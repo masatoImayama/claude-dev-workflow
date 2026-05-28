@@ -2,7 +2,7 @@
   "$schema": "https://json.schemastore.org/claude-code-plugin-manifest.json",
   "name": "dev-workflow",
   "displayName": "Dev Workflow",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "3エージェント自律開発ワークフロー。仕様ヒアリング → 仕様書・計画書作成 → GitHub issue管理 → 計画者・実行者・レビュアーによる自律実装。",
   "author": {
     "name": "masatoImayama",
