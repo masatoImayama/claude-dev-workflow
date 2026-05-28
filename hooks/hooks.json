@@ -1,5 +1,16 @@
 {
   "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "if [ -f mix.exs ]; then mix deps.get --check 2>/dev/null; if ! mix credo --version >/dev/null 2>&1; then echo '[dev-workflow] mix credo が見つかりません。静的解析を有効にするには mix.exs に {:credo, \"~> 1.7\", only: [:dev, :test], runtime: false} を追加してください。'; fi; fi",
+            "statusMessage": "dev-workflow: 環境チェック中..."
+          }
+        ]
+      }
+    ],
     "Stop": [
       {
         "hooks": [
