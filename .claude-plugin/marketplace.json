@@ -1,0 +1,13 @@
+{
+  "version": "1.0.0",
+  "plugins": [
+    {
+      "name": "dev-workflow",
+      "description": "3エージェント自律開発ワークフロー",
+      "source": {
+        "type": "directory",
+        "path": "."
+      }
+    }
+  ]
+}
