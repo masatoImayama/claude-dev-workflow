@@ -1,0 +1,21 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-plugin-manifest.json",
+  "name": "dev-workflow",
+  "displayName": "Dev Workflow",
+  "version": "0.1.0",
+  "description": "3エージェント自律開発ワークフロー。仕様ヒアリング → 仕様書・計画書作成 → GitHub issue管理 → 計画者・実行者・レビュアーによる自律実装。",
+  "author": {
+    "name": "masatoImayama",
+    "url": "https://github.com/masatoImayama"
+  },
+  "repository": "https://github.com/masatoImayama/claude-dev-workflow",
+  "license": "MIT",
+  "keywords": ["workflow", "agents", "autonomous", "github-issues", "tdd"],
+  "userConfig": {
+    "default_executor_model": {
+      "type": "string",
+      "title": "実行者エージェントのモデル",
+      "description": "executor agentに使用するモデル (sonnet / opus / haiku)"
+    }
+  }
+}
