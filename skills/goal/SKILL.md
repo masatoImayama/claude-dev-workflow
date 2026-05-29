@@ -1,7 +1,7 @@
 ---
 name: goal
-description: 全自動モード。計画者が仕様ヒアリング〜issue作成を行い、ユーザー承認後に実行者+レビュアーが自律実装する。plan→承認→runの一気通貫。
-argument-hint: "[機能名や概要]"
+description: 全自動モード。plannerが仕様ヒアリング〜issue作成を行い、ユーザー承認後にgenerator+evaluatorが自律実装する。
+argument-hint: "[実装したい機能や仕様の説明]"
 ---
 
 ## 目的
@@ -11,12 +11,12 @@ argument-hint: "[機能名や概要]"
 ## フロー
 
 ```
-plan（計画者）→ ユーザー承認 → run（実行者+レビュアー）
+plan（planner）→ ユーザー承認 → run（generator + evaluator）
 ```
 
 ## Phase 1: 計画（@planner）
 
-計画者エージェントに以下を依頼する:
+plannerに以下を依頼する:
 
 ```
 @planner
@@ -30,7 +30,7 @@ plan（計画者）→ ユーザー承認 → run（実行者+レビュアー）
 
 ## Phase 2: ユーザー承認
 
-計画者の出力を確認し、ユーザーに承認を求める:
+plannerの出力を確認し、ユーザーに承認を求める:
 
 ```
 ══════════════════════════════════════════
@@ -46,18 +46,18 @@ plan（計画者）→ ユーザー承認 → run（実行者+レビュアー）
 ```
 
 **承認された場合** → Phase 3 へ
-**修正が必要な場合** → 計画者に修正を依頼
+**修正が必要な場合** → plannerに修正を依頼
 
-## Phase 3: 自律実装（@executor + @reviewer）
+## Phase 3: 自律実装（@generator + @evaluator）
 
-承認されたEpic issueに対して、実行者とレビュアーの自律ループを開始する。
+承認されたEpic issueに対して、generatorとevaluatorの自律ループを開始する。
 `/dev-workflow:run #[epic番号]` と同じ動作:
 
 1. 未完了Task issueをPhase順に選定
-2. @executor がworktreeで実装
-3. @reviewer がレビュー（APPROVE / REQUEST_CHANGES）
+2. @generator がworktreeで実装
+3. @evaluator がレビュー（APPROVE / REQUEST_CHANGES）
 4. APPROVE → マージ・クローズ → 次のタスクへ
-5. REQUEST_CHANGES → 実行者に修正依頼 → 再レビュー
+5. REQUEST_CHANGES → generatorに修正依頼 → 再レビュー
 6. 全タスク完了 → Epic クローズ
 
 ## 安全装置

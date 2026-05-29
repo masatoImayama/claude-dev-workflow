@@ -1,13 +1,13 @@
 ---
 name: run
-description: 承認済みのEpic issueに対して、実行者とレビュアーの2エージェントで自律的に開発を進める。計画者は介在しない。
+description: 承認済みのEpic issueに対して、generatorとevaluatorの2エージェントで自律的に開発を進める。
 argument-hint: "#[epic issue番号]"
 disallowed-tools: AskUserQuestion
 ---
 
 ## 目的
 
-承認済みの Epic issue $ARGUMENTS 配下の全Task issueを、実行者+レビュアーの2エージェント体制で自律的に完了させる。
+承認済みの Epic issue $ARGUMENTS 配下の全Task issueを、generator+evaluatorの2エージェント体制で自律的に完了させる。
 
 ## 起動時の確認
 
@@ -19,12 +19,12 @@ disallowed-tools: AskUserQuestion
 
 | エージェント | 役割 | 判断権限 |
 |-------------|------|----------|
-| **実行者 (Executor)** | コード実装・テスト・コミット | 実装方針の判断 |
-| **レビュアー (Reviewer)** | コードレビュー・品質保証 | APPROVE / REQUEST_CHANGES |
+| **generator** | コード実装・テスト・コミット | 実装方針の判断 |
+| **evaluator** | コードレビュー・品質保証 | APPROVE / REQUEST_CHANGES |
 
 ## タスク選定ロジック
 
-計画者は介在しない。代わりに以下のルールで次のタスクを自動選定する:
+plannerは介在しない。代わりに以下のルールで次のタスクを自動選定する:
 
 1. Epic issueのbodyからタスク一覧を取得
 2. 未クローズのTask issueをPhase順にソート
@@ -44,12 +44,12 @@ gh issue list --label "task" --state open --json number,title,body --limit 50
 
 未完了のTask issueからPhase順で次のタスクを選ぶ。
 
-### Step 2: 実行者 - タスクを実装
+### Step 2: generator - タスクを実装
 
-実行者エージェントをworktreeで起動し、選定されたタスクを実装する:
+generatorをworktreeで起動し、選定されたタスクを実装する:
 
 ```
-@executor
+@generator
 Task #[番号] を実装してください。
 - issueの要件を確認
 - 仕様書 docs/specs/*/spec.md を参照
@@ -58,12 +58,12 @@ Task #[番号] を実装してください。
 - 変更をコミット
 ```
 
-### Step 3: レビュアー - 変更をレビュー
+### Step 3: evaluator - 変更をレビュー
 
-レビュアーエージェントに実行者の変更をレビューさせる:
+evaluatorにgeneratorの変更をレビューさせる:
 
 ```
-@reviewer
+@evaluator
 Task #[番号] の変更をレビューしてください。
 - 変更差分を確認
 - 仕様書との照合
@@ -80,7 +80,7 @@ Task #[番号] の変更をレビューしてください。
   4. → Step 1 に戻る（次のタスクへ）
 
 - **REQUEST_CHANGES** の場合:
-  1. レビュアーの指摘を実行者に伝える
+  1. evaluatorの指摘をgeneratorに伝える
   2. → Step 2 に戻る（修正）
 
 ## 進捗表示

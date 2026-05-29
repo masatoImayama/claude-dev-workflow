@@ -1,12 +1,12 @@
 ---
 name: plan
-description: 計画者エージェントが仕様ヒアリング→仕様書・計画書作成→GitHub issue作成を一気通貫で実行し、ユーザー承認で停止する。
-argument-hint: "[機能名や概要]"
+description: plannerが仕様ヒアリング→仕様書・計画書作成→GitHub issue作成を一気通貫で実行し、ユーザー承認で停止する。
+argument-hint: "[実装したい機能や仕様の説明]"
 ---
 
 ## 目的
 
-計画者エージェント（@planner）が以下を一気通貫で実行する:
+planner（計画者エージェント）が以下を一気通貫で実行する:
 
 1. 仕様ヒアリング（grill-me）
 2. 仕様書・実装計画書の作成（spec）
@@ -15,7 +15,7 @@ argument-hint: "[機能名や概要]"
 
 ## 実行
 
-計画者エージェントに以下を依頼する:
+plannerに以下を依頼する:
 
 ```
 @planner
@@ -29,8 +29,8 @@ argument-hint: "[機能名や概要]"
 
 ### Phase 2: ドキュメント作成
 仕様サマリーをもとに以下を作成してください:
-- docs/specs/$ARGUMENTS/spec.md（仕様書）
-- docs/specs/$ARGUMENTS/plan.md（実装計画書）
+- docs/specs/[機能名]/spec.md（仕様書）
+- docs/specs/[機能名]/plan.md（実装計画書）
 
 ### Phase 3: GitHub issue作成
 実装計画書をもとに以下を作成してください:
@@ -48,6 +48,6 @@ argument-hint: "[機能名や概要]"
 
 ## 注意
 
-- 計画者はPhase 1のヒアリング中のみユーザーに質問する
+- plannerはPhase 1のヒアリング中のみユーザーに質問する
 - Phase 2以降は自律的に進める
 - ユーザーの承認なしに実装は開始しない

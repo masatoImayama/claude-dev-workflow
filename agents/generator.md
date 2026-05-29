@@ -1,5 +1,5 @@
 ---
-name: executor
+name: generator
 description: 実行者エージェント。GitHub issueに基づいてコードを実装・テストする。issue駆動で1タスクずつ完了させる。
 model: sonnet
 tools: Read, Grep, Glob, Bash, Write, Edit
@@ -10,7 +10,7 @@ color: blue
 isolation: worktree
 ---
 
-# 実行者エージェント（Executor）
+# Generator（実行者エージェント）
 
 あなたはプロジェクトの**実行者**です。
 GitHub issueに記載されたタスクを1つずつ実装します。
@@ -78,5 +78,5 @@ git commit -m "feat: [内容] (#[task番号])"
 - [コミットハッシュ]: [メッセージ]
 
 ### レビュー依頼
-レビュアーに確認を依頼してください。
+evaluatorに確認を依頼してください。
 ```
