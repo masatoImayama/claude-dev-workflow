@@ -42,10 +42,8 @@ color: purple
 
 ### Phase 2: ドキュメント作成
 
-仕様サマリーをもとに以下を作成:
-
-- `docs/specs/[機能名]/spec.md` - 仕様書
-- `docs/specs/[機能名]/plan.md` - 実装計画書
+仕様サマリーをもとに仕様書と実装計画書を作成する（ファイル出力は不要、会話内で作成する）。
+これらは Phase 3 で Epic issue 本文に埋め込む。
 
 計画書のタスクは:
 - 1タスク = 1-2時間で完了できる粒度
@@ -53,7 +51,7 @@ color: purple
 - 各タスクに完了条件（テスト含む）を明記
 - 対象ファイルを具体的に記載
 
-### Phase 3: GitHub issue作成
+### Phase 3: GitHub issue作成・ブランチ作成
 
 ```bash
 # ラベル作成
@@ -61,9 +59,20 @@ gh label list | grep -q "epic" || gh label create "epic" --color "6f42c1" --desc
 gh label list | grep -q "task" || gh label create "task" --color "0075ca" --description "実装タスク"
 ```
 
-1. Epic issue を作成（epicラベル）
-2. 各タスクの Task issue を作成（taskラベル）
-3. Epic issueのbodyにTask issueのチェックリストを追記
+**ブランチ命名規則:** `epic/epic[issue番号]/[機能名]`
+
+1. Epic issue を作成（epicラベル、仕様書・計画書を`<details>`タグで本文に埋め込む）
+2. Epic issue番号を使って `epic/epic[番号]/[機能名]` ブランチを作成・push
+3. Epic issue本文にブランチ名を反映
+4. 各タスクの Task issue を作成（taskラベル、ブランチ名を記載）
+5. Epic issueのbodyにTask issueのチェックリストを追記
+
+```bash
+# Epic issue作成後にブランチ作成
+git checkout main && git pull
+git checkout -b epic/epic[番号]/[機能名]
+git push -u origin epic/epic[番号]/[機能名]
+```
 
 ### Phase 4: 確認依頼
 
@@ -73,10 +82,10 @@ gh label list | grep -q "task" || gh label create "task" --color "0075ca" --desc
 ══════════════════════════════════════════
   計画フェーズ完了
 
-  仕様書: docs/specs/[機能名]/spec.md
-  計画書: docs/specs/[機能名]/plan.md
-  Epic:   #[番号] - [タイトル]
-  Tasks:  [件数] 件
+  Epic:     #[番号] - [タイトル]
+  ブランチ: epic/epic[番号]/[機能名]
+  Tasks:    [件数] 件
+  仕様書・計画書: Epic issue本文に添付済み
 
   タスク一覧:
   #XX Task: [タスク1] (Phase 1)

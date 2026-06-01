@@ -6,18 +6,24 @@ argument-hint: "[機能名]"
 
 ## 目的
 
-`docs/specs/$ARGUMENTS/` の仕様書と実装計画書をもとに、GitHub issueを体系的に作成する。
+会話中の仕様書と実装計画書をもとに、GitHub issueを体系的に作成する。
+仕様書・計画書はEpic issue本文に直接埋め込む。
+Epic専用のブランチ `epic/epicXX/[機能名]` を作成し、mainブランチには直接変更を加えない。
+
+## ブランチ命名規則
+
+```
+epic/epic[issue番号]/[機能名]
+```
+
+例: Epic issue #42 で機能名が `notifications` の場合 → `epic/epic42/notifications`
 
 ## 手順
 
-### 1. ドキュメントの読み込み
+### 1. 仕様書・計画書の確認
 
-```bash
-cat docs/specs/$ARGUMENTS/spec.md
-cat docs/specs/$ARGUMENTS/plan.md
-```
-
-ファイルが見つからない場合は「先に `/dev-workflow:spec $ARGUMENTS` を実行してください」と案内する。
+会話履歴から仕様書と実装計画書を探す。
+見つからない場合は「先に `/dev-workflow:spec $ARGUMENTS` を実行してください」と案内する。
 
 ### 2. ラベルの確認・作成
 
@@ -26,31 +32,71 @@ gh label list | grep -q "epic" || gh label create "epic" --color "6f42c1" --desc
 gh label list | grep -q "task" || gh label create "task" --color "0075ca" --description "実装タスク"
 ```
 
-### 3. Epic issue の作成
+### 3. Epic issue の作成（ブランチ名は後で更新）
 
-仕様書の内容をもとに親issueを作成:
+仕様書・計画書の全内容をEpic issue本文に埋め込んで作成:
 
 ```bash
-gh issue create \
+EPIC_NUMBER=$(gh issue create \
   --title "Epic: [機能名]" \
   --label "epic" \
   --body "$(cat <<'BODY'
 ## 概要
 [仕様書の概要セクション]
 
-## 仕様書
-docs/specs/[機能名]/spec.md
-
-## 実装計画書
-docs/specs/[機能名]/plan.md
+## ブランチ
+(ブランチ作成後に更新)
 
 ## タスク一覧
 (子issue作成後にチェックリストを更新)
+
+---
+
+<details>
+<summary>仕様書</summary>
+
+[仕様書の全内容をここに埋め込む]
+
+</details>
+
+<details>
+<summary>実装計画書</summary>
+
+[実装計画書の全内容をここに埋め込む]
+
+</details>
 BODY
-)"
+)" 2>&1 | grep -oP '\d+$')
 ```
 
-### 4. Task issue の作成
+### 4. Epicブランチの作成
+
+Epic issue番号を使ってブランチを作成し、リモートにpushする:
+
+```bash
+EPIC_BRANCH="epic/epic${EPIC_NUMBER}/$ARGUMENTS"
+
+git checkout main && git pull
+git checkout -b "${EPIC_BRANCH}"
+git push -u origin "${EPIC_BRANCH}"
+```
+
+### 5. Epic issue にブランチ名を反映
+
+作成したブランチ名をEpic issue本文に更新:
+
+```bash
+# Epic issueのbodyの「(ブランチ作成後に更新)」を実際のブランチ名に置換して更新
+gh issue edit ${EPIC_NUMBER} --body "[ブランチ名を反映したbody]"
+```
+
+ブランチセクションは以下の形式にする:
+```
+## ブランチ
+`epic/epic[番号]/[機能名]`
+```
+
+### 6. Task issue の作成
 
 実装計画書の各タスクに対して子issueを作成:
 
@@ -61,6 +107,9 @@ gh issue create \
   --body "$(cat <<'BODY'
 ## 親Epic
 #[epic番号]
+
+## ブランチ
+`epic/epic[番号]/[機能名]`
 
 ## 概要
 [タスクの詳細]
@@ -79,7 +128,7 @@ BODY
 )"
 ```
 
-### 5. Epic issue の更新
+### 7. Epic issue の更新
 
 すべてのTask issueを作成したら、Epic issueのタスク一覧を子issue番号で更新:
 
@@ -87,7 +136,7 @@ BODY
 gh issue edit [epic番号] --body "[更新したbody]"
 ```
 
-### 6. 子issueの紐付け
+### 8. 子issueの紐付け
 
 GitHub CLIで子issueをepicに紐付ける:
 
@@ -95,7 +144,7 @@ GitHub CLIで子issueをepicに紐付ける:
 gh issue develop [task番号] --issue [epic番号] 2>/dev/null || true
 ```
 
-### 7. 完了報告
+### 9. 完了報告
 
 作成したissueの一覧を表示:
 
@@ -107,6 +156,8 @@ gh issue develop [task番号] --issue [epic番号] 2>/dev/null || true
 | #XX | Epic: [機能名] | epic | - |
 | #XX | Task: [タスク1] | task | 1 |
 | #XX | Task: [タスク2] | task | 2 |
+
+ブランチ: epic/epicXX/[機能名]
 ```
 
-「`/dev-workflow:goal #[epic番号]` で自律的な実装を開始できます」と案内する。
+「`/dev-workflow:run #[epic番号]` で自律的な実装を開始できます」と案内する。

@@ -15,8 +15,9 @@
       {
         "hooks": [
           {
-            "type": "prompt",
-            "prompt": "作業が完了しました。変更内容をレビューし、テストが全て通っているか確認してください。問題があれば修正してください。"
+            "type": "command",
+            "command": "bash \"${CLAUDE_PLUGIN_ROOT}/scripts/check-stop-review.sh\"",
+            "statusMessage": "dev-workflow: 変更チェック中..."
           }
         ]
       }

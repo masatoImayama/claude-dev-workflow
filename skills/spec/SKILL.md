@@ -6,7 +6,8 @@ argument-hint: "[機能名]"
 
 ## 目的
 
-会話中の仕様サマリー（grill-meの出力）をもとに、2つのドキュメントを `docs/specs/` に作成する。
+会話中の仕様サマリー（grill-meの出力）をもとに、仕様書と実装計画書を作成する。
+作成した内容は後続の `/dev-workflow:epic` でEpic issue本文に埋め込まれる。
 
 ## 手順
 
@@ -23,7 +24,7 @@ argument-hint: "[機能名]"
 
 ### 3. 仕様書の作成
 
-`docs/specs/$ARGUMENTS/spec.md` に以下の構成で作成:
+以下の構成で仕様書を会話内に出力する:
 
 ```markdown
 # 仕様書: [機能名]
@@ -58,7 +59,7 @@ argument-hint: "[機能名]"
 
 ### 4. 実装計画書の作成
 
-`docs/specs/$ARGUMENTS/plan.md` に以下の構成で作成:
+仕様書に続けて、以下の構成で実装計画書を会話内に出力する:
 
 ```markdown
 # 実装計画書: [機能名]
@@ -98,5 +99,5 @@ argument-hint: "[機能名]"
 
 ### 5. 完了案内
 
-ドキュメント作成後、以下を案内する:
-- 「`/dev-workflow:epic $ARGUMENTS` でGitHub issueを作成できます」
+仕様書・計画書を出力したら、以下を案内する:
+- 「`/dev-workflow:epic $ARGUMENTS` でGitHub issueを作成し、仕様書・計画書をEpic issueに添付できます」

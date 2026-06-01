@@ -28,21 +28,18 @@ plannerに以下を依頼する:
 - すべての分岐が解決したら仕様サマリーを出力する
 
 ### Phase 2: ドキュメント作成
-仕様サマリーをもとに以下を作成してください:
-- docs/specs/[機能名]/spec.md（仕様書）
-- docs/specs/[機能名]/plan.md（実装計画書）
+仕様サマリーをもとに仕様書と実装計画書を作成してください（ファイル出力不要、会話内で作成）。
 
 ### Phase 3: GitHub issue作成
-実装計画書をもとに以下を作成してください:
-- epicラベル付きの親issue（仕様書の内容）
+仕様書・計画書をEpic issue本文に埋め込んでGitHub issueを作成してください:
+- epicラベル付きの親issue（仕様書・計画書を`<details>`で本文に埋め込む）
 - taskラベル付きの子issue（計画書の各タスク）
 - 親issueのタスク一覧を子issue番号で更新
 
 ### Phase 4: 確認依頼
 作成した成果物の一覧を表示し、ユーザーに確認を求めてください:
-- 仕様書のパス
-- 実装計画書のパス
-- Epic issue番号と全Task issue一覧
+- Epic issue番号（仕様書・計画書はEpic issueに添付済み）
+- 全Task issue一覧
 - 「確認後 `/dev-workflow:run #[epic番号]` で自律実装を開始できます」と案内
 ```
 
@@ -51,3 +48,4 @@ plannerに以下を依頼する:
 - plannerはPhase 1のヒアリング中のみユーザーに質問する
 - Phase 2以降は自律的に進める
 - ユーザーの承認なしに実装は開始しない
+- 実装フェーズ（run）ではDocker sandbox内でYOLOモード（完全自律）で動作する

@@ -2,20 +2,30 @@
   "$schema": "https://json.schemastore.org/claude-code-plugin-manifest.json",
   "name": "dev-workflow",
   "displayName": "Dev Workflow",
-  "version": "0.3.0",
-  "description": "3エージェント自律開発ワークフロー。planner・generator・evaluatorによる仕様策定から自律実装まで。",
+  "version": "0.4.0",
+  "description": "3エージェント自律開発ワークフロー。Docker sandbox内でplanner・generator・evaluatorによる仕様策定から自律実装まで。",
   "author": {
     "name": "masatoImayama",
     "url": "https://github.com/masatoImayama"
   },
   "repository": "https://github.com/masatoImayama/claude-dev-workflow",
   "license": "MIT",
-  "keywords": ["workflow", "agents", "autonomous", "github-issues", "tdd"],
+  "keywords": ["workflow", "agents", "autonomous", "github-issues", "tdd", "docker", "sandbox"],
   "userConfig": {
     "default_generator_model": {
       "type": "string",
       "title": "generatorエージェントのモデル",
       "description": "generator agentに使用するモデル (sonnet / opus / haiku)"
+    },
+    "docker_image": {
+      "type": "string",
+      "title": "Docker sandbox イメージ",
+      "description": "実装・テストに使用するDockerイメージ名。未指定の場合はプロジェクトルートの Dockerfile.dev を使用。"
+    },
+    "docker_compose_file": {
+      "type": "string",
+      "title": "Docker Compose ファイル",
+      "description": "DB等の依存サービスが必要な場合に使用する docker-compose.yml のパス。"
     }
   }
 }
