@@ -17,7 +17,10 @@
 #   どちらも無ければ通知OFFとして何もせずexit 0
 #
 # 環境変数:
-#   DEV_WORKFLOW_NOTIFY_STOP   — "1" のときのみStop完了通知を送る（既定: 送らない）
+#   DEV_WORKFLOW_NOTIFY_STOP     — "1" のときのみStop完了通知を送る（既定: 送らない）
+#   DEV_WORKFLOW_NOTIFY_COOLDOWN — 同じ通知を抑止する秒数（既定: 600、0で無効）
+#   DEV_WORKFLOW_NOTIFY_DEBUG    — "1" で受け取ったNotificationのpayloadを
+#                                  .claude/.dev-workflow-notify.log に記録する
 
 set -u
 
@@ -84,6 +87,13 @@ if [ -n "$GIT_COMMON" ]; then
 fi
 RUN_MARKER="$MARKER_ROOT/.claude/.dev-workflow-run"
 
+# 通知が多すぎるときに、実際どのpayloadで発火しているかを追えるようにする
+if [ "$EVENT" = "notification" ] && [ "${DEV_WORKFLOW_NOTIFY_DEBUG:-}" = "1" ]; then
+  mkdir -p "$MARKER_ROOT/.claude"
+  printf '%s\t%s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$PAYLOAD" \
+    >> "$MARKER_ROOT/.claude/.dev-workflow-notify.log"
+fi
+
 # run-startは通知を伴わないので、Webhook解決より前に処理する
 if [ "$EVENT" = "run-start" ]; then
   mkdir -p "$MARKER_ROOT/.claude"
@@ -138,12 +148,16 @@ DETAIL=""
 case "$EVENT" in
   notification)
     MESSAGE="$(json_field message)"
-    # 許可プロンプトかアイドル待ちかを文言から判定する
+    # Notification hookはサブエージェントの状態変化など人の操作を必要としない場面でも
+    # 発火する。未知の文言まで「入力待ち」として送ると通知が溢れるので、
+    # 実際に人を待たせている2種類だけを許可し、それ以外は黙って捨てる
     case "$MESSAGE" in
       *permission*|*Permission*|*許可*)
         HEADLINE=":lock: 承認待ち" ;;
-      *)
+      *"waiting for your input"*|*"waiting for input"*|*idle*|*Idle*|*入力待ち*)
         HEADLINE=":hourglass: 入力待ち" ;;
+      *)
+        exit 0 ;;
     esac
     DETAIL="$MESSAGE"
     ;;
@@ -173,6 +187,23 @@ $(last_assistant_message 2>/dev/null || true)"
     HEADLINE=":information_source: $EVENT"
     ;;
 esac
+
+# アイドル通知は待たせている間ずっと繰り返し発火するので、
+# 同じ内容が続く間は一定時間鳴らさない
+COOLDOWN="${DEV_WORKFLOW_NOTIFY_COOLDOWN:-600}"
+if [ "$EVENT" = "notification" ] && [ "$COOLDOWN" -gt 0 ] 2>/dev/null; then
+  STATE_FILE="$MARKER_ROOT/.claude/.dev-workflow-notify-last"
+  SIG="$(printf '%s' "$HEADLINE|$DETAIL" | cksum | cut -d' ' -f1)"
+  NOW="$(date +%s)"
+  LAST_SIG=""
+  LAST_AT=0
+  [ -f "$STATE_FILE" ] && read -r LAST_SIG LAST_AT < "$STATE_FILE"
+  if [ "$LAST_SIG" = "$SIG" ] && [ $((NOW - ${LAST_AT:-0})) -lt "$COOLDOWN" ]; then
+    exit 0
+  fi
+  mkdir -p "$MARKER_ROOT/.claude"
+  printf '%s %s\n' "$SIG" "$NOW" > "$STATE_FILE"
+fi
 
 # 1行目でプロジェクトを特定できるようにする
 TEXT="${MENTION}[$PROJECT_NAME] $HEADLINE"

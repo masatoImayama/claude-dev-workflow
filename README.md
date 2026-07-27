@@ -309,6 +309,12 @@ echo ".claude/slack-webhook" >> .gitignore
 
 通知は必ず `[プロジェクト名]` から始まり、ブランチ名と作業ディレクトリも添えられるため、複数プロジェクトを並行実行していても発信元が分かる。
 
+`Notification` フックは上記2つ以外の場面（サブエージェントの切り替えなど、人の操作を必要としないタイミング）でも発火する。**そうした通知は送信されない** — 文言が承認待ち・入力待ちのいずれにも一致しないものは黙って捨てられる。
+
+さらに、入力待ちのまま放置すると同じ通知が繰り返し発火するため、**同じ内容の通知は既定で10分間抑止される**。間隔は `DEV_WORKFLOW_NOTIFY_COOLDOWN`（秒、`0` で無効）で変更できる。
+
+それでも不要な通知が届く場合は `DEV_WORKFLOW_NOTIFY_DEBUG=1` を設定すると、受け取った payload が `.claude/.dev-workflow-notify.log` に記録され、どの文言で発火しているか確認できる。
+
 ### 「完全な完了」と「途中停止」の区別
 
 `Stop` フックは毎ターン発火するだけで、自律実行がやり切ったのか途中で止まったのかを区別できない。そこでマーカーファイルで判別する:
@@ -322,8 +328,10 @@ echo ".claude/slack-webhook" >> .gitignore
 マーカーは一時ファイルなので `.gitignore` に追加しておく:
 
 ```bash
-echo ".claude/.dev-workflow-run" >> .gitignore
+echo ".claude/.dev-workflow-*" >> .gitignore
 ```
+
+（通知の抑止状態を持つ `.claude/.dev-workflow-notify-last` とデバッグログも同じパターンで除外される）
 
 ### 通常の応答完了通知の有効化
 
