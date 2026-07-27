@@ -11,9 +11,42 @@
         ]
       }
     ],
+    "PostToolUse": [
+      {
+        "matcher": "Write|Edit|MultiEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PLUGIN_ROOT}/scripts/check-readability.sh\"",
+            "statusMessage": "dev-workflow: 可読性チェック中..."
+          }
+        ]
+      }
+    ],
+    "Notification": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PLUGIN_ROOT}/scripts/notify-slack.sh\" notification",
+            "statusMessage": "dev-workflow: Slack通知中..."
+          }
+        ]
+      }
+    ],
     "Stop": [
       {
         "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PLUGIN_ROOT}/scripts/notify-slack.sh\" stop",
+            "statusMessage": "dev-workflow: Slack通知中..."
+          },
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PLUGIN_ROOT}/scripts/check-readability.sh\" --git",
+            "statusMessage": "dev-workflow: 可読性チェック中..."
+          },
           {
             "type": "command",
             "command": "bash \"${CLAUDE_PLUGIN_ROOT}/scripts/check-stop-review.sh\"",
