@@ -110,7 +110,19 @@ if [ -f "$WEBHOOK_FILE" ]; then
   # 任意: `name=表示名` 行で通知に出すプロジェクト名を上書きできる
   NAME_LINE="$(grep -m1 '^[[:space:]]*name[[:space:]]*=' "$WEBHOOK_FILE" | tr -d '\r' | sed 's/^[[:space:]]*name[[:space:]]*=[[:space:]]*//')"
   [ -n "$NAME_LINE" ] && [ -z "$PROJECT_NAME" ] && PROJECT_NAME="$NAME_LINE"
+  # 任意: `mention=` 行でメンション先を変更できる（既定は channel）
+  MENTION_LINE="$(grep -m1 '^[[:space:]]*mention[[:space:]]*=' "$WEBHOOK_FILE" | tr -d '\r' | sed 's/^[[:space:]]*mention[[:space:]]*=[[:space:]]*//')"
+  [ -n "$MENTION_LINE" ] && [ -z "${DEV_WORKFLOW_SLACK_MENTION:-}" ] && MENTION_SETTING="$MENTION_LINE"
 fi
+
+# 既定で @channel を付ける。channel / here / none / 生のメンション文字列（<@U123>等）を受け付ける
+MENTION_SETTING="${DEV_WORKFLOW_SLACK_MENTION:-${MENTION_SETTING:-channel}}"
+case "$MENTION_SETTING" in
+  channel) MENTION="<!channel> " ;;
+  here)    MENTION="<!here> " ;;
+  none|"") MENTION="" ;;
+  *)       MENTION="$MENTION_SETTING " ;;
+esac
 
 # 未設定なら通知OFF
 [ -n "$WEBHOOK_URL" ] || exit 0
@@ -163,12 +175,12 @@ $(last_assistant_message 2>/dev/null || true)"
 esac
 
 # 1行目でプロジェクトを特定できるようにする
-TEXT="[$PROJECT_NAME] $HEADLINE"
+TEXT="${MENTION}[$PROJECT_NAME] $HEADLINE"
 [ -n "$DETAIL" ] && TEXT="$TEXT
 $DETAIL"
 
 BODY="{\"text\":$(json_escape "$TEXT"),\"blocks\":[
-  {\"type\":\"section\",\"text\":{\"type\":\"mrkdwn\",\"text\":$(json_escape "*[$PROJECT_NAME]* $HEADLINE${DETAIL:+
+  {\"type\":\"section\",\"text\":{\"type\":\"mrkdwn\",\"text\":$(json_escape "${MENTION}*[$PROJECT_NAME]* $HEADLINE${DETAIL:+
 $DETAIL}")}},
   {\"type\":\"context\",\"elements\":[{\"type\":\"mrkdwn\",\"text\":$(json_escape "$CONTEXT")}]}
 ]}"

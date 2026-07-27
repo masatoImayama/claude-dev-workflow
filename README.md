@@ -277,7 +277,17 @@ https://hooks.slack.com/services/XXX/YYY/ZZZ
 
 - `https://` で始まる最初の行がWebhook URL（必須）
 - `name=` 行は通知に表示するプロジェクト名（任意、既定はディレクトリ名）
+- `mention=` 行はメンション先（任意、**既定は `channel` ＝ 全通知が `@channel`**）
 - `#` 始まりの行はコメント
+
+`mention=` に指定できる値:
+
+| 値 | 動作 |
+|---|---|
+| `channel`（既定） | `@channel` — チャンネル全員に通知 |
+| `here` | `@here` — オンラインのメンバーのみ |
+| `none` | メンションなし |
+| `<@U123ABC>` | 特定ユーザーへのメンション（SlackのメンバーID） |
 
 3. **`.claude/slack-webhook` は必ず `.gitignore` に追加する**（Webhook URLは秘密情報）
 
@@ -285,7 +295,7 @@ https://hooks.slack.com/services/XXX/YYY/ZZZ
 echo ".claude/slack-webhook" >> .gitignore
 ```
 
-環境変数 `SLACK_WEBHOOK_URL` / `DEV_WORKFLOW_PROJECT_NAME` でも指定できる（ファイル設定が優先）。
+環境変数 `SLACK_WEBHOOK_URL` / `DEV_WORKFLOW_PROJECT_NAME` でも指定できる（ファイル設定が優先）。メンションは `DEV_WORKFLOW_SLACK_MENTION` で上書きでき、こちらはファイル設定より優先される。
 
 ### 通知されるタイミング
 
