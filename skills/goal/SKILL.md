@@ -57,6 +57,10 @@ plannerの出力を確認し、ユーザーに承認を求める:
 承認されたEpic issueに対して、Docker sandbox内でgeneratorとevaluatorの自律ループを開始する。
 `/dev-workflow:run #[epic番号]` と同じ動作:
 
+0. 自律実行の開始を記録（Slack通知が完了と途中停止を区別するため）
+   ```bash
+   bash "${CLAUDE_PLUGIN_ROOT}/scripts/notify-slack.sh" run-start "Epic #[epic番号]"
+   ```
 1. Docker sandboxを起動
 2. 未完了Task issueをPhase順に選定
 3. @generator がworktree上・Docker sandbox内で実装
@@ -65,6 +69,13 @@ plannerの出力を確認し、ユーザーに承認を求める:
 6. REQUEST_CHANGES → generatorに修正依頼 → 再レビュー
 7. 全タスク完了 → main向けPR作成（人間がレビュー・マージ）
 8. Docker sandboxをクリーンアップ
+9. 完全な完了を通知（PR作成に成功した場合のみ実行する）
+   ```bash
+   bash "${CLAUDE_PLUGIN_ROOT}/scripts/notify-slack.sh" run-complete \
+     "全[N]タスク完了（スキップ[M]件）
+   PR: [PRのURL]"
+   ```
+   ここに到達せず終了した場合は、Stopフックが「自律実行が停止」として自動通知する。
 
 ## 自律動作ポリシー（YOLOモード）
 

@@ -258,6 +258,80 @@ READABILITY_MAX_BASE64=2000    # 連続base64文字列の許容上限（文字�
 READABILITY_MAX_LINE=5000      # ソース1行の許容上限（文字数）
 ```
 
+## Slack通知
+
+**自律実行の完了・ユーザー入力待ち・許可プロンプトをSlackに通知する。** 長時間の自律実行を放置しておいて、止まったタイミングだけ気づける。
+
+### 設定（プロジェクトごと）
+
+通知先はプロジェクト単位で設定する。**未設定のプロジェクトでは通知は一切行われない（通知OFF扱い）。**
+
+1. Slackで [Incoming Webhook](https://api.slack.com/messaging/webhooks) を作成し、URLを取得
+2. プロジェクトルートに `.claude/slack-webhook` を作成
+
+```
+# .claude/slack-webhook
+name=tessera (API)
+https://hooks.slack.com/services/XXX/YYY/ZZZ
+```
+
+- `https://` で始まる最初の行がWebhook URL（必須）
+- `name=` 行は通知に表示するプロジェクト名（任意、既定はディレクトリ名）
+- `#` 始まりの行はコメント
+
+3. **`.claude/slack-webhook` は必ず `.gitignore` に追加する**（Webhook URLは秘密情報）
+
+```bash
+echo ".claude/slack-webhook" >> .gitignore
+```
+
+環境変数 `SLACK_WEBHOOK_URL` / `DEV_WORKFLOW_PROJECT_NAME` でも指定できる（ファイル設定が優先）。
+
+### 通知されるタイミング
+
+| タイミング | フック | 内容 |
+|---|---|---|
+| **許可プロンプト表示** | `Notification` | `:lock: 承認待ち` — ファイルアクセス等の承認でエージェントが止まったとき |
+| **入力待ちで放置** | `Notification` | `:hourglass: 入力待ち` — 入力待ちのまま約60秒経過したとき |
+| **自律実行の完全な完了** | skill | `:white_check_mark: 完了` — 全タスク完了＋PR作成まで到達したとき |
+| **自律実行の途中停止** | `Stop` | `:octagonal_sign: 自律実行が停止` — 完了に到達せず止まったとき |
+| **通常の応答完了** | `Stop` | `:white_check_mark: 応答完了` — 既定でOFF（下記） |
+
+通知は必ず `[プロジェクト名]` から始まり、ブランチ名と作業ディレクトリも添えられるため、複数プロジェクトを並行実行していても発信元が分かる。
+
+### 「完全な完了」と「途中停止」の区別
+
+`Stop` フックは毎ターン発火するだけで、自律実行がやり切ったのか途中で止まったのかを区別できない。そこでマーカーファイルで判別する:
+
+1. `/run`・`/goal` はループ開始時に `.claude/.dev-workflow-run` を作成する
+2. **PR作成まで到達した場合のみ** `run-complete` を実行 → マーカーを消して `:white_check_mark: 完了`（PR URL付き）を通知
+3. マーカーが残ったまま `Stop` した場合 → 完了地点に到達していない ＝ `:octagonal_sign: 自律実行が停止` を通知
+
+これにより、**エラーで落ちた・承認待ちで止まった・コンテキストが尽きた**といった「静かな失敗」も取りこぼさずに通知される。停止通知は鳴り続けないよう1回だけ送られる。
+
+マーカーは一時ファイルなので `.gitignore` に追加しておく:
+
+```bash
+echo ".claude/.dev-workflow-run" >> .gitignore
+```
+
+### 通常の応答完了通知の有効化
+
+自律実行と関係ない通常のターン終了は、毎ターン鳴ってしまうため既定でOFF。必要なプロジェクトでのみ有効にする:
+
+```json
+// .claude/settings.json
+{
+  "env": {
+    "DEV_WORKFLOW_NOTIFY_STOP": "1"
+  }
+}
+```
+
+> **注意:** `--dangerously-skip-permissions`（完全なYOLO）では許可プロンプト自体が発生しないため、承認待ち通知も発生しない。`/run`・`/goal` は allowlist ベースで動作するため、許可されていない操作に当たった際は通知される。
+>
+> 停止通知・応答完了通知の要約表示には `jq` が必要（未インストールでも通知自体は届く）。「完了」通知はskillが渡すサマリーを使うため `jq` は不要。
+
 ## プロジェクト固有のカスタマイズ
 
 エージェントはプロジェクトの `CLAUDE.md` と `.claude/rules/` を自動的に読み込みます。  
