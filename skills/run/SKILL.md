@@ -21,25 +21,58 @@ YOLOモードで動作するためには、プロジェクトの `.claude/settin
 
 未設定の場合、Bash実行のたびに「Do you want to proceed?」と確認が入り自律動作が中断される。
 
+**ファイルツール（Read/Edit/Write）の権限について**: 本 run は Epic 専用 worktree を
+`.claude/worktrees/<epicN>` に作る（後述）。この配下は**リポジトリルートの一部**なので、
+`permissions.additionalDirectories` にリポジトリルート（例: `.../github/<repo>`）を1つ入れておけば
+worktree もサブエージェントの isolation worktree も**追加設定なしで自動許可**され、確認が入らない。
+逆に worktree を `../<repo>-epicN` のような**リポジトリ外の兄弟ディレクトリに作ると許可外**となり、
+generator の Read/Edit のたびに確認が入る（＝自律動作が止まる）。だから worktree は必ず
+`.claude/worktrees/` 配下に作る。
+
 ## 起動時の確認
 
 !`gh issue view $ARGUMENTS 2>/dev/null || echo "ERROR: issue $ARGUMENTS が見つかりません"`
 
 !`gh issue list --label "task" --state open --json number,title,labels,body --limit 100 2>/dev/null | head -200`
 
-### Epicブランチの確認
+### Epicブランチ + 作業 worktree の準備
 
-Epic issue本文の「ブランチ」セクションからブランチ名を取得し、存在を確認する:
+Epic issue本文の「ブランチ」セクションからブランチ名を取得し、**Epic 専用の作業 worktree を
+`.claude/worktrees/<epicN>` に作成**する（`../<repo>-epicN` のような**兄弟ディレクトリは作らない**）。
+
+なぜ `.claude/worktrees/` 配下か:
+- **並行 epic 実行**が可能（各 epic が独立した worktree を持つ）。
+- worktree パスが**プロジェクトツリー内**に収まるため、`.claude/settings.json` の
+  `additionalDirectories` がリポジトリルートを許可していれば **追加の権限設定なしで**
+  ファイルツール（Read/Edit/Write）が自動許可される。`github` 直下の**他リポジトリには一切及ばない**
+  （兄弟ディレクトリ方式だと other-project へ権限が漏れる or 毎回プロンプトが出る）。
+- メインリポのチェックアウトを切り替えないので、他の作業を壊さない。
 
 ```bash
-# Epic issueからブランチ名を取得
 # Epic issueからブランチ名を取得 (形式: epic/epicXX/[機能名])
 EPIC_BRANCH=$(gh issue view $ARGUMENTS --json body -q '.body' | grep -oP '`epic/epic\d+/[^`]+`' | tr -d '`' | head -1)
+EPIC_NUM=$(printf '%s' "$EPIC_BRANCH" | grep -oP 'epic\d+' | head -1)   # 例: epic259
 
 # ブランチの存在確認
 git fetch origin
-git rev-parse --verify "origin/${EPIC_BRANCH}" 2>/dev/null || echo "ERROR: ブランチ ${EPIC_BRANCH} が見つかりません"
+git rev-parse --verify "origin/${EPIC_BRANCH}" >/dev/null 2>&1 || { echo "ERROR: ブランチ ${EPIC_BRANCH} が見つかりません"; exit 1; }
+
+# ローカル追跡ブランチを用意（無ければ origin から作成）
+git show-ref --verify --quiet "refs/heads/${EPIC_BRANCH}" || git branch "${EPIC_BRANCH}" "origin/${EPIC_BRANCH}"
+
+# Epic 専用 worktree を .claude/worktrees/<epicN> に作成（既存なら再利用）
+EPIC_WT=".claude/worktrees/${EPIC_NUM}"
+if [ -d "$EPIC_WT" ]; then
+  git -C "$EPIC_WT" checkout "${EPIC_BRANCH}" 2>/dev/null || true
+else
+  git worktree add "$EPIC_WT" "${EPIC_BRANCH}"
+fi
 ```
+
+**重要**: 以降の**すべてのステップ**（Docker 準備・タスクループ・generator/evaluator 起動・
+commit/push・PR 作成・クリーンアップ）は、この `$EPIC_WT`（= `.claude/worktrees/<epicN>`）を
+**作業ディレクトリ**として実行すること（`cd "$EPIC_WT"` してから、または `git -C "$EPIC_WT"` で操作）。
+**メインリポのチェックアウトを epic ブランチに切り替えてはならない**（兄弟 worktree も作らない）。
 
 ### 自律実行の開始を記録
 
@@ -49,11 +82,17 @@ Slack通知が「完全な完了」と「途中停止」を区別できるよう
 bash "${CLAUDE_PLUGIN_ROOT}/scripts/notify-slack.sh" run-start "Epic #$ARGUMENTS"
 ```
 
+worktree内から実行してもマーカーはメインリポのルートに置かれるため、実行場所は問わない。
+
 ### Docker sandbox の準備
 
-実装・テスト用のDockerコンテナを起動する:
+**まず作業 worktree に移動してから**、実装・テスト用のDockerコンテナを起動する（以降 `pwd` は
+`$EPIC_WT`。マウント・ビルドはこの worktree を基点に行う）:
 
 ```bash
+cd "$EPIC_WT"   # 以降の作業ディレクトリを Epic 専用 worktree に固定
+
+# Dockerfile.dev / docker-compose.dev.yml は worktree にも存在する（フルチェックアウトのため）
 # プロジェクトルートに Dockerfile.dev があればビルド、なければ設定されたイメージを使用
 if [ -f Dockerfile.dev ]; then
   docker build -f Dockerfile.dev -t dev-sandbox:$(basename $(pwd)) .
@@ -83,9 +122,11 @@ Gitオペレーション（commit, push等）はホスト側で実行する。
 ```
 main (保護: 人間のみマージ可)
  └─ epic/epicXX/[機能名] (Epic単位のブランチ)
-     └─ generator worktree (Docker sandbox内で実装 → epicブランチにマージ)
+     └─ 作業 worktree: .claude/worktrees/epicXX/  ← このツリー内で全作業（許可済み領域・兄弟ディレクトリは作らない）
+         └─ generator の isolation worktree (Docker sandbox内で実装 → epicブランチにマージ)
 ```
 
+- Epic 専用 worktree は **`.claude/worktrees/<epicN>`** に作る（`../<repo>-epicN` の兄弟は作らない）。additionalDirectories はリポジトリルート許可で足り、他リポジトリに権限が及ばない。
 - generatorはworktreeでEpicブランチをベースに作業する
 - 実装・テスト・ビルドは全てDockerコンテナ内で実行する
 - タスク完了後はEpicブランチにマージする（mainではない）
@@ -118,8 +159,10 @@ gh issue list --label "task" --state open --json number,title,body --limit 50
 
 **各タスク開始前に必ずEpicブランチを最新に同期する。**
 前のタスクの変更が反映されていない古いベースでworktreeを作ると、コンフリクトやファイル不整合が発生する。
+同期は**メインリポではなく Epic 専用 worktree（`$EPIC_WT`）内で**行う。
 
 ```bash
+cd "$EPIC_WT"            # 作業 worktree に居ることを保証
 git fetch origin
 git checkout ${EPIC_BRANCH}
 git pull origin ${EPIC_BRANCH}
@@ -244,16 +287,25 @@ PR: [PRのURL]"
 
 ## worktree クリーンアップ
 
-**重要:** `git worktree remove` はworktree内のファイルを削除するが、`node_modules` 等がメインリポへのsymlinkの場合、symlink越しに実体ファイルが削除される。
+**重要:** `git worktree remove` はworktree内のファイルを削除するが、`node_modules` 等がメインリポへのsymlinkの場合、symlink越しに実体ファイルが削除される。また**カレントディレクトリが対象 worktree 内だと削除できない**ため、必ずメインリポのルートへ戻ってから削除する。
 
-worktreeを削除する前に、必ずsymlinkを解除すること:
+Epic 専用 worktree（`.claude/worktrees/<epicN>`）は **PR 作成後**に削除してよい（epic ブランチは
+origin に push 済みのため安全）。フォローアップ修正で使い続けたい場合は残しておいてもよい。
 
 ```bash
-# worktree内のsymlinkを解除してからworktreeを削除
-cd [worktree-path]
-find . -maxdepth 2 -type l -name "node_modules" -exec unlink {} \; 2>/dev/null || true
-cd -
-git worktree remove [worktree-path] --force 2>/dev/null || true
+# 1) メインリポのルートへ戻る（対象 worktree の中からは remove できない）
+MAIN_ROOT=$(git -C "$EPIC_WT" rev-parse --path-format=absolute --git-common-dir 2>/dev/null | sed 's#/\.git$##')
+cd "$MAIN_ROOT" 2>/dev/null || cd "$(git rev-parse --show-toplevel)"
+
+# 2) symlink（node_modules 等）を解除してから Epic 専用 worktree を削除
+if [ -d "$EPIC_WT" ]; then
+  find "$EPIC_WT" -maxdepth 2 -type l -name "node_modules" -exec unlink {} \; 2>/dev/null || true
+  git worktree remove "$EPIC_WT" --force 2>/dev/null || true
+fi
+
+# 3) generator の isolation worktree（.claude/worktrees/agent-*）はハーネスが自動整理するが、
+#    残存していれば prune で登録を掃除する
+git worktree prune
 ```
 
 ## Docker sandbox クリーンアップ

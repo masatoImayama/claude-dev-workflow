@@ -69,12 +69,24 @@ last_assistant_message() {
 CWD="$(json_field cwd)"
 [ -z "$CWD" ] && CWD="$(pwd)"
 
-# 自律実行中であることを示すマーカー
-RUN_MARKER="$CWD/.claude/.dev-workflow-run"
+# 自律実行中であることを示すマーカー。
+# skillはworktree（.claude/worktrees/<epicN>）内から実行されるが、hookのcwdはメインリポの
+# ルートなので、両者が同じファイルを見るようメインリポのルートに固定する
+MARKER_ROOT="$CWD"
+GIT_COMMON="$(git -C "$CWD" rev-parse --git-common-dir 2>/dev/null || true)"
+if [ -n "$GIT_COMMON" ]; then
+  case "$GIT_COMMON" in
+    /*|[A-Za-z]:*) ;;                       # 絶対パスならそのまま
+    *) GIT_COMMON="$CWD/$GIT_COMMON" ;;     # 相対パスならcwd基準で解決
+  esac
+  MAIN_ROOT="$(cd "$GIT_COMMON/.." 2>/dev/null && pwd || true)"
+  [ -n "$MAIN_ROOT" ] && MARKER_ROOT="$MAIN_ROOT"
+fi
+RUN_MARKER="$MARKER_ROOT/.claude/.dev-workflow-run"
 
 # run-startは通知を伴わないので、Webhook解決より前に処理する
 if [ "$EVENT" = "run-start" ]; then
-  mkdir -p "$CWD/.claude"
+  mkdir -p "$MARKER_ROOT/.claude"
   printf '%s\n' "${ARG:-自律実行}" > "$RUN_MARKER"
   exit 0
 fi
@@ -85,8 +97,10 @@ RUN_LABEL=""
 [ -f "$RUN_MARKER" ] && RUN_LABEL="$(head -1 "$RUN_MARKER" | tr -d '\r')"
 [ "$EVENT" = "run-complete" ] && rm -f "$RUN_MARKER"
 
-# プロジェクト個別の設定を優先し、無ければ環境変数にフォールバックする
-WEBHOOK_FILE="$CWD/.claude/slack-webhook"
+# プロジェクト個別の設定を優先し、無ければ環境変数にフォールバックする。
+# 設定ファイルはgitignore対象でworktreeには存在しないため、メインリポのルートを見る
+WEBHOOK_FILE="$MARKER_ROOT/.claude/slack-webhook"
+[ -f "$WEBHOOK_FILE" ] || WEBHOOK_FILE="$CWD/.claude/slack-webhook"
 WEBHOOK_URL="${SLACK_WEBHOOK_URL:-}"
 PROJECT_NAME="${DEV_WORKFLOW_PROJECT_NAME:-}"
 if [ -f "$WEBHOOK_FILE" ]; then
@@ -101,8 +115,9 @@ fi
 # 未設定なら通知OFF
 [ -n "$WEBHOOK_URL" ] || exit 0
 
-# 表示名の既定はディレクトリ名。どの環境から来た通知かブランチとパスも添える
-[ -n "$PROJECT_NAME" ] || PROJECT_NAME="$(basename "$CWD")"
+# 表示名の既定はメインリポのディレクトリ名（worktree内でもプロジェクト名がぶれないように）。
+# どの環境から来た通知かブランチとパスも添える
+[ -n "$PROJECT_NAME" ] || PROJECT_NAME="$(basename "$MARKER_ROOT")"
 BRANCH="$(git -C "$CWD" rev-parse --abbrev-ref HEAD 2>/dev/null || true)"
 CONTEXT="$CWD"
 [ -n "$BRANCH" ] && CONTEXT="branch: $BRANCH ・ $CWD"
