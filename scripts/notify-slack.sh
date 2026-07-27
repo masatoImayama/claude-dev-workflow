@@ -185,7 +185,14 @@ $DETAIL}")}},
   {\"type\":\"context\",\"elements\":[{\"type\":\"mrkdwn\",\"text\":$(json_escape "$CONTEXT")}]}
 ]}"
 
-curl -sS -m 10 -X POST -H 'Content-Type: application/json' \
-  --data "$BODY" "$WEBHOOK_URL" > /dev/null 2>&1
+# 本文は必ずファイル経由で渡す。
+# Git for Windows の curl はネイティブビルドのため、コマンドライン引数として渡した
+# UTF-8 の日本語が cp932 に変換されて壊れる（--data は使わない）。
+BODY_FILE="$(mktemp -t slack-notify.XXXXXX)" || exit 0
+trap 'rm -f "$BODY_FILE"' EXIT
+printf '%s' "$BODY" > "$BODY_FILE"
+
+curl -sS -m 10 -X POST -H 'Content-Type: application/json; charset=utf-8' \
+  --data-binary @"$BODY_FILE" "$WEBHOOK_URL" > /dev/null 2>&1
 
 exit 0

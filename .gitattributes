@@ -1,0 +1,8 @@
+# シェルスクリプトは必ずLFでチェックアウトする。
+# Windowsのcore.autocrlf=trueでCRLFに変換されると、行末の\rが文字列に混入し
+# フックスクリプトが誤動作する。
+*.sh text eol=lf
+
+# 設定ファイル・ドキュメントもUTF-8/LFで統一する
+*.json text eol=lf
+*.md text eol=lf
