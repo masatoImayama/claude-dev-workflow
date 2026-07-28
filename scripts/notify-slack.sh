@@ -18,6 +18,7 @@
 #
 # 環境変数:
 #   DEV_WORKFLOW_NOTIFY_STOP     — "1" のときのみStop完了通知を送る（既定: 送らない）
+#   DEV_WORKFLOW_NOTIFY_IDLE     — "1" のときのみ「入力待ち」通知を送る（既定: 送らない）
 #   DEV_WORKFLOW_NOTIFY_COOLDOWN — 同じ通知を抑止する秒数（既定: 600、0で無効）
 #   DEV_WORKFLOW_NOTIFY_DEBUG    — "1" で受け取ったNotificationのpayloadを
 #                                  .claude/.dev-workflow-notify.log に記録する
@@ -148,13 +149,15 @@ DETAIL=""
 case "$EVENT" in
   notification)
     MESSAGE="$(json_field message)"
-    # Notification hookはサブエージェントの状態変化など人の操作を必要としない場面でも
-    # 発火する。未知の文言まで「入力待ち」として送ると通知が溢れるので、
-    # 実際に人を待たせている2種類だけを許可し、それ以外は黙って捨てる
+    # Notification hookは人の操作を必要としない場面（サブエージェントの切り替え、
+    # LLMの応答待ちなど）でも発火し、文言からは区別できなかった。
+    # そのため「入力待ち」通知は既定でOFFとし、承認待ちだけを送る。
+    # DEV_WORKFLOW_NOTIFY_IDLE=1 のときに限り入力待ちも送る。
     case "$MESSAGE" in
       *permission*|*Permission*|*許可*)
         HEADLINE=":lock: 承認待ち" ;;
       *"waiting for your input"*|*"waiting for input"*|*idle*|*Idle*|*入力待ち*)
+        [ "${DEV_WORKFLOW_NOTIFY_IDLE:-}" = "1" ] || exit 0
         HEADLINE=":hourglass: 入力待ち" ;;
       *)
         exit 0 ;;
