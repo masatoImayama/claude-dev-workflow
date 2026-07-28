@@ -64,12 +64,13 @@ plannerの出力を確認し、ユーザーに承認を求める:
 1. Docker sandboxを起動
 2. 未完了Task issueをPhase順に選定
 3. @generator がworktree上・Docker sandbox内で実装
-4. @evaluator がDocker sandbox内でテスト検証・レビュー（APPROVE / REQUEST_CHANGES）
-5. APPROVE → Epicブランチにマージ・タスククローズ → 次のタスクへ
-6. REQUEST_CHANGES → generatorに修正依頼 → 再レビュー
-7. 全タスク完了 → main向けPR作成（人間がレビュー・マージ）
-8. Docker sandboxをクリーンアップ
-9. 完全な完了を通知（PR作成に成功した場合のみ実行する）
+4. 機械的ゲート（テスト・ビルド・可読性ガード）を通す — **ここでevaluatorは起動しない**
+5. 通過 → Epicブランチにマージ・タスククローズ → 次のタスクへ / 失敗 → generatorに差し戻し
+6. 全タスク完了 → @evaluator がEpic全差分を**一括レビュー**（起動はここが初回）
+7. 指摘（high/medium）を review issue 化 → generatorが対応 → 差分だけ再レビュー（最大2巡）
+8. main向けPR作成（未対応の指摘はPR本文に明記し、人間がレビュー・マージ）
+9. Docker sandboxをクリーンアップ
+10. 完全な完了を通知（PR作成に成功した場合のみ実行する）
    ```bash
    bash "${CLAUDE_PLUGIN_ROOT}/scripts/notify-slack.sh" run-complete \
      "全[N]タスク完了（スキップ[M]件）
@@ -80,7 +81,8 @@ plannerの出力を確認し、ユーザーに承認を求める:
 ## 自律動作ポリシー（YOLOモード）
 
 - **Phase 3以降、ユーザーへの確認・質問は一切行わない**
-- 同一タスクで3回REQUEST_CHANGES → タスクをスキップし、issueにコメントを残して次へ
+- 同一タスクで機械的ゲートに3回失敗 → タスクをスキップし、issueにコメントを残して次へ
+- レビューはEpic完了後にまとめて1回。タスクごとにevaluatorを起動しない（コスト削減のため）
 - テスト5回連続失敗 → issueにデバッグログをコメントし、次のタスクへ
 - 予期しないエラー → issueにエラー詳細をコメントし、次のタスクへ
 - スキップしたタスクはPR本文に明示する

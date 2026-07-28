@@ -112,10 +112,24 @@ Gitオペレーション（commit, push等）はホスト側で実行する。
 
 ## 2エージェント体制
 
-| エージェント | 役割 | 判断権限 |
-|-------------|------|----------|
-| **generator** | Docker内でコード実装・テスト・コミット | 実装方針の判断 |
-| **evaluator** | Docker内でレビュー・テスト検証 | APPROVE / REQUEST_CHANGES |
+| エージェント | 役割 | 起動頻度 | 判断権限 |
+|-------------|------|----------|----------|
+| **generator** | Docker内でコード実装・テスト・コミット | タスクごと | 実装方針の判断 |
+| **evaluator** | Epic全差分の一括レビュー | **Epicにつき1〜3回** | APPROVE / REQUEST_CHANGES |
+
+### レビューはEpic単位でまとめて行う
+
+**タスクごとにevaluatorを起動してはならない。** レビューは最もコストの高い工程であり、
+タスクのたびにOpusで全文脈を読み直すとレビュー費用が実装費用を上回る。
+
+代わりに:
+
+1. **タスクごと**は機械的ゲート（テスト・ビルド・可読性ガード）だけで通す — LLM呼び出しなし
+2. **全タスク完了後**にevaluatorを1回起動し、`main...epicブランチ` の全差分をレビュー
+3. 指摘は**個別のissueに変換**し、generatorが対応する
+4. 対応後は**その差分だけ**を再レビュー（最大2巡）
+
+これにより、evaluatorの起動回数はタスク数に比例せず、Epicあたり1〜3回に固定される。
 
 ## ブランチ戦略
 
@@ -184,33 +198,37 @@ Task #[番号] を実装してください。
 - 変更をコミット
 ```
 
-### Step 4: evaluator - Docker sandbox内で変更をレビュー
+### Step 4: 機械的ゲート（LLMレビューなし）
 
-evaluatorにgeneratorの変更をレビューさせる:
+**evaluatorは起動しない。** 以下をbashで実行し、結果だけで通過判定する:
 
+```bash
+cd "$EPIC_WT"
+
+# 1) テスト（Docker sandbox内）— 落ちたら不合格
+docker run --rm -v "$(pwd):/workspace" -w /workspace dev-sandbox:$(basename $(pwd)) [test-command]
+
+# 2) ビルド/型チェック — プロジェクトに定義があれば実行
+docker run --rm -v "$(pwd):/workspace" -w /workspace dev-sandbox:$(basename $(pwd)) [build-command]
+
+# 3) 可読性ガード — 差分に対して実行（PostToolUseフックと同じ判定）
+bash "${CLAUDE_PLUGIN_ROOT}/scripts/check-readability.sh" --git
 ```
-@evaluator
-Task #[番号] の変更をレビューしてください。
-- Epicブランチ: [epic/epicXX/機能名]
-- 変更差分を確認
-- 親Epic issueの仕様書との照合
-- チェックリストに基づくレビュー
-- テストをDocker sandbox内で実行して検証
-- APPROVE or REQUEST_CHANGES を判定
-```
 
-### Step 5: 結果に基づく分岐
+- **全て通過** → Step 5 へ
+- **いずれか失敗** → 失敗ログをgeneratorに渡して Step 3 に戻る（同一タスクで3回失敗したらスキップ）
 
-- **APPROVE** の場合:
-  1. 変更をEpicブランチにマージ（mainではない）
-  2. Epicブランチをリモートにpush: `git push origin ${EPIC_BRANCH}`
-  3. Task issueをクローズ: `gh issue close [番号]`
-  4. Epic issueの進捗を更新
-  5. → Step 1 に戻る（次のタスクへ）
+品質・設計・セキュリティの観点はここでは見ない。**それらはEpic完了後の一括レビューで見る。**
 
-- **REQUEST_CHANGES** の場合:
-  1. evaluatorの指摘をgeneratorに伝える
-  2. → Step 3 に戻る（修正）
+### Step 5: Epicブランチに取り込んで次のタスクへ
+
+1. 変更をEpicブランチにマージ（mainではない）
+2. Epicブランチをリモートにpush: `git push origin ${EPIC_BRANCH}`
+3. Task issueをクローズ: `gh issue close [番号]`
+4. Epic issueの進捗を更新
+5. → Step 1 に戻る（次のタスクへ）
+
+全タスクが完了したら **「Epic一括レビュー」** へ進む。
 
 ## 進捗表示
 
@@ -227,6 +245,101 @@ Task #[番号] の変更をレビューしてください。
 ═══════════════════════════════════════
 ```
 
+## Epic一括レビュー（全タスク完了後・PR作成前）
+
+全Task issueがクローズされた時点で、**ここで初めてevaluatorを起動する。**
+
+### R1: 一括レビューの実行
+
+```
+@evaluator
+Epic #$ARGUMENTS の全変更をレビューしてください。
+- モード: epic-review
+- 差分範囲: main...[epic/epicXX/機能名]
+- 作業ディレクトリ: .claude/worktrees/[epicN]
+- 親Epic issueの仕様書と照合し、実装漏れも指摘すること
+- テストをDocker sandbox内で実行して検証すること
+- 最後に必ずJSONブロック（verdict / reviewed_commit / findings）を出力すること
+```
+
+### R2: 指摘をissue化
+
+evaluatorの出力末尾のJSONを読み、**high と medium の指摘だけ**をissueにする。
+low は issue化せず、PR本文の「レビューで挙がった軽微な指摘」に列挙するだけに留める。
+
+JSONのパースは**あなた（runの実行者）が直接行う。** `jq` は環境によっては入っていないため、
+パイプラインで機械的に処理しようとしない。findingsを読み取り、1件ずつ以下を実行する:
+
+```bash
+# reviewラベルを用意（初回のみ。既存なら --force で上書き）
+gh label create review --color B60205 --description "一括レビューの指摘" --force
+
+# 指摘1件につき1つのissueを作成（[]内はfindingの値で置き換える）
+gh issue create --label "task,review" --title "Review: [title]" --body "$(cat <<'BODY'
+## 指摘（重要度: [severity]）
+
+[detail]
+
+## 該当箇所
+`[location]`
+
+## 修正方針
+[fix]
+
+## 由来
+- Epic: #[epic番号]
+- 起因タスク: [task_ref]
+- レビュー時点: `[reviewed_commit]`
+BODY
+)"
+```
+
+`reviewed_commit` は次の delta-review の起点になるので、**必ず控えておく。**
+
+作成したissueの番号一覧をEpic issueにコメントし、追跡できるようにする。
+
+### R3: 指摘対応ループ
+
+`APPROVE` なら何もせずPR作成へ進む。`REQUEST_CHANGES` の場合:
+
+1. 作成した review issue を**1件ずつ** generator に渡して修正させる（通常のタスクと同じ Step 3〜5）
+2. 全件対応したら **delta-review** で再レビューする:
+
+```
+@evaluator
+Epic #$ARGUMENTS の指摘対応を確認してください。
+- モード: delta-review
+- 差分範囲: [R1のreviewed_commit]..[epic/epicXX/機能名]
+- 指定範囲外の蒸し返しはしないこと
+- 最後に必ずJSONブロックを出力すること
+```
+
+3. `APPROVE` → PR作成へ / `REQUEST_CHANGES` → R2 に戻る
+
+### R4: 打ち切り条件
+
+**レビューは最大2巡まで**（初回 + delta-review 1回。合わせてevaluator起動は最大3回）。
+
+2巡目でも `REQUEST_CHANGES` が残る場合は、**そこで打ち切ってPRを作成する。**
+未対応の指摘は:
+
+1. issueは**オープンのまま残す**（クローズしない）
+2. PR本文の「未対応の指摘」セクションに issue 番号付きで列挙する
+3. 人間のレビュアーがPR上で判断する
+
+無限ループでコストを溶かすより、人間に判断を渡す方が安い。
+
+### レビュー粒度の調整
+
+Epicが大きく差分が膨大になる場合（目安: 変更50ファイル超）は、
+R1をPhase単位に分割して起動してよい。その場合も**タスク単位には戻さない**。
+
+```
+@evaluator
+Epic #$ARGUMENTS のうち Phase 1 の変更をレビューしてください。
+- 差分範囲: main...[epic-branch] のうち [Phase1で変更されたファイル群]
+```
+
 ## 完了条件
 
 以下がすべて満たされたらゴール達成:
@@ -234,11 +347,12 @@ Task #[番号] の変更をレビューしてください。
 1. Epic配下の全Task issueがクローズされている（スキップ分はissueにコメント済み）
 2. Docker sandbox内で全テストが通っている
 3. コンパイル/ビルドが成功する
-4. **main向けPRが作成されている**
+4. **Epic一括レビューが実施されている**（APPROVE、または2巡で打ち切り済み）
+5. **main向けPRが作成されている**
 
 ### PR作成（runの最終責務）
 
-全タスク完了後、**必ずPRを作成する。** これがrunコマンドの最終出力であり、PRのURLを表示して完了とする。
+一括レビューまで終えたら、**必ずPRを作成する。** これがrunコマンドの最終出力であり、PRのURLを表示して完了とする。
 PRを作成せずにrunを終了してはならない。
 
 ```bash
@@ -260,6 +374,16 @@ Closes $ARGUMENTS
 - [x] #XX Task: [タスク1]
 - [x] #XX Task: [タスク2]
 ...
+
+## レビュー結果
+- 一括レビュー: [APPROVE / 2巡で打ち切り]
+- 対応済みの指摘: #XX, #XX
+
+### 未対応の指摘（人間の判断が必要）
+- [ ] #XX [タイトル] — [なぜ未対応か]
+
+### レビューで挙がった軽微な指摘（issue化せず記録のみ）
+- [重要度lowの指摘]
 
 ## Test plan
 - [ ] 全テスト通過確認済み（Docker sandbox内）
@@ -323,8 +447,10 @@ docker rm -f dev-sandbox-$(basename $(pwd)) 2>/dev/null || true
 ## 自律動作ポリシー（YOLOモード）
 
 - **ユーザーへの確認・質問は一切行わない**
-- 同一タスクで3回REQUEST_CHANGESが出た場合 → タスクをスキップし、issueにコメントを残して次のタスクへ進む
+- 同一タスクで機械的ゲートに3回失敗した場合 → タスクをスキップし、issueにコメントを残して次のタスクへ進む
 - テストが5回連続で失敗した場合 → issueにデバッグログをコメントし、次のタスクへ進む
+- **タスクループ中にevaluatorを起動しない**（レビューはEpic完了後の一括レビューのみ）
+- Epic一括レビューは最大2巡で打ち切り、未対応の指摘はissueを残したままPR本文に明記する
 - 予期しないエラーが発生した場合 → issueにエラー詳細をコメントし、次のタスクへ進む
 - スキップしたタスクはEpic issueの進捗表示で明示する
 - **mainブランチには絶対にマージしない**
