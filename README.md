@@ -393,6 +393,32 @@ echo ".claude/.dev-workflow-*" >> .gitignore
 エージェントはプロジェクトの `CLAUDE.md` と `.claude/rules/` を自動的に読み込みます。  
 プロジェクト固有のルール（コーディング規約、禁止事項、設計思想）はそこに記載してください。
 
+## このプラグイン自体を開発する場合
+
+`agents/*.md` は**生成物**です。直接編集しないでください。
+
+正本は以下の3つで、これらを結合して `agents/*.md` が生成されます。
+
+| ファイル | 内容 |
+|---|---|
+| `core/instructions.md` | ベンダー中立なハーネス共通ルール（ワークフロー・規約・可読性原則・安全ルール） |
+| `core/roles/*.md` | ベンダー中立な役割定義（planner / generator / evaluator） |
+| `adapters/claude/overlays/*.md` | Claude Code固有のfrontmatterと補足 |
+
+```bash
+# core/ や overlays/ を編集したら再生成する
+bash adapters/claude/build.sh
+
+# 生成物が正本と一致しているか検証する（差分があれば exit 1）
+bash adapters/claude/build.sh --check
+```
+
+**`core/` を編集したら再生成し、生成物をコミットに含めてください。**
+
+`core/` をベンダー中立に保っているのは、Claude Codeが利用不能になった際に別ベンダーのCLIへ
+フェイルオーバーできるようにするためです。設計方針は
+[docs/dev-workflow-multi-vendor-guide.md](docs/dev-workflow-multi-vendor-guide.md) を参照してください。
+
 ## ライセンス
 
 MIT
