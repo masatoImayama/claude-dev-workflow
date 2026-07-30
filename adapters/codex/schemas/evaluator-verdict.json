@@ -1,0 +1,59 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "dev-workflow evaluator verdict",
+  "description": "Epic一括レビュー／delta-review の判定結果。codex exec --output-schema で最終応答の形状を強制するために使う。",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["verdict", "reviewed_commit", "findings"],
+  "properties": {
+    "verdict": {
+      "type": "string",
+      "enum": ["APPROVE", "REQUEST_CHANGES"],
+      "description": "high または medium の指摘があれば REQUEST_CHANGES。low のみ／指摘なしなら APPROVE。"
+    },
+    "reviewed_commit": {
+      "type": "string",
+      "description": "レビュー時点のEpicブランチのHEAD SHA。次回 delta-review の起点になるため必須。"
+    },
+    "summary": {
+      "type": "string",
+      "description": "1〜2文の総評。"
+    },
+    "findings": {
+      "type": "array",
+      "description": "指摘の一覧。1件もない場合は空配列とし、キー自体を省略しない。",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["severity", "title", "location", "detail", "fix"],
+        "properties": {
+          "severity": {
+            "type": "string",
+            "enum": ["high", "medium", "low"],
+            "description": "high: バグ・セキュリティ欠陥・仕様未達・可読性原則違反・未検証の中核ロジック / medium: 設計の歪み・タスク間の不整合・重複実装・エッジケース未カバー / low: 命名の好み・軽微なリファクタ"
+          },
+          "title": {
+            "type": "string",
+            "description": "issueのタイトルになる。それ単体で何を直すか分かる簡潔な1文。"
+          },
+          "location": {
+            "type": "string",
+            "description": "パス:行 形式。複数箇所なら代表1つを指定し、detail に補足する。"
+          },
+          "detail": {
+            "type": "string",
+            "description": "なぜ問題なのかを、コードを見ていない人にも分かるように書く。"
+          },
+          "fix": {
+            "type": "string",
+            "description": "具体的な修正方針。実装側はこれを読んで実装する。"
+          },
+          "task_ref": {
+            "type": "string",
+            "description": "起因となったTask issue番号（例: #57）。不明なら空文字。"
+          }
+        }
+      }
+    }
+  }
+}

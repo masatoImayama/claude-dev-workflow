@@ -863,20 +863,41 @@ Claude Code側の挙動を一切変えずに、ベンダー中立な内容を単
       `file_path` 抽出／pre-commit のブロック・通過・バイパス・冪等・アンインストール）
 - [ ] 実プロジェクトで Claude Code のフックが従来どおり動作することを確認（セッション再起動が必要）
 
-### Phase C: Codex アダプタ
+### Phase C: Codex アダプタ（実装完了・実機検証待ち）
 
-- [ ] `.codex-plugin/plugin.json` の作成（`skills` / `hooks` を指す）
-- [ ] `adapters/codex/overlays/*.toml` の作成
-      （evaluator は `sandbox_mode = "read-only"`）
-- [ ] `adapters/codex/build.sh` の実装（→ `codex-agents/*.toml`）
-- [ ] `adapters/codex/install-agents.sh` の実装（→ `<project>/.codex/agents/`）
-- [ ] `skills/install-codex-agents/SKILL.md` の作成
-- [ ] `skills/run-codex/SKILL.md` の作成（`multi_agent` によるループ）
-- [ ] `adapters/codex/run-loop.sh` の実装（`codex exec` による無人ループ）
-- [ ] evaluator の判定JSONを `--output-schema` で強制するスキーマファイルを作成
-- [ ] `codex-dev-workflow` の知見を取り込み、統合・廃止（4.9の移行手順）
+- [x] `.codex-plugin/plugin.json` の作成（`skills: ./skills-codex/` / `hooks: ./hooks/hooks.codex.json`）
+- [x] `hooks/hooks.codex.json` の作成（`Notification` を除外。`apply_patch` を PostToolUse の matcher に追加）
+- [x] `adapters/lib/expand-includes.sh` に include 展開を共通化（Claude/Codex 両 build から source）
+- [x] `adapters/codex/overlays/*.toml` の作成（evaluator は `sandbox_mode = "read-only"`）
+- [x] `adapters/codex/build.sh` の実装（→ `codex-agents/*.toml`、`--check` 対応、
+      TOML リテラル文字列の終端 `'''` 混入検出つき）
+- [x] `adapters/codex/install-agents.sh` の実装（→ `<project>/.codex/agents/`、
+      `--check` とモデル指定の環境変数に対応）
+- [x] `skills-codex/install-codex-agents/SKILL.md` の作成
+- [x] `skills-codex/dev-workflow-run/SKILL.md` の作成（サブエージェントによるループ）
+- [x] `skills-codex/dev-workflow-plan/SKILL.md` / `dev-workflow-goal/SKILL.md` の作成
+- [x] `adapters/codex/run-loop.sh` の実装（`codex exec` による無人ループ。
+      反復上限・dry-run・前提の事前検証つき）
+- [x] `adapters/codex/schemas/evaluator-verdict.json` の作成（`--output-schema` 用）
+- [x] 生成物の TOML 妥当性検証（`tomllib` で必須3フィールドを確認）
+- [x] `install-agents.sh` の結合テスト（未設置検出／設置／`--check`／モデル指定の反映）
+- [x] `run-loop.sh` のエラー経路テスト（引数なし／前提未達で worktree を作らずに落ちる）
+- [x] README に Codex での導入手順・無人実行・Claude Code との差分表を追記
+- [ ] `codex-dev-workflow` の統合・廃止（4.9の移行手順）
 - [ ] 実プロジェクトで planner → generator → evaluator の1サイクルが回ることを確認
-- [ ] プラグイン同梱フックの信頼付与フローを確認し、README に手順を記載
+- [ ] プラグイン同梱フックの信頼付与フローを実機で確認
+
+#### 実装時に判明した設計上の判断
+
+- **`model` は既定で指定しない。** 利用可能なモデルの階層（どれが実装向き／レビュー向きか）を
+  確証をもって決められないため、既定では親セッションまたは `[agents] default_subagent_model` から
+  継承させ、`DEV_WORKFLOW_CODEX_{PLANNER,GENERATOR,EVALUATOR}_MODEL` で任意に指定できるようにした。
+  オーバーレイにはコメントアウトした `# model = "..."` を置いてある
+- **スキルは `skills/` を共有せず `skills-codex/` に分けた。** 同一ディレクトリを両マニフェストが
+  指すと、Codex が Claude 固有構文（`$ARGUMENTS`、`@agent` 記法、`` !`command` ``）を含む
+  `run` / `goal` を読んでしまう。共有できるのは中立な `core/` であり、スキルは薄い起動役に留める
+- **`PostToolUse` の matcher に `apply_patch` を追加した。** Codex のファイル編集ツール名が
+  Claude Code の `Write` / `Edit` と異なるため。実機で正確なツール名を確認して調整する余地がある
 
 #### Phase C の配布作業（方式は 3.6 で確定済み）
 

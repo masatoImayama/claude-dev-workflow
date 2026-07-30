@@ -439,31 +439,77 @@ echo ".claude/.dev-workflow-*" >> .gitignore
 エージェントはプロジェクトの `CLAUDE.md` と `.claude/rules/` を自動的に読み込みます。  
 プロジェクト固有のルール（コーディング規約、禁止事項、設計思想）はそこに記載してください。
 
+## Codex CLI で使う
+
+このプラグインは Claude Code と Codex CLI の**両方のプラグイン**として動作します。
+Claude Code が利用不能になったときのフェイルオーバー先として、平常時に用意しておくことを推奨します。
+
+役割定義・ワークフロー規約・可読性原則・安全ルールは両CLIで**同じ `core/` を正本**にしているため、
+どちらで作業しても同じルールで動きます。
+
+### 導入
+
+```bash
+# 1. マーケットプレイスとプラグインを追加
+codex plugin marketplace add masatoImayama/claude-dev-workflow-marketplace
+codex plugin add dev-workflow@dev-workflow-marketplace
+
+# 2. サブエージェント定義をプロジェクトに設置
+#    （Codexのプラグインは agents を配布できないためコピーが必要）
+bash "${CLAUDE_PLUGIN_ROOT}/adapters/codex/install-agents.sh" .
+
+# 3. 生成物をコミット（障害時に生成処理を実行できない可能性があるため）
+git add .codex/agents/ && git commit -m "chore: Codex用サブエージェント定義を配置"
+```
+
+Codex 側のスキルは `dev-workflow-plan` / `dev-workflow-run` / `dev-workflow-goal` /
+`install-codex-agents` です。初回はプラグイン同梱フックの**信頼付与**を求められます
+（承認しないと可読性ガードが働きません）。
+
+### 無人で回す
+
+```bash
+bash "${CLAUDE_PLUGIN_ROOT}/adapters/codex/run-loop.sh" <Epic issue番号>
+```
+
+ループをシェル側に置き、1回の `codex exec` = 1役として起動するため、役割ごとに文脈が分離されます。
+`DEV_WORKFLOW_DRY_RUN=1` を付けると実行内容の確認だけができます。
+
+### Claude Code との差分
+
+| 項目 | Claude Code | Codex |
+|---|---|---|
+| 役割ごとのモデル指定 | `agents/*.md` の `model` | `.codex/agents/*.toml` の `model`（既定は継承。環境変数で指定可） |
+| レビュアーの書き込み禁止 | `disallowedTools: Write, Edit` | `sandbox_mode = "read-only"` |
+| ターン数の上限 | `maxTurns` | **相当機能なし。** ループ側の反復上限とプロンプト規約で担保 |
+| サブエージェント専用worktree | `isolation: worktree`（自動） | **なし。** generator を並行実行しない設計 |
+| 判定JSONの強制 | なし（本文から読み取り） | `--output-schema` でスキーマ強制 |
+| 「入力待ち」Slack通知 | `Notification` フック | **なし**（Codexに該当イベントがない） |
+
 ## このプラグイン自体を開発する場合
 
-`agents/*.md` は**生成物**です。直接編集しないでください。
-
-正本は以下の3つで、これらを結合して `agents/*.md` が生成されます。
+`agents/*.md` と `codex-agents/*.toml` は**生成物**です。直接編集しないでください。
 
 | ファイル | 内容 |
 |---|---|
 | `core/instructions.md` | ベンダー中立なハーネス共通ルール（ワークフロー・規約・可読性原則・安全ルール） |
 | `core/roles/*.md` | ベンダー中立な役割定義（planner / generator / evaluator） |
-| `adapters/claude/overlays/*.md` | Claude Code固有のfrontmatterと補足 |
+| `adapters/claude/overlays/*.md` | Claude Code固有のfrontmatterと補足 → `agents/*.md` |
+| `adapters/codex/overlays/*.toml` | Codex固有のTOMLキーと補足 → `codex-agents/*.toml` |
 
 ```bash
-# core/ や overlays/ を編集したら再生成する
+# core/ や overlays/ を編集したら両方を再生成する
 bash adapters/claude/build.sh
+bash adapters/codex/build.sh
 
 # 生成物が正本と一致しているか検証する（差分があれば exit 1）
 bash adapters/claude/build.sh --check
+bash adapters/codex/build.sh --check
 ```
 
-**`core/` を編集したら再生成し、生成物をコミットに含めてください。**
+**`core/` を編集したら両方を再生成し、生成物をコミットに含めてください。**
 
-`core/` をベンダー中立に保っているのは、Claude Codeが利用不能になった際に別ベンダーのCLIへ
-フェイルオーバーできるようにするためです。設計方針は
-[docs/dev-workflow-multi-vendor-guide.md](docs/dev-workflow-multi-vendor-guide.md) を参照してください。
+設計方針は [docs/dev-workflow-multi-vendor-guide.md](docs/dev-workflow-multi-vendor-guide.md) を参照してください。
 
 ## ライセンス
 

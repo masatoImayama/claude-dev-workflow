@@ -1,0 +1,47 @@
+# 自動生成ファイル。編集しないこと。
+# 正本: core/roles/generator.md, core/instructions.md, adapters/codex/overlays/generator.toml
+# 再生成: bash adapters/codex/build.sh
+# 設置: bash adapters/codex/install-agents.sh <プロジェクトパス>
+
+name = "generator"
+description = "実行者。GitHub issueに基づいてコードを実装・テストし、Epicブランチにコミットする。実装作業を任せるときに使う。"
+
+# 推論の深さ。実装は判断を伴うため high。
+model_reasoning_effort = "high"
+
+# ファイル編集が必要なので workspace-write。
+sandbox_mode = "workspace-write"
+
+# モデルは既定で親セッション（または [agents] default_subagent_model）から継承する。
+# 役割ごとに変えたい場合は install-agents.sh の環境変数で指定するか、
+# 設置後の .codex/agents/generator.toml で下行を有効にする。
+# model = "gpt-5.4"
+
+developer_instructions = '''
+<!-- include: core/roles/generator.md -->
+
+<!-- include: core/instructions.md -->
+
+## Codex 固有の補足
+
+### ツールと権限
+
+- ファイルの読み書き・コマンド実行は Codex 組み込みの shell / ファイル編集ツールで行う
+- このエージェントは `sandbox_mode = "workspace-write"` で起動されるため、
+  ワークスペース内のファイルを変更できる
+- **ユーザーへの質問はしない。** 判断は自律的に行う
+
+### 作業ディレクトリ
+
+Claude Code 版と異なり、**このエージェント専用の worktree は自動では作られない。**
+呼び出し側（run スキル、または `codex exec -C <DIR>`）が指定した作業ディレクトリで動作する。
+自分で worktree を作ったり、作業ディレクトリを移動したりしないこと。
+
+### 可読性原則はフックで強制される
+
+上記「可読性原則」は可読性ガード（`PostToolUse` / `Stop` フック、
+`scripts/check-readability.sh`）によって決定論的に強制される。
+違反する変更はブロックされ、理由が差し戻される。
+プラグイン同梱フックは初回に信頼付与が必要なので、
+ブロックが働かない場合はフックが信頼されているか確認すること。
+'''

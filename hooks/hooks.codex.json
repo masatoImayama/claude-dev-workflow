@@ -1,0 +1,53 @@
+{
+  "description": "dev-workflow: Codex CLI 用フック定義。Notification イベントは Codex に存在しないため hooks.json とは別ファイルにしている。",
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PLUGIN_ROOT}/scripts/check-prerequisites.sh\"",
+            "statusMessage": "dev-workflow: 前提条件チェック中..."
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Write|Edit|MultiEdit|apply_patch",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PLUGIN_ROOT}/scripts/check-readability.sh\"",
+            "timeout": 30,
+            "statusMessage": "dev-workflow: 可読性チェック中..."
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PLUGIN_ROOT}/scripts/notify-slack.sh\" stop",
+            "timeout": 30,
+            "statusMessage": "dev-workflow: Slack通知中..."
+          },
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PLUGIN_ROOT}/scripts/check-readability.sh\" --git",
+            "timeout": 60,
+            "statusMessage": "dev-workflow: 可読性チェック中..."
+          },
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PLUGIN_ROOT}/scripts/check-stop-review.sh\"",
+            "timeout": 30,
+            "statusMessage": "dev-workflow: 変更チェック中..."
+          }
+        ]
+      }
+    ]
+  }
+}

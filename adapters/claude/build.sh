@@ -6,7 +6,7 @@
 #
 # 使い方:
 #   bash adapters/claude/build.sh          # 生成する
-#   bash adapters/claude/build.sh --check  # 生成物が最新かを検証する（CI・フック用）
+#   bash adapters/claude/build.sh --check  # 生成物が最新かを検証する（CI・開発時用）
 #
 # --check は差分があれば exit 1 を返す。ファイルは書き換えない。
 
@@ -16,35 +16,12 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 OVERLAY_DIR="${REPO_ROOT}/adapters/claude/overlays"
 OUT_DIR="${REPO_ROOT}/agents"
 
+source "${REPO_ROOT}/adapters/lib/expand-includes.sh"
+
 CHECK_ONLY=0
 if [ "${1:-}" = "--check" ]; then
   CHECK_ONLY=1
 fi
-
-# オーバーレイ中の `<!-- include: <パス> -->` 行を、そのファイルの内容で置き換える。
-# パスはリポジトリルートからの相対パス。include の入れ子は行わない（1段のみ）。
-expand_includes() {
-  local overlay_file="$1"
-  local line include_path
-
-  while IFS= read -r line || [ -n "$line" ]; do
-    case "$line" in
-      '<!-- include: '*' -->')
-        include_path="${line#<!-- include: }"
-        include_path="${include_path% -->}"
-        if [ ! -f "${REPO_ROOT}/${include_path}" ]; then
-          echo "ERROR: include 対象が見つかりません: ${include_path}" >&2
-          echo "  参照元: ${overlay_file}" >&2
-          return 1
-        fi
-        cat "${REPO_ROOT}/${include_path}"
-        ;;
-      *)
-        printf '%s\n' "$line"
-        ;;
-    esac
-  done < "$overlay_file"
-}
 
 if [ ! -d "$OVERLAY_DIR" ]; then
   echo "ERROR: オーバーレイディレクトリが見つかりません: ${OVERLAY_DIR}" >&2
@@ -59,22 +36,13 @@ generated=0
 for overlay in "${OVERLAY_DIR}"/*.md; do
   [ -f "$overlay" ] || continue
   name="$(basename "$overlay")"
-  out="${OUT_DIR}/${name}"
 
-  built="$(expand_includes "$overlay")"
+  built="$(expand_includes "$REPO_ROOT" "$overlay")"
 
-  if [ "$CHECK_ONLY" -eq 1 ]; then
-    if [ ! -f "$out" ]; then
-      echo "STALE: ${name} が生成されていません"
-      stale=1
-    elif ! printf '%s\n' "$built" | diff -q - "$out" > /dev/null 2>&1; then
-      echo "STALE: agents/${name} が core/ の内容と一致しません"
-      stale=1
-    fi
+  if emit_or_check "$built" "${OUT_DIR}/${name}" "agents/${name}" "$CHECK_ONLY"; then
+    [ "$CHECK_ONLY" -eq 0 ] && generated=$((generated + 1))
   else
-    printf '%s\n' "$built" > "$out"
-    echo "generated: agents/${name}"
-    generated=$((generated + 1))
+    stale=1
   fi
 done
 
