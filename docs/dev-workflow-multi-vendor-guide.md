@@ -141,13 +141,53 @@ Codex はプラグインフックの実行時に `PLUGIN_ROOT` / `PLUGIN_DATA` �
 | `model: sonnet` / `opus` | `model` |
 | `effort: high` | `model_reasoning_effort` |
 | `tools:` / `disallowedTools:` | `sandbox_mode`（`read-only` / `workspace-write` / `danger-full-access`。**粒度は粗い**） |
-| `isolation: worktree` | 相当物なし（`codex exec -C <DIR>` で代替） |
-| `maxTurns` | **相当物を確認できず** |
+| `isolation: worktree` | **サブエージェント単位の相当物なし**（3.3.3参照） |
+| `maxTurns` | **相当物なし**（3.3.4参照） |
 | `color` | なし |
 
 **重要な非対称性: サブエージェント定義はプラグインで配布できない。**
 `.codex-plugin/plugin.json` がサポートするのは `skills` / `hooks` / `mcpServers` / `apps` / `interface` のみで、
 `agents` は含まれない。したがって `.codex/agents/*.toml` は**プロジェクト側に設置する**必要がある。
+
+#### 3.3.3. worktree 隔離の粒度
+
+Codex の `[agents]` 配下のキーは `enabled` / `max_concurrent_threads_per_session`（旧名 `max_threads`）/
+`default_subagent_model` / `default_subagent_reasoning_effort` / `interrupt_message` /
+`<role>.config_file` / `<role>.description` のみで、**作業ディレクトリを指定するキーはない。**
+カスタムエージェントの TOML にも `cwd` 相当は存在しない
+（`cwd` はセッションおよびMCPサーバのフィールドとしては存在するが、エージェント設定にはない）。
+
+一方、**セッション単位の worktree は第一級機能**である（`codex exec -C <DIR>`、デスクトップアプリの
+worktree 作成、スケジュールタスクの worktree 実行、Local ↔ Worktree ハンドオフ）。
+`sandbox_workspace_write.writable_roots` で書き込み可能ルートを追加することもできるが、
+これは「許可の追加」であって隔離ではない。
+
+| 粒度 | Claude Code | Codex |
+| --- | --- | --- |
+| セッション単位 | `.claude/worktrees/<epicN>` を run スキルが作成 | `codex exec -C <DIR>` / アプリの worktree 機能 |
+| **サブエージェント単位** | **`isolation: worktree`（自動）** | **不可** |
+
+**設計への影響:** generator を並行実行して衝突を避ける方式は Codex では取れない。
+Epic ごとに1 worktree を割り当てて**逐次実行**するか、シェルループ側が worktree を割り当てて
+`codex exec -C` で起動する方式のいずれかを採る（4.4.3参照）。
+
+#### 3.3.4. ターン上限の相当物はない
+
+`maxTurns: 50` / `40` に相当する設定は Codex に存在しない。最も近いのは
+`features.rollout_budget`（`enabled` / `limit_tokens` / `prefill_token_weight` /
+`reminder_interval_tokens` / `sampling_token_weight`）だが、これは
+
+- **under development で既定オフ**
+- ターン数ではなく**トークン予算**
+
+であり、そのままの代替にはならない。
+
+**設計への影響:** 暴走時の停止条件は以下で担保する。
+
+1. シェルループ方式では**オーケストレーター側が反復回数を制御する**（`codex exec` 1起動＝1タスク）
+2. `core/instructions.md` の打ち切り条件（同一タスク3回失敗でスキップ、レビュー最大2巡）を
+   プロンプト側の規約として明記する（既に記載済み）
+3. `features.rollout_budget` が stable になった時点で導入を再検討する
 
 ### 3.4. `codex exec`（ヘッドレス実行）
 
@@ -195,6 +235,85 @@ dev-workflow が使用する **`SessionStart` / `PostToolUse` / `Stop` はすべ
   相対パスではなく git root からの解決を推奨（マニュアルの明示的な指示）
 - `plugin-creator` の `validate_plugin.py` は `hooks` フィールドを拒否するが、
   これはスキャフォールド側の制約であり、マニュアルでは正式にサポートされている
+
+### 3.6. 配布方式（Codex マーケットプレイス）
+
+**結論: 既存の `claude-dev-workflow-marketplace` リポジトリをそのまま両CLI用に使える。**
+
+#### 3.6.1. `source` の種別
+
+| `source` | 用途 | 必須フィールド |
+| --- | --- | --- |
+| `local` | ローカルディレクトリ | `path`（マーケットプレイスルートからの相対、`./` 始まり） |
+| `url` | Git リポジトリの**ルート**にプラグインがある | `url` |
+| **`git-subdir`** | **Git リポジトリの<b>サブディレクトリ</b>にプラグインがある** | `url`, `path` |
+| `npm` | JavaScript パッケージレジストリ | `package`（`version` / `registry` は任意） |
+
+Git 系エントリは `ref` または `sha` セレクタを使える。
+**これは現行の `.claude-plugin/marketplace.json` と同形である。**
+
+```json
+{
+  "name": "dev-workflow",
+  "source": {
+    "source": "git-subdir",
+    "url": "https://github.com/masatoImayama/claude-dev-workflow-marketplace.git",
+    "path": "./plugins/dev-workflow",
+    "ref": "master",
+    "sha": "..."
+  },
+  "policy": { "installation": "AVAILABLE", "authentication": "ON_INSTALL" },
+  "category": "Productivity"
+}
+```
+
+Claude Code 側との差分は、Codex エントリでは **`policy.installation` / `policy.authentication` /
+`category` が必須**という点のみ。解決できないエントリは**スキップされ、マーケットプレイス全体は壊れない。**
+
+#### 3.6.2. マーケットプレイスファイルの探索パス
+
+| パス | 用途 |
+| --- | --- |
+| `$REPO_ROOT/.agents/plugins/marketplace.json` | リポジトリ／チーム用（Codexネイティブ） |
+| **`$REPO_ROOT/.claude-plugin/marketplace.json`** | **レガシー互換パス（Claude Code 形式をそのまま読む）** |
+| `~/.agents/plugins/marketplace.json` | 個人用 |
+
+**現行の `.claude-plugin/marketplace.json` がそのまま読まれる可能性がある**が、マニュアルの記述は
+「ChatGPT デスクトップアプリが読める」という文脈であり、**CLI でも同じ探索が行われるかは未検証**である。
+安全策として、Codexネイティブな `.agents/plugins/marketplace.json` を追加し、
+両ファイルが同じ `plugins/dev-workflow` を指す構成にする。
+
+なお `.claude-plugin/plugin.json` は `.codex-plugin/plugin.json` に**正規化変換される**仕組みも
+存在するが（`claude_format_normalized`）、これは公開ポータルへの提出経路の記述であり、
+ローカル配布で同じ変換が働くとは限らない。**`.codex-plugin/plugin.json` は明示的に用意する。**
+
+#### 3.6.3. 導入コマンド
+
+```bash
+# GitHub ショートハンド / HTTPS / SSH / ローカルパスのいずれも可
+codex plugin marketplace add masatoImayama/claude-dev-workflow-marketplace
+codex plugin marketplace add https://github.com/masatoImayama/claude-dev-workflow-marketplace.git --ref master
+
+codex plugin add dev-workflow@<marketplace-name>
+
+# Git マーケットプレイスのスナップショット更新（配信後に利用者が実行する）
+codex plugin marketplace upgrade <marketplace-name>
+```
+
+`--sparse <PATH>` を繰り返し指定すると Git ソースをスパースチェックアウトできる。
+インストール先は `~/.codex/plugins/cache/$MARKETPLACE_NAME/$PLUGIN_NAME/$VERSION/`。
+有効／無効の状態は `~/.codex/config.toml` に記録される。
+
+`marketplaces.allowed_sources` で許可ソースを制限できる（`source = "git"` は `url`、
+`source = "local"` は絶対パス、`source = "host_pattern"` はホスト名の正規表現）。
+
+#### 3.6.4. 配信フローへの影響
+
+現行の2コミット方式（内容更新 → SHA更新）は維持できるが、**SHA を2ファイルに書く**必要がある。
+
+1. `plugins/dev-workflow/` を更新してコミット・push
+2. そのコミットSHAを `.claude-plugin/marketplace.json` と
+   `.agents/plugins/marketplace.json` の**両方**に書いてコミット・push
 
 ---
 
@@ -733,9 +852,19 @@ Claude Code側の挙動を一切変えずに、ベンダー中立な内容を単
 - [ ] `adapters/codex/run-loop.sh` の実装（`codex exec` による無人ループ）
 - [ ] evaluator の判定JSONを `--output-schema` で強制するスキーマファイルを作成
 - [ ] `codex-dev-workflow` の知見を取り込み、統合・廃止（4.9の移行手順）
-- [ ] Codex 側マーケットプレイスに登録し、`codex plugin add` で導入確認
 - [ ] 実プロジェクトで planner → generator → evaluator の1サイクルが回ることを確認
 - [ ] プラグイン同梱フックの信頼付与フローを確認し、README に手順を記載
+
+#### Phase C の配布作業（方式は 3.6 で確定済み）
+
+- [ ] marketplace リポジトリに `.agents/plugins/marketplace.json` を追加
+      （`source: git-subdir` + `policy.installation` / `policy.authentication` / `category`）
+- [ ] `.claude-plugin/marketplace.json` がCLIでもレガシー互換パスとして読まれるかを実測
+      （読まれるなら二重管理を廃止できる）
+- [ ] 配信スクリプトを2ファイルのSHA更新に対応させる（3.6.4）
+- [ ] `codex plugin marketplace add` → `codex plugin add dev-workflow@<name>` で導入確認
+- [ ] `codex plugin marketplace upgrade` で更新が反映されることを確認
+- [ ] README に Codex 側の導入手順を追記
 
 ### Phase D: プロジェクト指示ファイルの生成
 
@@ -752,13 +881,20 @@ Claude Code側の挙動を一切変えずに、ベンダー中立な内容を単
 - [ ] Codex 側で緩む点（`maxTurns` 相当なし、worktree分離なし、`sandbox_mode` の粒度が粗い）を明記
 - [ ] marketplace リポジトリ側のコピーとSHAを更新して配信
 
+### 調査済みの事項（初版の未確認リスト）
+
+| 項目 | 結論 | 対応 |
+| --- | --- | --- |
+| `maxTurns` 相当の設定があるか | **無い。** 近いのは `features.rollout_budget` だが under development・既定オフ・トークン予算 | オーケストレーター側で反復回数を制御し、打ち切り条件はプロンプト規約で担保（3.3.4） |
+| サブエージェントを worktree に隔離できるか | **不可。** セッション単位の worktree は第一級機能だが、エージェント設定に作業ディレクトリのキーがない | generator の並行実行を諦め、Epicごと1 worktreeで逐次、またはシェルループが `codex exec -C` で割り当て（3.3.3） |
+| Codex marketplace の `source` に git 系があるか | **ある。** `git-subdir` / `url` / `npm` / `local`。`git-subdir` は現行の Claude Code 形式と同形 | 既存の marketplace リポジトリを両CLI共用にする（3.6） |
+
 ### 残る未確認事項
 
 | 項目 | 影響 |
 | --- | --- |
-| `maxTurns` 相当の設定があるか | 無ければ暴走時の停止条件をプロンプト側で担保する必要がある |
-| サブエージェントを worktree に隔離できるか | 並行実行時の衝突回避方法が変わる |
-| Codex marketplace の `source` に git 系があるか | 配布形態（local パス配布か git 配布か）が変わる |
+| `.claude-plugin/marketplace.json` をCLIもレガシー互換パスとして読むか | 読むなら Codex 用マーケットプレイスファイルの二重管理が不要になる（マニュアルの記述はデスクトップアプリの文脈） |
+| `.claude-plugin/plugin.json` のローカル配布時の正規化変換の有無 | `claude_format_normalized` は公開ポータル提出経路の記述。ローカルでも働くなら `.codex-plugin/plugin.json` が不要になる（安全側に倒して明示的に用意する方針） |
 
 ### フェーズをまたぐ不変条件
 
