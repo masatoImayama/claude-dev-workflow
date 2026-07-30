@@ -643,7 +643,15 @@ codex-dev-workflow/                 # codex-dev-workflow@personal としてイ�
    codex plugin remove codex-dev-workflow@personal
    ```
 
-5. [ ] `codex-dev-workflow` リポジトリをアーカイブする（未実施）
+5. [x] ローカルクローンを削除する（`origin/main` と同期済み・固有の変更なしを確認のうえ実施）
+6. [ ] GitHub リポジトリを削除する（**未実施。** `gh` トークンに `delete_repo` スコープが必要。
+   `gh auth refresh -h github.com -s delete_repo` を実行してから `gh repo delete` する）
+
+旧版の `scripts/check-prerequisites.ps1` は取り込んでいない。
+`scripts/check-prerequisites.sh` が同じ項目（gh のインストールと認証、Docker のインストールと
+デーモン起動、gitリポジトリ内であること）をすべて確認しており、加えて `gh auth setup-git` による
+git認証の委任まで行うため、**機能的に上位互換**である。フックはすべて bash 経由で起動するので
+PowerShell 版を残す理由がない。
 
 #### 旧版から意図的に落とした機能
 
