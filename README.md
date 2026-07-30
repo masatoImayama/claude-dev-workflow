@@ -257,9 +257,25 @@ YOLOモードではClaude Code本体のパーミッション確認を無効化�
 
 | 層 | 内容 |
 |---|---|
-| **フック**（中核） | `PostToolUse(Write/Edit)` と `Stop` で `check-readability.sh` が変更を走査。違反を検出すると **exit 2 でブロックし、理由をエージェントに差し戻す**（自己修正ループ）。AIの判断に依存しない |
+| **フック**（中核） | `PostToolUse(Write/Edit)` と `Stop` で `check-readability.sh` が変更を走査。違反を検出すると**ブロックし、理由をエージェントに差し戻す**（自己修正ループ）。AIの判断に依存しない |
+| **git pre-commit**（任意） | CLIを問わず、コミット時にステージ済みの変更を走査してブロックする。下記で設置する |
 | **generator** | 「ソースは人間可読／生成物を正本にしない／元ソースを必ず残す」を最優先ルールとして遵守 |
 | **evaluator** | Epic一括レビューで可読性違反を**重要度「高」の必須対応指摘**として扱う |
+
+### git pre-commit への設置（ベンダー非依存の最終防衛線）
+
+CLIのフックは「編集直後の即時フィードバック」を担いますが、素の `git commit` や別のツールから
+編集された場合は通りません。git 側にも同じガードを置くと、どこから編集してもコミットは通らなくなります。
+
+```bash
+# 設置（既存の pre-commit がある場合は壊さず追記する）
+bash "${CLAUDE_PLUGIN_ROOT}/adapters/common/install-git-hooks.sh" .
+
+# 解除
+bash "${CLAUDE_PLUGIN_ROOT}/adapters/common/install-git-hooks.sh" --uninstall .
+```
+
+一時的に回避する場合は `READABILITY_GUARD=off git commit ...` とします。
 
 ### 検出するもの
 
@@ -277,6 +293,36 @@ YOLOモードではClaude Code本体のパーミッション確認を無効化�
 READABILITY_GUARD=off          # ガード全体を無効化
 READABILITY_MAX_BASE64=2000    # 連続base64文字列の許容上限（文字数）
 READABILITY_MAX_LINE=5000      # ソース1行の許容上限（文字数）
+```
+
+### ブロック契約（マルチベンダー対応）
+
+違反の通知方法はCLIごとに契約が異なるため、実行中のCLIを自動判定して出し分けます。
+
+| 実行環境 | 判定条件 | 通知方法 |
+|---|---|---|
+| Claude Code | 既定 | `exit 2` + stderr |
+| Codex CLI | `PLUGIN_ROOT` が設定済み、または入力JSONに `turn_id` がある | `exit 0` + stdout に `{"continue": false, ...}` |
+| git pre-commit | インストーラが `DEV_WORKFLOW_HOOK_VENDOR=exit-code` を設定 | `exit 1` + stderr |
+
+`DEV_WORKFLOW_HOOK_VENDOR=claude|codex|exit-code` で自動判定を上書きできます（デバッグ・CI用）。
+
+## サンドボックス設定
+
+実装・テストに使うコンテナの設定は環境変数を正本として解決します（plugin userConfig は
+他CLIに相当物がないため）。
+
+```bash
+DEV_WORKFLOW_DOCKER_IMAGE=my-image:tag      # 既存イメージを使う（ビルドしない）
+DEV_WORKFLOW_DOCKER_COMPOSE_FILE=path.yml   # 使用する compose ファイル
+DEV_WORKFLOW_DOCKERFILE=path                # 使用する Dockerfile（既定: Dockerfile.dev）
+```
+
+未設定の場合は `Dockerfile.dev` → `docker-compose.dev.yml` の順に探索します。
+現在の解決結果は次のコマンドで確認できます。
+
+```bash
+bash "${CLAUDE_PLUGIN_ROOT}/scripts/resolve-sandbox.sh" --print
 ```
 
 ## Slack通知

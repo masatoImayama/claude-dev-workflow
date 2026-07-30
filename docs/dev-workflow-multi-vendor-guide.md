@@ -540,8 +540,26 @@ degrade させる」としていたが、`multi_agent` と `codex exec` の存�
    stdout の `{"continue": false, ...}`（Codex）の両方を満たす。入力の hook JSON に含まれる
    Codex 固有フィールド（`turn_id` / `permission_mode` / `model`）で分岐する
 2. **`Notification` イベントの扱い** — Codex のイベント一覧に `Notification` は無い。
-   Slack通知の該当分は `UserPromptSubmit` か `PermissionRequest` への読み替え、
-   または Codex では当該通知を出さない選択とする（要検討）
+
+**決定: `hooks.json` を1ファイルに共有せず、Codex 用に `hooks/hooks.codex.json` を分ける。**
+
+`.codex-plugin/plugin.json` の `hooks` エントリでパスを上書きできる（既定は `hooks/hooks.json`）ため、
+マニフェスト側で切り替える。
+
+```json
+{ "name": "dev-workflow", "hooks": "./hooks/hooks.codex.json" }
+```
+
+理由は2つ。
+
+- Codex が未知のイベントキー（`Notification`）を含む `hooks.json` を許容するかが未検証であり、
+  共有して壊れると**フック全体が読まれなくなる**リスクがある
+- `Notification` は Claude Code の「入力待ち」通知に紐づく概念で、
+  Codex の `PermissionRequest` とは意味が異なる。機械的な読み替えは誤った通知を生む
+
+`hooks.codex.json` は `Notification` を除いた構成とし、Slack通知は `Stop` のみに紐づける。
+「入力待ち」通知は Codex 側では提供しない（既定でOFFの機能なので実害は小さい）。
+実装は Phase C（`.codex-plugin/plugin.json` の作成）と同時に行う。
 
 加えて、**強制点をgit側に二重化する**（`adapters/common/install-git-hooks.sh`）。
 これはベンダー非依存の保険であり、フックが移植できるようになった今でも価値がある
@@ -830,15 +848,20 @@ Claude Code側の挙動を一切変えずに、ベンダー中立な内容を単
 - [x] v0.7.2 として配信
 - [ ] 実プロジェクトで `/dev-workflow:plan` / `/dev-workflow:run` が改修前と同等に動作することを確認
 
-### Phase B: フックの両CLI対応
+### Phase B: フックの両CLI対応（完了）
 
-- [ ] `scripts/check-readability.sh` を二重出力対応にする
-      （`exit 2` + stderr / stdout の `{"continue": false, ...}`）
-- [ ] hook JSON の Codex 固有フィールド（`turn_id` / `permission_mode` / `model`）による分岐を実装
-- [ ] `Notification` イベントの Codex 側の扱いを決める（読み替えるか、出さないか）
-- [ ] `scripts/*.sh` を環境変数フォールバック対応にする（4.6）
-- [ ] `adapters/common/install-git-hooks.sh` の実装（pre-commit への二重化）
-- [ ] Claude Code 側で従来どおりブロックされることを回帰確認
+- [x] `scripts/check-readability.sh` を3契約対応にする
+      （Claude Code: `exit 2` + stderr / Codex: `exit 0` + stdout JSON / git: `exit 1` + stderr）
+- [x] 実行中のCLIの判定を実装（`DEV_WORKFLOW_HOOK_VENDOR` > `PLUGIN_ROOT` > 入力JSONの `turn_id`）
+      ※ `permission_mode` は両CLIに存在するため判定に使えない。`turn_id` / `PLUGIN_ROOT` が Codex 固有
+- [x] フック入力の読み取りを冒頭に集約し、tty のときは読まない（手動実行時のブロック回避）
+- [x] `--staged` モードの追加（pre-commit 用にステージ済み変更のみを検査）
+- [x] `Notification` イベントの Codex 側の扱いを決定（`hooks/hooks.codex.json` に分離。上記4.5参照）
+- [x] `scripts/resolve-sandbox.sh` の実装（環境変数を正本にサンドボックス設定を解決）
+- [x] `adapters/common/install-git-hooks.sh` の実装（pre-commit への二重化。追記方式・冪等・アンインストール対応）
+- [x] 3契約すべての回帰確認（違反あり／なし／`READABILITY_GUARD=off`／JSON妥当性／
+      `file_path` 抽出／pre-commit のブロック・通過・バイパス・冪等・アンインストール）
+- [ ] 実プロジェクトで Claude Code のフックが従来どおり動作することを確認（セッション再起動が必要）
 
 ### Phase C: Codex アダプタ
 

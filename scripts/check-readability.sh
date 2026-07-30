@@ -6,19 +6,27 @@
 # base64+gzip化、ミニファイ/難読化されたソースのコミット等）が混入するのを
 # 物理的に阻止する。
 #
-# 検出した場合は exit 2 + stderr を返す:
-#   - PostToolUse(Write|Edit) フック → そのツール結果をブロックし、理由をエージェントに差し戻す（自己修正ループ）
+# 違反の通知方法はCLIごとに契約が異なるため、実行中のCLIを判定して出し分ける:
+#   - Claude Code … exit 2 + stderr にメッセージ
+#   - Codex CLI  … exit 0 + stdout に {"continue": false, ...} のJSON
+#   - pre-commit … exit 1 + stderr にメッセージ（--exit-code で明示）
+#
+# どちらも
+#   - PostToolUse(Write|Edit) フック → ツール結果をブロックし、理由をエージェントに差し戻す（自己修正ループ）
 #   - Stop フック → セッション終了をブロックし、修正を促す
 #
 # 使い方:
 #   check-readability.sh                # stdin の hook JSON から file_path を抽出して検査
 #   check-readability.sh --git          # git の変更ファイル全体を検査（Stop フック用）
+#   check-readability.sh --staged       # ステージ済みの変更のみ検査（pre-commit フック用）
 #   check-readability.sh FILE [FILE...]  # 指定ファイルを検査（手動/CI用）
 #
 # 無効化・調整（環境変数）:
 #   READABILITY_GUARD=off               # ガード全体を無効化
 #   READABILITY_MAX_BASE64=2000         # 連続するbase64文字列の許容上限（文字数）
 #   READABILITY_MAX_LINE=5000           # ソース1行の許容上限（文字数。ミニファイ検出）
+#   DEV_WORKFLOW_HOOK_VENDOR=claude|codex|exit-code
+#                                       # ベンダー自動判定を上書きする（デバッグ・CI用）
 #
 # エスケープハッチ:
 #   正当な理由で巨大なエンコード済みデータが必要な場合、そのファイル内に
@@ -34,6 +42,46 @@ fi
 
 MAX_BASE64="${READABILITY_MAX_BASE64:-2000}"
 MAX_LINE="${READABILITY_MAX_LINE:-5000}"
+
+# ── フック入力の読み取り ─────────────────────────────────────────────
+# フック実行時は stdin に JSON が渡る。端末から手で叩いた場合は stdin が tty に
+# なるため読まない（読むとブロックしてしまう）。
+HOOK_INPUT=""
+if [ ! -t 0 ]; then
+  HOOK_INPUT="$(cat 2>/dev/null || true)"
+fi
+
+# ── 実行中のCLIを判定 ────────────────────────────────────────────────
+# Claude Code と Codex CLI はフックのブロック契約が異なるため、出力を出し分ける。
+#   1. DEV_WORKFLOW_HOOK_VENDOR が明示されていればそれに従う
+#   2. Codex はプラグインフックに PLUGIN_ROOT を設定する（Claude Code は
+#      CLAUDE_PLUGIN_ROOT のみを設定し、PLUGIN_ROOT は設定しない）
+#   3. 保険として、入力JSONに Codex 固有拡張の turn_id があれば Codex と判定する
+detect_hook_vendor() {
+  if [ -n "${DEV_WORKFLOW_HOOK_VENDOR:-}" ]; then
+    printf '%s' "$DEV_WORKFLOW_HOOK_VENDOR"
+    return
+  fi
+  if [ -n "${PLUGIN_ROOT:-}" ]; then
+    printf 'codex'
+    return
+  fi
+  case "$HOOK_INPUT" in
+    *'"turn_id"'*) printf 'codex'; return ;;
+  esac
+  printf 'claude'
+}
+
+# 文字列をJSON文字列リテラルに変換する（jq非依存）
+json_string() {
+  local s="$1"
+  s="${s//\\/\\\\}"
+  s="${s//\"/\\\"}"
+  s="${s//$'\t'/\\t}"
+  s="${s//$'\r'/}"
+  s="${s//$'\n'/\\n}"
+  printf '"%s"' "$s"
+}
 
 # ── 許可リスト（このパターンに一致するパスは検査をスキップ）────────────
 # 生成物・ロックファイル・テストフィクスチャ・ベンダリングされた依存など、
@@ -104,13 +152,18 @@ if [ "${1:-}" = "--git" ]; then
     while IFS= read -r f; do [ -n "$f" ] && files+=("$f"); done < <(git diff --name-only HEAD 2>/dev/null)
     while IFS= read -r f; do [ -n "$f" ] && files+=("$f"); done < <(git ls-files --others --exclude-standard 2>/dev/null)
   fi
+elif [ "${1:-}" = "--staged" ]; then
+  # ステージ済みの変更のみ（pre-commit フック用）
+  if git rev-parse --is-inside-work-tree &>/dev/null 2>&1; then
+    while IFS= read -r f; do [ -n "$f" ] && files+=("$f"); done \
+      < <(git diff --cached --name-only --diff-filter=ACMR 2>/dev/null)
+  fi
 elif [ "$#" -gt 0 ]; then
   # 引数で指定されたファイル
   files=("$@")
 else
-  # stdin の hook JSON から file_path を抽出（PostToolUse 用）
-  input="$(cat 2>/dev/null || true)"
-  raw=$(printf '%s' "$input" | grep -oE '"file_path"[[:space:]]*:[[:space:]]*"[^"]*"' | head -1 \
+  # フック入力のJSONから file_path を抽出（PostToolUse 用）
+  raw=$(printf '%s' "$HOOK_INPUT" | grep -oE '"file_path"[[:space:]]*:[[:space:]]*"[^"]*"' | head -1 \
         | sed -E 's/.*"file_path"[[:space:]]*:[[:space:]]*"([^"]*)".*/\1/')
   if [ -n "$raw" ]; then
     # JSONエスケープ解除（\\ → \）と Windows パスの正規化（\ → /）
@@ -132,17 +185,37 @@ for f in "${files[@]}"; do
   fi
 done
 
-if [ "$violated" -eq 1 ]; then
-  {
-    echo "可読性ガードが違反を検出しました。「ソースを読めば何をしているのか分かる」状態を壊す変更はブロックされます。"
-    echo ""
-    printf '%b' "$report"
-    echo "対応方針:"
-    echo "  1. エンコード/圧縮/ミニファイした成果物を「ソースの正本」としてコミットしない。"
-    echo "  2. 元の人間可読なソースを必ずバージョン管理に残し、エンコード/ビルドは実行時・ビルド時に行う。"
-    echo "  3. どうしても必要な場合のみ、ファイル内に 'readability-guard:allow <理由>' を明記して理由を残す。"
-  } >&2
-  exit 2
-fi
+[ "$violated" -eq 0 ] && exit 0
 
-exit 0
+# ── 違反メッセージの組み立て ─────────────────────────────────────────
+message=$(
+  echo "可読性ガードが違反を検出しました。「ソースを読めば何をしているのか分かる」状態を壊す変更はブロックされます。"
+  echo ""
+  printf '%b' "$report"
+  echo "対応方針:"
+  echo "  1. エンコード/圧縮/ミニファイした成果物を「ソースの正本」としてコミットしない。"
+  echo "  2. 元の人間可読なソースを必ずバージョン管理に残し、エンコード/ビルドは実行時・ビルド時に行う。"
+  echo "  3. どうしても必要な場合のみ、ファイル内に 'readability-guard:allow <理由>' を明記して理由を残す。"
+)
+
+# ── CLIごとの契約で通知する ──────────────────────────────────────────
+case "$(detect_hook_vendor)" in
+  codex)
+    # Codex は stdout のJSONでブロックする。非0終了は「フックの失敗」として
+    # 扱われ、JSONが読まれないため exit 0 で返す。
+    printf '{"continue":false,"stopReason":%s,"systemMessage":%s}\n' \
+      "$(json_string '可読性ガードが違反を検出しました')" \
+      "$(json_string "$message")"
+    exit 0
+    ;;
+  exit-code)
+    # pre-commit などの素のgitフック用。慣例どおり exit 1 で失敗させる。
+    printf '%s\n' "$message" >&2
+    exit 1
+    ;;
+  *)
+    # Claude Code。exit 2 + stderr でツール結果をブロックし、理由を差し戻す。
+    printf '%s\n' "$message" >&2
+    exit 2
+    ;;
+esac
