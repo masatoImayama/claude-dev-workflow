@@ -624,14 +624,36 @@ codex-dev-workflow/                 # codex-dev-workflow@personal としてイ�
 ベンダー間の差分は `.codex-plugin/plugin.json` と `.codex/agents/*.toml` の生成のみに収まる。
 2系統を保守する理由がない。
 
-移行手順：
+移行手順（実施済みの手順は実機で確認したコマンドに置き換えてある）：
 
-1. `codex-dev-workflow/skills/*` の内容を確認し、Codex 固有の知見（PowerShell 版の前提チェック、
-   Codex 向けの言い回し）を `adapters/codex/` 側に取り込む
-2. `dev-workflow` に `.codex-plugin/plugin.json` を追加する
-3. Codex 側のマーケットプレイスに `dev-workflow` を登録する
-4. `codex plugin remove codex-dev-workflow` で旧プラグインを削除する
-5. `codex-dev-workflow` リポジトリをアーカイブする
+1. [x] `codex-dev-workflow/skills/*` の内容を `skills-codex/` に取り込む。
+   旧版はタスクごとにレビューする古い設計だったため、**現行の core（Epic一括レビュー）に合わせて改訂した**
+2. [x] `dev-workflow` に `.codex-plugin/plugin.json` を追加する
+3. [x] Codex 側のマーケットプレイスに登録する
+
+   ```bash
+   codex plugin marketplace add masatoImayama/claude-dev-workflow-marketplace --ref master
+   codex plugin add dev-workflow@dev-workflow-marketplace
+   ```
+
+4. [x] 旧プラグインを削除する。**`<plugin>@<marketplace>` の形式が必須**
+   （`codex plugin remove codex-dev-workflow` だけではエラーになる）
+
+   ```bash
+   codex plugin remove codex-dev-workflow@personal
+   ```
+
+5. [ ] `codex-dev-workflow` リポジトリをアーカイブする（未実施）
+
+#### 旧版から意図的に落とした機能
+
+旧 `codex-dev-workflow` には `dev-workflow-review` という**単体のレビュースキル**があったが、
+`skills-codex/` には引き継いでいない。現行の core は「レビューはEpic単位でまとめて行う」方針で、
+タスク単位のレビューを明示的に禁止しているためである（レビューが最もコストの高い工程であり、
+タスクごとに起動するとレビュー費用が実装費用を上回る）。
+
+Epic の途中で単発レビューをしたい需要があれば、`evaluator` エージェントを直接起動すれば足りる。
+専用スキルとして復活させるかは運用してから判断する。
 
 ---
 
@@ -883,9 +905,14 @@ Claude Code側の挙動を一切変えずに、ベンダー中立な内容を単
 - [x] `install-agents.sh` の結合テスト（未設置検出／設置／`--check`／モデル指定の反映）
 - [x] `run-loop.sh` のエラー経路テスト（引数なし／前提未達で worktree を作らずに落ちる）
 - [x] README に Codex での導入手順・無人実行・Claude Code との差分表を追記
-- [ ] `codex-dev-workflow` の統合・廃止（4.9の移行手順）
+- [x] marketplace リポジトリに `.agents/plugins/marketplace.json` を追加（`git-subdir` + `policy` + `category`）
+- [x] 配信フローを2ファイルのSHA更新に対応（`.claude-plugin/` と `.agents/plugins/` の両方）
+- [x] **実機で導入を検証**（`codex plugin marketplace add` → `codex plugin add`。
+      `.agents/plugins/marketplace.json` が読まれ、`git-subdir` とSHAが正しく解決された）
+- [x] `codex-dev-workflow@personal` を削除（スキル名が3件衝突していたため必須の作業だった）
 - [ ] 実プロジェクトで planner → generator → evaluator の1サイクルが回ることを確認
 - [ ] プラグイン同梱フックの信頼付与フローを実機で確認
+- [ ] `codex-dev-workflow` リポジトリのアーカイブ（ユーザー判断待ち）
 
 #### 実装時に判明した設計上の判断
 
