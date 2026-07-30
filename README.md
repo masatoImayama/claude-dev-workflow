@@ -43,7 +43,7 @@ claude
 ### ローカルでテスト（インストール不要）
 
 ```bash
-claude --plugin-dir /path/to/claude-dev-workflow
+claude --plugin-dir /path/to/dev-workflow
 ```
 
 ## 前提条件

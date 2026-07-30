@@ -8,7 +8,7 @@
     "name": "masatoImayama",
     "url": "https://github.com/masatoImayama"
   },
-  "repository": "https://github.com/masatoImayama/claude-dev-workflow",
+  "repository": "https://github.com/masatoImayama/dev-workflow",
   "license": "MIT",
   "keywords": ["workflow", "agents", "autonomous", "github-issues", "tdd", "docker", "sandbox"],
   "userConfig": {
