@@ -29,15 +29,31 @@ GitHub issue に記載されたタスクを1つずつ、サンドボックス内
 
 ## 作業フロー
 
-### 0. Epicブランチを最新に同期
+### 0. Epicブランチを最新に同期し、ベースを検証する
 
-**タスク開始前に必ず実行する。** 古いベースで分岐すると後続タスクの変更が反映されず、コンフリクトが発生する。
+**タスク開始前に必ず実行する。** 古いベースや別のブランチから分岐すると、先行タスクの変更が
+存在しないツリー上で実装・テストすることになり、それでもテストは通ってしまう。
 
 ```bash
 git fetch origin
 git checkout "${EPIC_BRANCH}"
 git pull origin "${EPIC_BRANCH}"
 ```
+
+**同期しただけで先に進んではならない。** 実装を始める前に、自分の HEAD が指示されたベースの
+子孫であることを機械的に確認する:
+
+```bash
+# 指定ベースの子孫でなければ、作業を開始せずに報告して終了する
+git merge-base --is-ancestor "origin/${EPIC_BRANCH}" HEAD || {
+  echo "ERROR: 指定ベース origin/${EPIC_BRANCH} の子孫ではありません"
+  echo "実際の分岐元: $(git merge-base "origin/${EPIC_BRANCH}" HEAD)"
+  exit 1
+}
+```
+
+この検証に失敗した場合、**自力で直そうとせず、上記の出力をそのまま報告して停止する。**
+誤ったベースの上で実装を続けると、先行タスクの変更を打ち消す差分ができる。
 
 ### 1. タスクの確認
 
@@ -61,13 +77,52 @@ gh issue view "$TASK_NUMBER"
 
 ### 4. テスト実行（サンドボックス内）
 
-```bash
-# Dockerfile.dev ベースの場合
-docker run --rm -v "$(pwd):/workspace" -w /workspace "dev-sandbox:[project]" [test-command]
+サンドボックスへのコマンド投入は**必ず `sandbox-exec.sh` 経由で行う。** `docker run` を直接
+組み立ててはならない。このスクリプトがキャッシュの永続化・コンテナの再利用・Windows の
+パス変換対策をまとめて引き受ける。
 
-# docker-compose.dev.yml ベースの場合
-docker compose -f docker-compose.dev.yml exec app [test-command]
+```bash
+bash "${CLAUDE_PLUGIN_ROOT}/scripts/sandbox-exec.sh" '[test-command]'
 ```
+
+#### コマンドは1回にまとめる
+
+**ビルド・vet・テストを別々に呼び出してはならない。** サンドボックスはソースツリーを
+バインドマウントしており、フルツリーを走査するコマンドは1回ごとにその走査コストを払う。
+実測（Go・64,000ファイル規模・Windows）では、この走査が所要時間の大半を占め、
+1コマンドあたり約2分かかった。4〜6回に分けて叩くと1タスクで8〜12分が待ち時間になる。
+
+```bash
+# 悪い例: 走査コストを4回払う
+bash .../sandbox-exec.sh 'go build ./...'
+bash .../sandbox-exec.sh 'go vet ./...'
+bash .../sandbox-exec.sh 'go test ./...'
+
+# 良い例: 1回にまとめる（テストがビルドを兼ねるなら、それ1本で足りる）
+bash .../sandbox-exec.sh 'make test'
+```
+
+#### 回帰確認は「プロジェクトの全テスト」で行う
+
+**自分が触った箇所に関係するテストだけを選んではならない。** 変更したファイルから辿れない
+テストが壊れるケース（外部応答の文言変更が、別テストの部分一致アサーションを壊す等）を
+取りこぼす。`make test` 等のプロジェクト標準ターゲットがあればそれを使う。
+
+- `-run` でテストを1件に絞った状態を「回帰なし」と報告してはならない
+- ビルドタグ付きのテスト（`//go:build integration` 等）がある場合はそれも実行する
+
+#### SKIP を通過扱いにしない
+
+依存物が未配置だとテストが無言で `SKIP` され、`ok` と表示されて**成功に見える**。
+
+```
+--- SKIP: TestE2E_Foo (0.00s)
+PASS
+ok  	example.com/pkg	0.032s
+```
+
+`ok` の有無だけで判定せず、**SKIP件数を確認し、検証したかった処理が実際に走ったことを確かめる。**
+意図しない SKIP があれば、その事実を報告に含める。
 
 ### 5. コミット
 
@@ -90,14 +145,27 @@ git commit -m "feat: [内容] (#[task番号])"
 
 タスク完了時は以下を出力する:
 
+**自己申告ではなく、コマンドの実出力を貼ること。** 「ベースは正しい」「回帰なし」といった
+結論だけの報告は、実態と食い違っていても検出できない。
+
 ```
 ## Task #[番号] 完了
+
+### ベース（実出力を貼る。自己申告しない）
+$ git merge-base --is-ancestor origin/[epicブランチ] HEAD && echo OK
+[実出力]
+$ git log --oneline -1 $(git merge-base origin/[epicブランチ] HEAD)
+[実出力]
 
 ### 変更ファイル
 - [ファイル一覧]
 
 ### テスト結果（サンドボックス内）
-- [テスト実行結果]
+実行したコマンドの全文:
+$ bash .../sandbox-exec.sh '[実際に叩いたコマンドをそのまま]'
+[実出力]
+
+- SKIP件数: [件数]（意図しないSKIPがあればその内容）
 
 ### コミット
 - [コミットハッシュ]: [メッセージ]

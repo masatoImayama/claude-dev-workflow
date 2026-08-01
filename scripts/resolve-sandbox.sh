@@ -40,8 +40,14 @@ if [ -n "${DEV_WORKFLOW_DOCKER_IMAGE:-}" ]; then
 elif [ -f "$DOCKERFILE" ]; then
   MODE="dockerfile"
   USE_DOCKERFILE="$DOCKERFILE"
-  # プロジェクトディレクトリ名でタグ付けする（並行実行しても衝突しない）
-  IMAGE="dev-sandbox:$(basename "$(pwd)")"
+  # リポジトリ名でタグ付けする。worktree の basename（agent-xxxx 等）を使うと
+  # worktree ごとに別タグとなり、既にビルド済みのイメージを取り逃す。
+  GIT_COMMON="$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null || true)"
+  if [ -n "$GIT_COMMON" ]; then
+    IMAGE="dev-sandbox:$(basename "$(dirname "$GIT_COMMON")")"
+  else
+    IMAGE="dev-sandbox:$(basename "$(pwd)")"
+  fi
 elif [ -f "$COMPOSE_FILE" ]; then
   MODE="compose"
   USE_COMPOSE="$COMPOSE_FILE"

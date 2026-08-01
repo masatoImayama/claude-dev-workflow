@@ -110,6 +110,31 @@ fi
 コンテナ内でコードをマウントし、全ての実装・テスト・ビルドコマンドをコンテナ内で実行する。
 Gitオペレーション（commit, push等）はホスト側で実行する。
 
+### サンドボックスへのコマンド投入は sandbox-exec.sh 経由に統一する
+
+**`docker run` を直接組み立ててはならない。** 以下をすべて `scripts/sandbox-exec.sh` が引き受ける:
+
+- **ビルドキャッシュの永続化** — `docker run --rm` はコンテナ層を毎回捨てるため、`GOCACHE` 等に
+  貯まったコンパイル結果が次回に残らない。言語ごとのキャッシュディレクトリを named volume 化する
+- **コンテナの再利用** — Epic 単位で常駐させ `docker exec` で叩き、起動オーバーヘッドを消す
+- **Windows のパス変換対策** — Git Bash（MSYS）は `-w /workspace` を
+  `C:/Program Files/Git/workspace` に変換してしまい、`docker run` がそのまま失敗する。
+  `MSYS_NO_PATHCONV=1` と `pwd -W` で回避する
+- **イメージタグの安定化** — タグをリポジトリ名基準にし、worktree ごとに別イメージを
+  ビルドし直す事故を防ぐ
+
+```bash
+# 実行（複数コマンドは1回にまとめる。後述）
+bash "${CLAUDE_PLUGIN_ROOT}/scripts/sandbox-exec.sh" --epic "$EPIC_NUM" 'make test'
+
+# キャッシュを温める（最初のタスクにキャッシュ構築コストを負担させない）
+bash "${CLAUDE_PLUGIN_ROOT}/scripts/sandbox-exec.sh" --epic "$EPIC_NUM" --warm '[build-command]'
+```
+
+終了コードは実行したコマンドのものがそのまま返るので、機械的ゲートの判定に使える。
+
+Docker sandbox の準備が終わったら、続けて `--warm` を1回流しておく。
+
 ## 2エージェント体制
 
 | エージェント | 役割 | 起動頻度 | 判断権限 |
@@ -189,13 +214,18 @@ generatorをworktreeで起動し、Docker sandbox内でEpicブランチ上のタ
 ```
 @generator
 Task #[番号] を実装してください。
-- Epicブランチ: [epic/epicXX/機能名] （必ず最新を同期してから作業開始すること）
-- Docker sandbox内で実装・テストを実行すること
+- Epicブランチ: [epic/epicXX/機能名]（最新は commit [ハッシュ]）
+- 作業開始前に `git fetch origin` で同期し、`git merge-base --is-ancestor origin/[epicブランチ] HEAD`
+  でベースを検証すること。偽なら実装を始めず、実出力を添えて報告し停止すること
+- サンドボックスへのコマンド投入は `${CLAUDE_PLUGIN_ROOT}/scripts/sandbox-exec.sh` 経由で行い、
+  ビルド・テストは1回の呼び出しにまとめること（分けると待ち時間が倍増する）
+- 回帰確認はプロジェクトの全テストで行うこと。`-run` で絞った結果を「回帰なし」と報告しないこと
+- SKIP されたテストがあれば件数と内容を報告に含めること
 - issueの要件を確認
 - 親Epic issueの本文から仕様書・計画書を参照
 - テストファーストで実装
-- 全テストが通ることを確認（Docker内で実行）
 - 変更をコミット
+- 報告には「実際に叩いたテストコマンドの全文」と「ベース検証の実出力」を含めること
 ```
 
 ### Step 4: 機械的ゲート（LLMレビューなし）
@@ -205,15 +235,29 @@ Task #[番号] を実装してください。
 ```bash
 cd "$EPIC_WT"
 
-# 1) テスト（Docker sandbox内）— 落ちたら不合格
-docker run --rm -v "$(pwd):/workspace" -w /workspace dev-sandbox:$(basename $(pwd)) [test-command]
+# 1) テスト＋ビルド（Docker sandbox内）— 1回にまとめる。落ちたら不合格
+bash "${CLAUDE_PLUGIN_ROOT}/scripts/sandbox-exec.sh" --epic "$EPIC_NUM" '[全テストを走らせるコマンド]'
 
-# 2) ビルド/型チェック — プロジェクトに定義があれば実行
-docker run --rm -v "$(pwd):/workspace" -w /workspace dev-sandbox:$(basename $(pwd)) [build-command]
-
-# 3) 可読性ガード — 差分に対して実行（PostToolUseフックと同じ判定）
+# 2) 可読性ガード — 差分に対して実行（PostToolUseフックと同じ判定）
 bash "${CLAUDE_PLUGIN_ROOT}/scripts/check-readability.sh" --git
 ```
+
+#### 何を実行すれば「回帰なし」と言えるか
+
+ゲートで走らせるのは**プロジェクトの全テスト**とする。`make test` 等のプロジェクト標準
+ターゲットがあればそれを優先し、**対象の選択を generator に委ねない。**
+
+- ビルドタグ付きのテスト（`//go:build integration` 等）があるプロジェクトでは、それも含める
+- ビルド・vet・テストを**別々の呼び出しに分けない**。サンドボックスはソースツリーを
+  バインドマウントしており、フルツリーを走査するコマンドは1回ごとにその走査コストを払う。
+  分けるとその分だけ待ち時間が倍増する（実測: 1コマンドあたり約2分）
+- テストがビルドを兼ねるなら（`go test ./...` 等）、それ1本で足りる
+
+#### SKIP を通過扱いにしない
+
+依存物が未配置だとテストが無言で `SKIP` され、`ok` と表示されて成功に見える。
+**`ok` の有無だけで判定してはならない。** 出力中の SKIP 件数を確認し、
+検証したかったテストが実際に走ったことを確かめる。想定外の SKIP は不合格として扱う。
 
 - **全て通過** → Step 5 へ
 - **いずれか失敗** → 失敗ログをgeneratorに渡して Step 3 に戻る（同一タスクで3回失敗したらスキップ）
@@ -222,11 +266,42 @@ bash "${CLAUDE_PLUGIN_ROOT}/scripts/check-readability.sh" --git
 
 ### Step 5: Epicブランチに取り込んで次のタスクへ
 
-1. 変更をEpicブランチにマージ（mainではない）
-2. Epicブランチをリモートにpush: `git push origin ${EPIC_BRANCH}`
-3. Task issueをクローズ: `gh issue close [番号]`
-4. Epic issueの進捗を更新
-5. → Step 1 に戻る（次のタスクへ）
+#### マージは必ず `--ff-only` で行う
+
+**generator の「ベースは正しい」という報告を信じてマージしてはならない。** 指示と異なるベース
+（例: main）から分岐していても、そのツリー上でテストは通ってしまうため、報告だけでは検出できない。
+`--ff-only` は誤ったベースからのマージをここで機械的に止める。
+
+```bash
+cd "$EPIC_WT"
+git checkout "${EPIC_BRANCH}"
+git merge --ff-only "[generatorの作業ブランチ]"
+```
+
+`fatal: Not possible to fast-forward` で失敗した場合、**generator の報告ではなく実態を確認する**:
+
+```bash
+# 実際の分岐元を見る。epic ブランチのコミットでなければ、別ベースから分岐している
+git merge-base "${EPIC_BRANCH}" "[作業ブランチ]"
+git log --oneline -1 "$(git merge-base "${EPIC_BRANCH}" "[作業ブランチ]")"
+```
+
+誤ったベースだった場合は cherry-pick で載せ替える。**載せ替えは自動マージが成功しても
+安全とは限らない**（先行タスクの変更が無いツリーで実装されているため）ので、
+載せ替え後に Step 4 の機械的ゲートを**必ず再実行する**。
+
+```bash
+git cherry-pick "${EPIC_BRANCH}..[作業ブランチ]"
+```
+
+`--ff-only` を使わずにマージすると、先行タスクの変更を打ち消す差分が静かに取り込まれる。
+
+#### 残りの手順
+
+1. Epicブランチをリモートにpush: `git push origin ${EPIC_BRANCH}`
+2. Task issueをクローズ: `gh issue close [番号]`
+3. Epic issueの進捗を更新
+4. → Step 1 に戻る（次のタスクへ）
 
 全タスクが完了したら **「Epic一括レビュー」** へ進む。
 
@@ -440,9 +515,13 @@ git worktree prune
 # docker compose使用時
 docker compose -f docker-compose.dev.yml down 2>/dev/null || true
 
-# 単体コンテナ使用時
-docker rm -f dev-sandbox-$(basename $(pwd)) 2>/dev/null || true
+# 常駐コンテナの削除（キャッシュ volume は次の Epic のために残す）
+bash "${CLAUDE_PLUGIN_ROOT}/scripts/sandbox-exec.sh" --epic "$EPIC_NUM" --down 2>/dev/null || true
 ```
+
+**キャッシュ volume は削除しない。** 次の Epic でそのまま効くのが利点であり、消すと
+毎回キャッシュ構築コストを払い直すことになる。ディスクを空けたい等の理由で明示的に
+消したい場合のみ `--reset-cache` を使う。
 
 ## 自律動作ポリシー（YOLOモード）
 

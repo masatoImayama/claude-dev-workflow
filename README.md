@@ -325,6 +325,36 @@ DEV_WORKFLOW_DOCKERFILE=path                # 使用する Dockerfile（既定: 
 bash "${CLAUDE_PLUGIN_ROOT}/scripts/resolve-sandbox.sh" --print
 ```
 
+### サンドボックスへのコマンド投入
+
+`docker run` を直接組み立てず、`sandbox-exec.sh` を使います。
+
+```bash
+bash "${CLAUDE_PLUGIN_ROOT}/scripts/sandbox-exec.sh" --epic epic259 'make test'
+bash "${CLAUDE_PLUGIN_ROOT}/scripts/sandbox-exec.sh" --epic epic259 --warm 'go build ./...'
+bash "${CLAUDE_PLUGIN_ROOT}/scripts/sandbox-exec.sh" --epic epic259 --down          # 常駐コンテナを削除
+bash "${CLAUDE_PLUGIN_ROOT}/scripts/sandbox-exec.sh" --epic epic259 --reset-cache   # キャッシュ volume も削除
+```
+
+このスクリプトが引き受けること:
+
+| 項目 | 内容 |
+| --- | --- |
+| ビルドキャッシュの永続化 | `docker run --rm` はコンテナ層ごとキャッシュを毎回捨てる。言語ごとのキャッシュディレクトリを named volume 化して次回に残す |
+| コンテナの再利用 | Epic単位で常駐させ `docker exec` で叩き、起動オーバーヘッドを消す |
+| Windows のパス変換対策 | Git Bash（MSYS）は `-w /workspace` を `C:/Program Files/Git/workspace` に変換して `docker run` を失敗させる |
+| イメージタグの安定化 | タグをリポジトリ名基準にし、worktree ごとに同じイメージをビルドし直す事故を防ぐ |
+
+終了コードは実行したコマンドのものがそのまま返るので、機械的ゲートの判定に使えます。
+
+volume 化するパスは既定で Go / Node / Rust / Python 向けを網羅します。イメージが root 以外の
+ユーザーで動く場合は `DEV_WORKFLOW_CACHE_PATHS`（スペース区切り）で上書きしてください。
+compose モードで exec するサービス名は `DEV_WORKFLOW_COMPOSE_SERVICE`（既定: `app`）で変えられます。
+
+> **待ち時間の主因はコンパイルではなくバインドマウントのI/O**（Windows 実測）。
+> フルツリーを走査するコマンドは1回ごとに走査コストを払うため、
+> **ビルド・vet・テストを別々に呼ばず1回にまとめる**ことが最も効きます。
+
 ## Slack通知
 
 **自律実行の完了・許可プロンプトをSlackに通知する。** 長時間の自律実行を放置しておいて、止まったタイミングだけ気づける。
