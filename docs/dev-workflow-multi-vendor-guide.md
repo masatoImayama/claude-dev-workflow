@@ -173,7 +173,7 @@ Epic ごとに1 worktree を割り当てて**逐次実行**するか、シェル
 
 #### 3.3.4. ターン上限の相当物はない
 
-`maxTurns: 50` / `40` に相当する設定は Codex に存在しない。最も近いのは
+`maxTurns: 200` / `120` に相当する設定は Codex に存在しない。最も近いのは
 `features.rollout_budget`（`enabled` / `limit_tokens` / `prefill_token_weight` /
 `reminder_interval_tokens` / `sampling_token_weight`）だが、これは
 
@@ -422,7 +422,7 @@ name: generator
 model: sonnet
 tools: Read, Grep, Glob, Bash, Write, Edit
 disallowedTools: AskUserQuestion
-maxTurns: 50
+maxTurns: 200
 effort: high
 isolation: worktree
 ---

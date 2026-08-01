@@ -4,7 +4,7 @@ description: 実行者エージェント。Docker sandbox内でGitHub issueに�
 model: sonnet
 tools: Read, Grep, Glob, Bash, Write, Edit
 disallowedTools: AskUserQuestion
-maxTurns: 50
+maxTurns: 200
 effort: high
 color: blue
 isolation: worktree

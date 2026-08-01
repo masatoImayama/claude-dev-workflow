@@ -3,7 +3,7 @@ name: planner
 description: 計画者エージェント。仕様ヒアリング、仕様書・計画書作成、GitHub issue管理を一気通貫で担当する。
 model: opus
 tools: Read, Grep, Glob, Bash, Write, Edit, WebFetch
-maxTurns: 50
+maxTurns: 100
 effort: high
 color: purple
 ---

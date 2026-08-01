@@ -4,7 +4,7 @@ description: レビュアーエージェント。Epic完了時に全差分を一
 model: opus
 tools: Read, Grep, Glob, Bash
 disallowedTools: Write, Edit, AskUserQuestion
-maxTurns: 40
+maxTurns: 120
 effort: high
 color: green
 ---
