@@ -20,6 +20,10 @@
 #   DEV_WORKFLOW_MAX_ATTEMPTS           同一タスクの再試行上限（既定: 3）
 #   DEV_WORKFLOW_MAX_TASKS              1回の実行で処理するタスク数の上限（既定: 50）
 #   DEV_WORKFLOW_DRY_RUN=1              codex を起動せず、実行予定の内容だけ表示する
+#   DEV_WORKFLOW_TEST_CMD                統合ゲート（mechanical_gate）で実行するプロジェクトの
+#                                        全テストコマンド（必須。既定値はない）。対象の選択を
+#                                        generator に委ねないため、run 側のこの変数で固定する。
+#                                        例: DEV_WORKFLOW_TEST_CMD='bash tests/run-tests.sh'
 #
 # 注意: このスクリプトは `--dangerously-bypass-approvals-and-sandbox` を使う。
 #       Codex 側の承認プロンプトを飛ばすため、**信頼できるリポジトリでのみ**使うこと。
@@ -42,11 +46,16 @@ SCHEMA="${PLUGIN_ROOT_DIR}/adapters/codex/schemas/evaluator-verdict.json"
 MAX_ATTEMPTS="${DEV_WORKFLOW_MAX_ATTEMPTS:-3}"
 MAX_TASKS="${DEV_WORKFLOW_MAX_TASKS:-50}"
 DRY_RUN="${DEV_WORKFLOW_DRY_RUN:-0}"
+TEST_CMD="${DEV_WORKFLOW_TEST_CMD:-}"
 
 need() { command -v "$1" >/dev/null 2>&1 || { echo "ERROR: $1 が見つかりません" >&2; exit 1; }; }
 need gh
 need git
 [ "$DRY_RUN" = "1" ] || need codex
+if [ -z "$TEST_CMD" ]; then
+  echo "ERROR: 環境変数 DEV_WORKFLOW_TEST_CMD が未設定です。統合ゲートで実行するプロジェクトの全テストコマンドを設定してください（例: DEV_WORKFLOW_TEST_CMD='bash tests/run-tests.sh'）。" >&2
+  exit 1
+fi
 
 cd "$PROJECT_ROOT" || exit 1
 
@@ -124,9 +133,21 @@ run_agent() {
 }
 
 # ── 機械的ゲート（waveブランチ上で実行する） ───────────────────────────
+# 1) プロジェクトの全テスト（sandbox-exec.sh 経由・1コマンドにまとめる）
+# 2) 可読性ガード（waveブランチの差分に対して実行。PostToolUseフックと同じ判定）
+# の AND で合否を返す。対象の選択を generator に委ねないため、テストコマンドは
+# DEV_WORKFLOW_TEST_CMD（TEST_CMD）で固定する。SKIP は「通過」ではなく、テスト
+# コマンド自身の終了コードのみで合否を判定する（無言SKIPをここで自動検出はしない。
+# generator の報告と合わせて確認すること）。
 mechanical_gate() {
-  ( cd "$EPIC_WT" && DEV_WORKFLOW_HOOK_VENDOR=exit-code \
-      bash "${PLUGIN_ROOT_DIR}/scripts/check-readability.sh" --git </dev/null )
+  if [ "$DRY_RUN" = "1" ]; then
+    echo "[dry-run] mechanical_gate: sandbox-exec.sh --epic ${EPIC_NUM} '${TEST_CMD}' && check-readability.sh --git"
+    return 0
+  fi
+  ( cd "$EPIC_WT" \
+      && bash "${PLUGIN_ROOT_DIR}/scripts/sandbox-exec.sh" --epic "$EPIC_NUM" "$TEST_CMD" \
+      && DEV_WORKFLOW_HOOK_VENDOR=exit-code \
+         bash "${PLUGIN_ROOT_DIR}/scripts/check-readability.sh" --git </dev/null )
 }
 
 # ── 開始を記録 ───────────────────────────────────────────────────────
@@ -138,6 +159,7 @@ bash "${PLUGIN_ROOT_DIR}/scripts/notify-slack.sh" run-start "Epic #${EPIC_NUMBER
 processed=0
 skipped=0
 SKIPPED_CSV=""
+PROPAGATED_CSV=""   # 依存先スキップにより伝播スキップ済みとして既にコメントしたタスク番号（重複コメント防止）
 WAVE_NO=0
 
 while [ "$processed" -lt "$MAX_TASKS" ]; do
@@ -158,12 +180,23 @@ while [ "$processed" -lt "$MAX_TASKS" ]; do
     break
   fi
 
-  while IFS=$'\t' read -r kind sub num extra; do
-    [ "$kind" = "warn" ] || continue
-    if [ "$sub" = "missing-deps" ]; then
-      echo "[警告] 前提未宣言（宣言漏れ・完全逐次にフォールバック）: #${num}"
-    elif [ "$sub" = "unknown-dep" ]; then
-      echo "[警告] 不明な依存（Epic外・存在しない issue。無視されます）: #${num} -> #${extra}"
+  while IFS=$'\t' read -r kind sub num extra dep; do
+    if [ "$kind" = "warn" ]; then
+      if [ "$sub" = "missing-deps" ]; then
+        echo "[警告] 前提未宣言（宣言漏れ・完全逐次にフォールバック）: #${num}"
+      elif [ "$sub" = "unknown-dep" ]; then
+        echo "[警告] 不明な依存（Epic外・存在しない issue。無視されます）: #${num} -> #${extra}"
+      fi
+    elif [ "$kind" = "skip" ]; then
+      # sub=スキップされたタスク番号 num=reason extra=depends-on-skipped dep=依存先番号
+      case ",${PROPAGATED_CSV}," in
+        *",${sub},"*) ;;  # 既にコメント済み（毎回のplan-waves.sh再計算で重複するため）
+        *)
+          echo "[警告] 依存先スキップにより伝播スキップ: #${sub}（依存先 #${dep}）"
+          gh issue comment "$sub" --body "自律実行: 依存先 #${dep} がスキップされたため、このタスクは実行せずスキップしました（推移的伝播）。" || true
+          PROPAGATED_CSV="${PROPAGATED_CSV:+${PROPAGATED_CSV},}${sub}"
+          ;;
+      esac
     fi
   done <<< "$PLAN"
 

@@ -171,7 +171,7 @@ WAVE_NO=0        # wave ブランチ名に使う通し番号。1タスク=1レ�
 そのうち**先頭の1件だけ**を今回処理するタスクとする。
 
 ```bash
-PLAN_ARGS=(--epic "$EPIC_NUMBER" --lanes 1)
+PLAN_ARGS=(--epic "$EPIC_NUM" --lanes 1)
 [ -n "$SKIPPED_CSV" ] && PLAN_ARGS+=(--skipped "$SKIPPED_CSV")
 PLAN="$(bash "${CLAUDE_PLUGIN_ROOT}/scripts/plan-waves.sh" "${PLAN_ARGS[@]}")"
 PLAN_EXIT=$?
@@ -253,10 +253,30 @@ bash "${CLAUDE_PLUGIN_ROOT}/scripts/merge-lane.sh" \
 
 ```bash
 git checkout "$WAVE_BRANCH"
+
+# 1) テスト（Docker sandbox内）— 1回にまとめる。落ちたら不合格
+bash "${CLAUDE_PLUGIN_ROOT}/scripts/sandbox-exec.sh" --epic "$EPIC_NUM" '[全テストを走らせるコマンド]'
+
+# 2) 可読性ガード — waveブランチの差分に対して実行（PostToolUseフックと同じ判定）
 bash "${CLAUDE_PLUGIN_ROOT}/scripts/check-readability.sh" --git
 ```
 
 品質・設計・セキュリティの観点はここでは見ない。**それらは Epic完了後の一括レビューで見る。**
+
+内容の要件は Claude 版（`skills/run/SKILL.md` Step 6）と同じ2コマンド構成（全テスト + 可読性
+ガード）とする。**対象の選択を generator に委ねない。** ゲートで走らせるのは**プロジェクトの
+全テスト**とする。`make test` 等のプロジェクト標準ターゲットがあればそれを優先する。
+
+- ビルドタグ付きのテスト（`//go:build integration` 等）があるプロジェクトでは、それも含める
+- ビルド・vet・テストを**別々の呼び出しに分けない**。サンドボックスはソースツリーを
+  バインドマウントしており、フルツリーを走査するコマンドは1回ごとにその走査コストを払う
+- テストがビルドを兼ねるなら（`go test ./...` 等）、それ1本で足りる
+
+#### SKIP を通過扱いにしない
+
+依存物が未配置だとテストが無言で `SKIP` され、`ok` と表示されて成功に見える。
+**`ok` の有無だけで判定してはならない。** 出力中のSKIP件数を確認し、
+検証したかったテストが実際に走ったことを確かめる。想定外のSKIPは不合格として扱う。
 
 - **通過** →
 
@@ -286,8 +306,11 @@ Epic issue の進捗チェックリストを更新し、Step 1 に戻る。
 
 **スキップの伝播**: スキップされたタスクに依存する後続タスクは、`plan-waves.sh` の出力
 （`skip	<番号>	reason	depends-on-skipped	<依存先番号>`）に従って実行せずスキップし、
-issue にその旨をコメントする（推移的に伝播する）。スキップ一覧は Epic 一括レビュー前に
-Epic issue へコメントし、PR 本文にも明記して人間に判断を渡す。
+issue にその旨をコメントする（推移的に伝播する）。**`plan-waves.sh` はタスクループのたびに
+再計算されるため、同じ `skip` 行は該当タスクが解消される（依存が完了する／`--skipped` から
+外れる）まで繰り返し出力される。** 一度コメントしたタスク番号は憶えておき、二重にコメント
+しないこと。スキップ一覧は Epic 一括レビュー前に Epic issue へコメントし、PR 本文にも明記して
+人間に判断を渡す。
 
 ## サンドボックスの後片付け（正常終了・異常終了を問わず必ず実行）
 

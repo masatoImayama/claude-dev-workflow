@@ -3015,6 +3015,175 @@ run_merge_lane "$ML_REPO_NOLANE" --wave-branch "wave/epicT/1" --expected-base "$
 assert_exit_code "存在しないレーンブランチは exit 1" 1 "$?"
 
 # ---------------------------------------------------------------------------
+# adapters/codex/run-loop.sh: 統合ゲートが全テストを実行すること（回帰防止 #37）
+#
+# Review #37: mechanical_gate() が check-readability.sh --git だけを実行しており、
+# sandbox-exec.sh 経由でプロジェクトの全テストを走らせていなかった（statically
+# 検証できる範囲に限定し、実際の gh/docker 呼び出しは行わない）。
+# ---------------------------------------------------------------------------
+
+echo ""
+echo "== adapters/codex/run-loop.sh（統合ゲートの全テスト実行・回帰防止 #37） =="
+
+RUN_LOOP_SCRIPT="${REPO_ROOT}/adapters/codex/run-loop.sh"
+
+RL_BASHN_OUT="$(bash -n "$RUN_LOOP_SCRIPT" 2>&1)"
+assert_exit_code "run-loop.sh: bash -n は exit 0" 0 "$?"
+[ -z "$RL_BASHN_OUT" ] || echo "         ${RL_BASHN_OUT}"
+
+if command -v shellcheck >/dev/null 2>&1; then
+  RL_SHELLCHECK_OUT="$(cd "$(dirname "$RUN_LOOP_SCRIPT")" && shellcheck -x "$(basename "$RUN_LOOP_SCRIPT")" 2>&1)"
+  if [ $? -eq 0 ]; then
+    pass "shellcheck: run-loop.sh"
+  else
+    fail "shellcheck: run-loop.sh" "$RL_SHELLCHECK_OUT"
+  fi
+else
+  skip "shellcheck: run-loop.sh" "コマンドが見つからないためスキップ"
+fi
+
+# mechanical_gate() の関数本体だけを取り出して静的に検証する
+RL_MECH_GATE_BODY="$(sed -n '/^mechanical_gate() {/,/^}/p' "$RUN_LOOP_SCRIPT")"
+RL_MECH_GATE_ONELINE="$(printf '%s' "$RL_MECH_GATE_BODY" | tr '\n' ' ')"
+
+case "$RL_MECH_GATE_ONELINE" in
+  *"sandbox-exec.sh"*'"$TEST_CMD"'*)
+    pass "run-loop.sh: mechanical_gate() が sandbox-exec.sh に \$TEST_CMD を渡している" ;;
+  *)
+    fail "run-loop.sh: mechanical_gate() が sandbox-exec.sh に \$TEST_CMD を渡している" "$RL_MECH_GATE_BODY" ;;
+esac
+
+case "$RL_MECH_GATE_ONELINE" in
+  *"check-readability.sh"*)
+    pass "run-loop.sh: mechanical_gate() が check-readability.sh を呼んでいる" ;;
+  *)
+    fail "run-loop.sh: mechanical_gate() が check-readability.sh を呼んでいる" "$RL_MECH_GATE_BODY" ;;
+esac
+
+# テストと可読性ガードが && で連結され、テスト失敗時に可読性ガードへ進まない（AND判定）こと
+case "$RL_MECH_GATE_ONELINE" in
+  *"sandbox-exec.sh"*'&&'*"check-readability.sh"*)
+    pass "run-loop.sh: mechanical_gate() はテストと可読性ガードを && で連結している" ;;
+  *)
+    fail "run-loop.sh: mechanical_gate() はテストと可読性ガードを && で連結している" "$RL_MECH_GATE_BODY" ;;
+esac
+
+# DEV_WORKFLOW_TEST_CMD 未設定時は、gh/git を呼ぶ前に停止すること
+RL_FAKE_BIN="$(mktemp -d "${TMPDIR:-/tmp}/dw-test-fakebin-rl.XXXXXX")"
+for rl_fake in gh git; do
+  cat > "${RL_FAKE_BIN}/${rl_fake}" <<'FAKE_BIN'
+#!/bin/bash
+exit 0
+FAKE_BIN
+  chmod +x "${RL_FAKE_BIN}/${rl_fake}"
+done
+
+RL_UNSET_OUT="$(PATH="${RL_FAKE_BIN}:${PATH}" DEV_WORKFLOW_DRY_RUN=1 DEV_WORKFLOW_TEST_CMD="" \
+  bash "$RUN_LOOP_SCRIPT" 999 2>&1)"
+RL_UNSET_EXIT=$?
+assert_exit_code "run-loop.sh: DEV_WORKFLOW_TEST_CMD 未設定は exit 1" 1 "$RL_UNSET_EXIT"
+case "$RL_UNSET_OUT" in
+  *"DEV_WORKFLOW_TEST_CMD"*)
+    pass "run-loop.sh: 未設定時のエラーメッセージに DEV_WORKFLOW_TEST_CMD を含む" ;;
+  *)
+    fail "run-loop.sh: 未設定時のエラーメッセージに DEV_WORKFLOW_TEST_CMD を含む" "$RL_UNSET_OUT" ;;
+esac
+
+RL_SET_OUT="$(PATH="${RL_FAKE_BIN}:${PATH}" DEV_WORKFLOW_DRY_RUN=1 DEV_WORKFLOW_TEST_CMD='true' \
+  bash "$RUN_LOOP_SCRIPT" 999 2>&1)"
+case "$RL_SET_OUT" in
+  *"DEV_WORKFLOW_TEST_CMD が未設定です"*)
+    fail "run-loop.sh: DEV_WORKFLOW_TEST_CMD 設定時は未設定エラーを出さない" "$RL_SET_OUT" ;;
+  *)
+    pass "run-loop.sh: DEV_WORKFLOW_TEST_CMD 設定時は未設定エラーを出さない" ;;
+esac
+
+# 伝播スキップ（skip <番号> reason depends-on-skipped <依存先番号>）を issue コメントし、
+# 同一実行内で重複コメントしないこと（静的検証: 分岐と重複防止の仕組みが存在するか）
+# 行番号を固定値でハードコードせず、目印となる固定文字列（grep -F）から範囲を求める。
+RL_LOOP_START="$(grep -n -F 'read -r kind sub num extra dep; do' "$RUN_LOOP_SCRIPT" | head -1 | cut -d: -f1)"
+RL_LOOP_END_REL="$(tail -n "+${RL_LOOP_START}" "$RUN_LOOP_SCRIPT" | grep -n -F 'done <<< "$PLAN"' | head -1 | cut -d: -f1)"
+RL_LOOP_END=$((RL_LOOP_START + RL_LOOP_END_REL - 1))
+RL_WARN_LOOP="$(sed -n "${RL_LOOP_START},${RL_LOOP_END}p" "$RUN_LOOP_SCRIPT")"
+RL_WARN_LOOP_ONELINE="$(printf '%s' "$RL_WARN_LOOP" | tr '\n' ' ')"
+
+RL_SKIP_BRANCH_OK=1
+case "$RL_WARN_LOOP_ONELINE" in
+  *'"$kind" = "skip"'*) : ;;
+  *) RL_SKIP_BRANCH_OK=0 ;;
+esac
+case "$RL_WARN_LOOP_ONELINE" in
+  *"gh issue comment"*) : ;;
+  *) RL_SKIP_BRANCH_OK=0 ;;
+esac
+case "$RL_WARN_LOOP_ONELINE" in
+  *"depends-on-skipped"*) : ;;
+  *) RL_SKIP_BRANCH_OK=0 ;;
+esac
+if [ "$RL_SKIP_BRANCH_OK" -eq 1 ]; then
+  pass "run-loop.sh: skip 行（伝播スキップ）を issue にコメントしている"
+else
+  fail "run-loop.sh: skip 行（伝播スキップ）を issue にコメントしている" "$RL_WARN_LOOP"
+fi
+
+case "$RL_WARN_LOOP_ONELINE" in
+  *"PROPAGATED_CSV"*)
+    pass "run-loop.sh: 伝播スキップの重複コメントを防ぐ仕組みがある" ;;
+  *)
+    fail "run-loop.sh: 伝播スキップの重複コメントを防ぐ仕組みがある" "$RL_WARN_LOOP" ;;
+esac
+
+# ---------------------------------------------------------------------------
+# skills-codex/dev-workflow-run/SKILL.md: 統合ゲートの記述が Claude 版と揃っていること
+# （回帰防止 #37）
+# ---------------------------------------------------------------------------
+
+echo ""
+echo "== skills-codex/dev-workflow-run/SKILL.md（統合ゲートの記述・回帰防止 #37） =="
+
+CODEX_RUN_SKILL="${REPO_ROOT}/skills-codex/dev-workflow-run/SKILL.md"
+
+CRS_STEP5="$(awk '/^### Step 5:/{f=1} /^### Step 6:/{f=0} f' "$CODEX_RUN_SKILL")"
+
+case "$CRS_STEP5" in
+  *"sandbox-exec.sh"*)
+    pass "SKILL.md(codex): Step 5 が sandbox-exec.sh で全テストを実行する記述を含む" ;;
+  *)
+    fail "SKILL.md(codex): Step 5 が sandbox-exec.sh で全テストを実行する記述を含む" "$CRS_STEP5" ;;
+esac
+
+case "$CRS_STEP5" in
+  *"check-readability.sh"*)
+    pass "SKILL.md(codex): Step 5 が check-readability.sh の記述を含む" ;;
+  *)
+    fail "SKILL.md(codex): Step 5 が check-readability.sh の記述を含む" "$CRS_STEP5" ;;
+esac
+
+case "$CRS_STEP5" in
+  *"対象の選択を"*"generator に委ねない"*)
+    pass "SKILL.md(codex): Step 5 が「対象の選択をgeneratorに委ねない」を含む" ;;
+  *)
+    fail "SKILL.md(codex): Step 5 が「対象の選択をgeneratorに委ねない」を含む" "$CRS_STEP5" ;;
+esac
+
+case "$CRS_STEP5" in
+  *"SKIP を通過扱いにしない"*)
+    pass "SKILL.md(codex): Step 5 が「SKIPを通過扱いにしない」を含む" ;;
+  *)
+    fail "SKILL.md(codex): Step 5 が「SKIPを通過扱いにしない」を含む" "$CRS_STEP5" ;;
+esac
+
+if grep -q '^EPIC_NUMBER' "$CODEX_RUN_SKILL"; then
+  fail "SKILL.md(codex): 未定義変数 \$EPIC_NUMBER を新たに導入していない" "EPIC_NUMBER の代入が見つかりました"
+else
+  if grep -q '\$EPIC_NUMBER' "$CODEX_RUN_SKILL"; then
+    fail "SKILL.md(codex): 未定義変数 \$EPIC_NUMBER を参照していない" "$(grep -n '\$EPIC_NUMBER' "$CODEX_RUN_SKILL")"
+  else
+    pass "SKILL.md(codex): 未定義変数 \$EPIC_NUMBER を参照していない"
+  fi
+fi
+
+# ---------------------------------------------------------------------------
 # 結果集計
 # ---------------------------------------------------------------------------
 
