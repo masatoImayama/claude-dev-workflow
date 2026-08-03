@@ -376,7 +376,7 @@ compose モードで exec するサービス名は `DEV_WORKFLOW_COMPOSE_SERVICE
 | コマンド | 動作 |
 | --- | --- |
 | `--down` | 現在の repo + epic のコンテナ1個を削除する（キャッシュ volume は残す）。**compose モードのときは** `docker compose -p <project> --project-directory <root> -f <compose_file> down` で現在の project を落とす |
-| `--down --all` | 現在のリポジトリに属する管理コンテナをすべて削除する（削除前に対象名を列挙表示。label が無い旧命名の残骸も、マウント元がリポジトリルート配下かで判定して回収する）。**compose モードのときは** `dw-<repo>` 接頭辞を持つ compose project も列挙表示のうえすべて down する |
+| `--down --all` | 現在のリポジトリに属する管理コンテナをすべて削除する（削除前に対象名を列挙表示。label が無い旧命名の残骸も、マウント元がリポジトリルート配下かで判定して回収する）。**compose モードのときは** `com.docker.compose.project.working_dir` label（＝ `--project-directory` に渡した値）を正規化してリポジトリルート配下と判定できた compose project だけを列挙表示のうえすべて down する（project 名の接頭辞一致では他リポジトリの project を巻き込むため使わない）。リポジトリ外 worktree のフォールバック実行で起動した project は working_dir がリポジトリルート外になるため対象に含まれない |
 | `--ls` | 管理コンテナを一覧表示する（NAME / REPO / EPIC / IMAGE / STATUS / CREATED。他リポジトリ分も含む）。**compose モードのときは** compose project の一覧（PROJECT / STATUS）も併せて表示する |
 | `--reset-cache [--force]` | キャッシュ volume を削除する（下記「作用範囲」を参照） |
 | `--rebuild` | イメージを強制再ビルドし、コンテナも作り直してからコマンドを実行する |

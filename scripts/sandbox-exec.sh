@@ -58,7 +58,12 @@
 #   （-p では解決できない衝突であり、停止はしない）。
 #   `--down` / `--down --all` / `--ls` は compose モードのときも対象にする（issue #28）:
 #   `--down` は現在の project を `docker compose down` で落とし、`--down --all` は
-#   同一リポジトリの `dw-<repo>` 接頭辞を持つ project をすべて列挙表示のうえ落とす。
+#   同一リポジトリに属する project をすべて列挙表示のうえ落とす。「同一リポジトリに属する」の
+#   判定は project 名の接頭辞一致ではなく、`com.docker.compose.project.working_dir` label
+#   （= `--project-directory` に渡した値）を正規化して HOST_ROOT と一致する（配下を含む）かで行う
+#   （issue #33。接頭辞一致だけでは他リポジトリの project を巻き込む）。
+#   リポジトリ外 worktree のフォールバック実行では working_dir が HOST_ROOT 外になるため、
+#   そこで起動した project は `--down --all` の対象に含まれない。
 #   `--ls` にも compose project の状態（running/stopped）を表示する。
 
 set -u
@@ -388,20 +393,44 @@ compose_cmd() {
     -f "$DEV_WORKFLOW_SANDBOX_COMPOSE" "$@"
 }
 
-# 同一リポジトリに属する compose project 名（dw-<repo> 接頭辞）を列挙する。
+# 同一リポジトリに属する compose project 名を列挙する。
 # compose が作るコンテナは com.docker.compose.project ラベルを持つため、それを一次情報にする。
+#
+# `docker ps` のフォーマットコンテキストでは `.Labels` は map ではなく `k=v,k=v` 形式の
+# 文字列であり、`{{ index .Labels "..." }}` は「slice/array を string で index できない」で
+# 必ず失敗する（`.Labels` が map になるのは `docker inspect` 系のみ）。`docker ps` では
+# `{{.Label "..."}}` を使う必要がある（issue #32）。
+# 失敗を `2>/dev/null` で握り潰すと、この手のテンプレート誤用が常に「対象0件」として
+# 沈黙してしまう（実害: --down --all が何も落とさないのに成功したかのように見える）ため、
+# 終了コードが非0なら stderr に警告を出す。
+#
+# 「同一リポジトリに属する」の判定は project 名の接頭辞一致ではなく、compose が付与する
+# com.docker.compose.project.working_dir ラベル（= --project-directory に渡した値）を
+# normalize_mount_source() で正規化し、HOST_ROOT と一致する（配下を含む）かで行う
+# （issue #33）。接頭辞一致だけだと次のような混入が起こる:
+#   - リポジトリ名が他リポジトリ名の接頭辞になっている場合
+#   - 同じ basename を別ディレクトリにクローンしている場合
+# dockerfile 経路は #29 で dev-workflow.root label による厳密判定を入れているので、
+# compose 経路もここで同水準の判定にそろえる。
 list_compose_projects_in_repo() {
-  local prefix
-  prefix="dw-$(sanitize "$PROJECT")"
-  docker ps -a --filter "label=com.docker.compose.project" \
-    --format '{{ index .Labels "com.docker.compose.project" }}' 2>/dev/null \
-    | sort -u \
-    | while IFS= read -r proj; do
-        [ -n "$proj" ] || continue
-        case "$proj" in
-          "$prefix"|"${prefix}"-*) printf '%s\n' "$proj" ;;
-        esac
-      done
+  local raw rc norm_host proj wd norm_wd
+  raw="$(docker ps -a --filter "label=com.docker.compose.project" \
+    --format '{{.Label "com.docker.compose.project"}}|{{.Label "com.docker.compose.project.working_dir"}}' 2>&1)"
+  rc=$?
+  if [ "$rc" -ne 0 ]; then
+    echo "WARNING: docker ps による compose project の列挙に失敗しました（終了コード${rc}）: ${raw}" >&2
+    return 0
+  fi
+
+  norm_host="$(normalize_mount_source "$HOST_ROOT")"
+
+  printf '%s\n' "$raw" | sort -u | while IFS='|' read -r proj wd; do
+    [ -n "$proj" ] || continue
+    norm_wd="$(normalize_mount_source "$wd")"
+    case "$norm_wd" in
+      "$norm_host"|"$norm_host"/*) printf '%s\n' "$proj" ;;
+    esac
+  done
 }
 
 # --ls に compose project の状態を表示する（issue #28）。他の管理コンテナ一覧

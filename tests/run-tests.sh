@@ -1463,10 +1463,59 @@ STATE_FILE="${DW_COMPOSE_SERVICE_STATE:?DW_COMPOSE_SERVICE_STATE is required}"  
 UP_SUCCEEDS="${DW_COMPOSE_UP_SUCCEEDS:-1}"
 WORKDIR_OK="${DW_COMPOSE_WORKDIR_OK:-1}"
 MOUNT_SOURCE="${DW_COMPOSE_MOUNT_SOURCE:-}"
+# issue #34 用: 「project|working_dir|running」形式のマニフェスト（1行1project）。
+# list_compose_projects_in_repo() の top-level `docker ps -a --filter
+# label=com.docker.compose.project ...` を模擬するために使う（未設定なら空扱い）。
+PROJECTS_MANIFEST="${DW_COMPOSE_PROJECTS_MANIFEST:-}"
+# issue #32 用: 1にすると一覧取得（label=com.docker.compose.project 単体フィルタ）を
+# 実機で観測したテンプレート誤用と同様に失敗させ、非0終了 + stderr 出力を模擬する。
+PS_FAIL="${DW_COMPOSE_PS_FAIL:-0}"
 
 echo "$*" >> "$LOG"
 
 case "${1:-}" in
+  ps)
+    shift
+    filter=""
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        -a) shift ;;
+        --filter) filter="$2"; shift 2 ;;
+        --format) shift 2 ;;
+        *) shift ;;
+      esac
+    done
+    case "$filter" in
+      "label=com.docker.compose.project")
+        if [ "$PS_FAIL" = "1" ]; then
+          echo 'failed to execute template: error calling index: cannot index slice/array with type string' >&2
+          exit 1
+        fi
+        # 自リポジトリ・他リポジトリ両方の compose project をマニフェストのまま返す。
+        # どれを対象にするかは production 側（正規化して working_dir を判定）に委ねる。
+        if [ -n "$PROJECTS_MANIFEST" ] && [ -f "$PROJECTS_MANIFEST" ]; then
+          while IFS='|' read -r m_proj m_wd _m_running; do
+            [ -n "$m_proj" ] || continue
+            printf '%s|%s\n' "$m_proj" "$m_wd"
+          done < "$PROJECTS_MANIFEST"
+        fi
+        exit 0
+        ;;
+      label=com.docker.compose.project=*)
+        target_proj="${filter#label=com.docker.compose.project=}"
+        if [ -n "$PROJECTS_MANIFEST" ] && [ -f "$PROJECTS_MANIFEST" ]; then
+          while IFS='|' read -r m_proj _m_wd m_running; do
+            [ "$m_proj" = "$target_proj" ] || continue
+            [ "$m_running" = "running" ] && echo "fake-compose-container-id"
+          done < "$PROJECTS_MANIFEST"
+        fi
+        exit 0
+        ;;
+      *)
+        exit 1
+        ;;
+    esac
+    ;;
   compose)
     shift
     # 先頭の共通オプション（-p / --project-directory / -f）を読み飛ばしてサブコマンドを取り出す
@@ -2250,6 +2299,180 @@ RG31_TIMEOUT_EXIT=0
 )
 RG31_TIMEOUT_EXIT=$?
 assert_exit_code "複数行読み取りに変えた後も、入力が来ない場合はタイムアウトしてexit 0で素通りする" 0 "$RG31_TIMEOUT_EXIT"
+
+# ---------------------------------------------------------------------------
+# compose: --down --all / --ls の project 絞り込み（レビュー2巡目 issue #32 / #33 / #34）
+#
+# list_compose_projects_in_repo() は本Epicのレビューで次の2点を指摘された:
+#   - issue #32: docker ps のフォーマットで `{{ index .Labels "..." }}` を使っていたが、
+#     `docker ps` コンテキストでは .Labels は map ではなく文字列であり必ず失敗する。
+#     正しくは `{{.Label "..."}}`。失敗を 2>/dev/null で握り潰さず、非0終了時は
+#     stderr に警告を出すことも合わせて固定する。
+#   - issue #33: 絞り込みが project 名の接頭辞一致だけで、他リポジトリ（basename が
+#     接頭辞になる／同じ basename を別ディレクトリにクローンした）の project を
+#     巻き込みうる。正しくは com.docker.compose.project.working_dir label
+#     （--project-directory に渡した値）を正規化して HOST_ROOT 配下のものだけを対象にする。
+#
+# 上記2つの穴は、偽 docker が compose モードの `ps`（-a なし・ありの両方）を
+# 未実装（*) exit 1）だったため一度もテストされていなかった（issue #34）。
+# FAKE_DOCKER_COMPOSE に「project|working_dir|running」形式のマニフェストで駆動する
+# ps 実装を追加した（DW_COMPOSE_PROJECTS_MANIFEST）ので、ここでそれを使って固定する。
+# 実 docker には一切触れない。
+# ---------------------------------------------------------------------------
+
+echo "== compose: --down --all / --ls の project 絞り込み（issue #32 / #33 / #34） =="
+
+COMPOSE_PROJECTS_LOG="$(mktemp "${TMPDIR:-/tmp}/dw-test-composeprojlog.XXXXXX")"
+COMPOSE_PROJECTS_STATE="$(mktemp "${TMPDIR:-/tmp}/dw-test-composeprojstate.XXXXXX")"
+: > "$COMPOSE_PROJECTS_STATE"
+
+COMPOSE_PROJECTS_MANIFEST_FILE="$(mktemp "${TMPDIR:-/tmp}/dw-test-composeprojects.XXXXXX")"
+
+# 他リポジトリのマウント元は正規化後も HOST_ROOT と一致しない、実在しないダミーパスでよい。
+COMPOSE_OTHER_CLONE_ROOT="/some/other/clone/root"
+COMPOSE_UNRELATED_ROOT="/home/user/otherrepo"
+
+# 1) 自リポジトリ・epicなし（--project-directory は常に HOST_ROOT）
+# 2) 自リポジトリ・epicあり（working_dir は同じ HOST_ROOT）
+# 3) 他リポジトリ。project 名は自リポジトリの basename が接頭辞になっている
+#    （旧・接頭辞一致ロジックなら誤って巻き込んでいた。working_dir は無関係な別root）
+# 4) 自リポジトリと「同名」の project だが working_dir が別root
+#    （同じ basename を別ディレクトリにクローンした場合を模す。issue #33 (b) / (c)）
+# 5) 全く無関係な他リポジトリ
+cat > "$COMPOSE_PROJECTS_MANIFEST_FILE" <<MANIFEST
+dw-${COMPOSE_REPO_BASENAME}|${COMPOSE_HOST_ROOT}|running
+dw-${COMPOSE_REPO_BASENAME}-epicx|${COMPOSE_HOST_ROOT}|stopped
+dw-${COMPOSE_REPO_BASENAME}-otherclone|${COMPOSE_OTHER_CLONE_ROOT}|running
+dw-${COMPOSE_REPO_BASENAME}|${COMPOSE_OTHER_CLONE_ROOT}|running
+dw-otherrepo|${COMPOSE_UNRELATED_ROOT}|running
+MANIFEST
+
+run_compose_projects_case() {
+  # run_compose_projects_case <sandbox-exec.shへの引数...>
+  (
+    cd "$COMPOSE_REPO" || exit 1
+    DW_COMPOSE_LOG="$COMPOSE_PROJECTS_LOG" \
+      DW_COMPOSE_SERVICE_STATE="$COMPOSE_PROJECTS_STATE" \
+      DW_COMPOSE_PROJECTS_MANIFEST="$COMPOSE_PROJECTS_MANIFEST_FILE" \
+      PATH="${FAKE_DOCKER_COMPOSE_DIR}:${PATH}" \
+      bash scripts/sandbox-exec.sh "$@"
+  )
+}
+
+# --- --ls は自リポジトリの compose project の状態のみ表示する（issue #34 の3点目） ---
+: > "$COMPOSE_PROJECTS_LOG"
+COMPOSE_LS_OUTPUT="$(run_compose_projects_case --ls)"
+
+case "$COMPOSE_LS_OUTPUT" in
+  *"dw-${COMPOSE_REPO_BASENAME}"*"running"*)
+    pass "compose: --ls は自リポジトリの compose project を running で表示する" ;;
+  *)
+    fail "compose: --ls は自リポジトリの compose project を running で表示する" \
+      "output=[${COMPOSE_LS_OUTPUT}]" ;;
+esac
+
+case "$COMPOSE_LS_OUTPUT" in
+  *"dw-${COMPOSE_REPO_BASENAME}-epicx"*"stopped"*)
+    pass "compose: --ls は自リポジトリの別epic project を stopped で表示する" ;;
+  *)
+    fail "compose: --ls は自リポジトリの別epic project を stopped で表示する" \
+      "output=[${COMPOSE_LS_OUTPUT}]" ;;
+esac
+
+if printf '%s\n' "$COMPOSE_LS_OUTPUT" | grep -q "otherclone"; then
+  fail "compose: --ls は basename が接頭辞一致するだけの他リポジトリ project を表示しない（issue #33）" \
+    "output=[${COMPOSE_LS_OUTPUT}]"
+else
+  pass "compose: --ls は basename が接頭辞一致するだけの他リポジトリ project を表示しない（issue #33）"
+fi
+
+if printf '%s\n' "$COMPOSE_LS_OUTPUT" | grep -q "otherrepo"; then
+  fail "compose: --ls は無関係な他リポジトリ project を表示しない" "output=[${COMPOSE_LS_OUTPUT}]"
+else
+  pass "compose: --ls は無関係な他リポジトリ project を表示しない"
+fi
+
+# --- --down --all は自リポジトリの project すべてを down し、他リポジトリは down しない（issue #34 の1・2点目） ---
+: > "$COMPOSE_PROJECTS_LOG"
+COMPOSE_DOWN_ALL_EXIT=0
+run_compose_projects_case --down --all >/dev/null 2>&1 || COMPOSE_DOWN_ALL_EXIT=$?
+assert_exit_code "compose: --down --all は成功する" 0 "$COMPOSE_DOWN_ALL_EXIT"
+
+DOWN_ALL_LOG_CONTENT="$(cat "$COMPOSE_PROJECTS_LOG")"
+
+DOWN_COUNT_SELF_NOEPIC="$(printf '%s\n' "$DOWN_ALL_LOG_CONTENT" \
+  | grep -Fc "compose -p dw-${COMPOSE_REPO_BASENAME} --project-directory ${COMPOSE_HOST_ROOT} -f docker-compose.dev.yml down" || true)"
+assert_eq "compose: --down --all は自リポジトリの project（epicなし）を down する（issue #34）" "1" "$DOWN_COUNT_SELF_NOEPIC"
+
+DOWN_COUNT_SELF_EPIC="$(printf '%s\n' "$DOWN_ALL_LOG_CONTENT" \
+  | grep -Fc "compose -p dw-${COMPOSE_REPO_BASENAME}-epicx --project-directory ${COMPOSE_HOST_ROOT} -f docker-compose.dev.yml down" || true)"
+assert_eq "compose: --down --all は自リポジトリの別epic project も down する（issue #34）" "1" "$DOWN_COUNT_SELF_EPIC"
+
+if printf '%s\n' "$DOWN_ALL_LOG_CONTENT" | grep -q "otherclone"; then
+  fail "compose: --down --all は basename が接頭辞一致するだけの他リポジトリ project を down しない（issue #33）" \
+    "log=[${DOWN_ALL_LOG_CONTENT}]"
+else
+  pass "compose: --down --all は basename が接頭辞一致するだけの他リポジトリ project を down しない（issue #33）"
+fi
+
+if printf '%s\n' "$DOWN_ALL_LOG_CONTENT" | grep -q "otherrepo"; then
+  fail "compose: --down --all は無関係な他リポジトリ project を down しない" "log=[${DOWN_ALL_LOG_CONTENT}]"
+else
+  pass "compose: --down --all は無関係な他リポジトリ project を down しない"
+fi
+
+# 同名別root（issue #33 (b)/(c)）: 自プロジェクトと同一名だが working_dir が別のエントリが
+# マニフェストに混在していても、down 呼び出しの総数は自リポジトリ分の2件のまま増えない。
+DOWN_TOTAL_COUNT="$(printf '%s\n' "$DOWN_ALL_LOG_CONTENT" | grep -c '^compose -p .* down$' || true)"
+assert_eq "compose: --down --all は同名別rootの混在があっても自リポジトリ分の2件だけを down する（issue #33）" \
+  "2" "$DOWN_TOTAL_COUNT"
+
+# --- issue #32 の直接検証: docker ps のフォーマットに .Label を使い、.Labels は使わない ---
+if printf '%s\n' "$DOWN_ALL_LOG_CONTENT" | grep -qF '.Label "com.docker.compose.project"'; then
+  pass "compose: docker ps のフォーマットに .Label を使う（issue #32）"
+else
+  fail "compose: docker ps のフォーマットに .Label を使う（issue #32）" "log=[${DOWN_ALL_LOG_CONTENT}]"
+fi
+
+if printf '%s\n' "$DOWN_ALL_LOG_CONTENT" | grep -qF 'index .Labels'; then
+  fail "compose: docker ps のフォーマットに index .Labels を使わない（issue #32）" "log=[${DOWN_ALL_LOG_CONTENT}]"
+else
+  pass "compose: docker ps のフォーマットに index .Labels を使わない（issue #32）"
+fi
+
+# --- issue #32: docker ps 失敗時は stderr に警告を出し、--ls 自体は非0で落ちない ---
+: > "$COMPOSE_PROJECTS_LOG"
+COMPOSE_PS_FAIL_STDERR="$(
+  cd "$COMPOSE_REPO" || exit 1
+  DW_COMPOSE_LOG="$COMPOSE_PROJECTS_LOG" \
+    DW_COMPOSE_SERVICE_STATE="$COMPOSE_PROJECTS_STATE" \
+    DW_COMPOSE_PROJECTS_MANIFEST="$COMPOSE_PROJECTS_MANIFEST_FILE" \
+    DW_COMPOSE_PS_FAIL=1 \
+    PATH="${FAKE_DOCKER_COMPOSE_DIR}:${PATH}" \
+    bash scripts/sandbox-exec.sh --ls 2>&1 1>/dev/null
+)"
+
+case "$COMPOSE_PS_FAIL_STDERR" in
+  *"WARNING"*"docker ps"*)
+    pass "compose: docker ps の失敗を握り潰さず stderr に警告する（issue #32）" ;;
+  *)
+    fail "compose: docker ps の失敗を握り潰さず stderr に警告する（issue #32）" \
+      "stderr=[${COMPOSE_PS_FAIL_STDERR}]" ;;
+esac
+
+COMPOSE_PS_FAIL_EXIT=0
+(
+  cd "$COMPOSE_REPO" || exit 1
+  DW_COMPOSE_LOG="$COMPOSE_PROJECTS_LOG" \
+    DW_COMPOSE_SERVICE_STATE="$COMPOSE_PROJECTS_STATE" \
+    DW_COMPOSE_PROJECTS_MANIFEST="$COMPOSE_PROJECTS_MANIFEST_FILE" \
+    DW_COMPOSE_PS_FAIL=1 \
+    PATH="${FAKE_DOCKER_COMPOSE_DIR}:${PATH}" \
+    bash scripts/sandbox-exec.sh --ls >/dev/null 2>&1
+)
+COMPOSE_PS_FAIL_EXIT=$?
+assert_exit_code "compose: docker ps の列挙に失敗しても --ls 自体は成功する（compose project欄なしで継続）" \
+  0 "$COMPOSE_PS_FAIL_EXIT"
 
 # ---------------------------------------------------------------------------
 # 結果集計
