@@ -130,15 +130,24 @@ gh issue list --label task --state closed --search "[epic番号]" --json number,
 
 ### 4. テスト実行（サンドボックス内）
 
-サンドボックス内でテストを実行し、全て通ることを確認する:
+サンドボックスへのコマンド投入は**必ず `sandbox-exec.sh` 経由で行う。** `docker run` や
+`docker compose exec` を直接組み立ててはならない。イメージの解決・ビルド・コンテナの
+再利用・compose サービスの起動はすべて `sandbox-exec.sh` に集約されている。
+
+必要なら事前に `--print-plan` で解決結果（mode / container / image / compose_* 等）を
+確認できる（docker には一切触れず、exit 0 で終了する）:
 
 ```bash
-# Dockerfile.dev ベースの場合
-docker run --rm -v "$(pwd):/workspace" -w /workspace "dev-sandbox:[project]" [test-command]
-
-# docker-compose.dev.yml ベースの場合
-docker compose -f docker-compose.dev.yml exec app [test-command]
+bash "${CLAUDE_PLUGIN_ROOT}/scripts/sandbox-exec.sh" --epic "$EPIC_NUM" --print-plan
 ```
+
+テストは `--epic` を渡して実行する（Epic 単位でコンテナ・キャッシュが共有される）:
+
+```bash
+bash "${CLAUDE_PLUGIN_ROOT}/scripts/sandbox-exec.sh" --epic "$EPIC_NUM" '[test-command]'
+```
+
+全て通ることを確認する。
 
 ## 重要度の基準
 
@@ -379,16 +388,16 @@ git commit -m "feat: セッショントークンの有効期限を検証する (
 プロジェクトルートに `Dockerfile.dev` または `docker-compose.dev.yml` を配置する。
 どちらも無い場合、コンテナ実行を前提とした自律モードは開始できない。
 
+**`docker build` / `docker compose up` を直接叩いてはならない。** イメージのビルド・
+コンテナの起動・compose サービスの起動は、すべて `sandbox-exec.sh` に集約されている。
+呼び出し側がやることは `--print-plan` で解決結果を確認し、コマンドを投入するだけである。
+
 ```bash
-if [ -f Dockerfile.dev ]; then
-  docker build -f Dockerfile.dev -t "dev-sandbox:$(basename "$(pwd)")" .
-elif [ -f docker-compose.dev.yml ]; then
-  docker compose -f docker-compose.dev.yml up -d
-else
-  echo "ERROR: Dockerfile.dev または docker-compose.dev.yml が見つかりません"
-  exit 1
-fi
+bash "${CLAUDE_PLUGIN_ROOT}/scripts/sandbox-exec.sh" --epic "$EPIC_NUM" --print-plan
 ```
+
+`--print-plan` が `mode=none` を返す場合、`Dockerfile.dev` も `docker-compose.dev.yml` も
+見つかっていないので、自律モードを開始せずに停止する。
 
 ## 安全ルール（例外なし）
 

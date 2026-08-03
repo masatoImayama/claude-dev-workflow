@@ -172,16 +172,16 @@ git commit -m "feat: セッショントークンの有効期限を検証する (
 プロジェクトルートに `Dockerfile.dev` または `docker-compose.dev.yml` を配置する。
 どちらも無い場合、コンテナ実行を前提とした自律モードは開始できない。
 
+**`docker build` / `docker compose up` を直接叩いてはならない。** イメージのビルド・
+コンテナの起動・compose サービスの起動は、すべて `sandbox-exec.sh` に集約されている。
+呼び出し側がやることは `--print-plan` で解決結果を確認し、コマンドを投入するだけである。
+
 ```bash
-if [ -f Dockerfile.dev ]; then
-  docker build -f Dockerfile.dev -t "dev-sandbox:$(basename "$(pwd)")" .
-elif [ -f docker-compose.dev.yml ]; then
-  docker compose -f docker-compose.dev.yml up -d
-else
-  echo "ERROR: Dockerfile.dev または docker-compose.dev.yml が見つかりません"
-  exit 1
-fi
+bash "${CLAUDE_PLUGIN_ROOT}/scripts/sandbox-exec.sh" --epic "$EPIC_NUM" --print-plan
 ```
+
+`--print-plan` が `mode=none` を返す場合、`Dockerfile.dev` も `docker-compose.dev.yml` も
+見つかっていないので、自律モードを開始せずに停止する。
 
 ## 安全ルール（例外なし）
 

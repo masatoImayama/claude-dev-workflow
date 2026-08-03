@@ -69,6 +69,25 @@ gh issue view "$TASK_NUMBER"
 bash "${CLAUDE_PLUGIN_ROOT}/scripts/sandbox-exec.sh" '[test-command]'
 ```
 
+#### `--epic` を必ず渡す
+
+呼び出し時は**必ず `--epic` を渡す**（または `DEV_WORKFLOW_EPIC` 環境変数を設定して尊重する）。
+分離の単位は epic であり、`--epic` を渡し忘れると自分の worktree 専用の別コンテナが
+新たに立ち上がってしまい、epic 内の他タスクと同じコンテナ・同じキャッシュを共有できない。
+
+```bash
+bash "${CLAUDE_PLUGIN_ROOT}/scripts/sandbox-exec.sh" --epic epic3 '[test-command]'
+```
+
+#### シェルスクリプトを新規生成したら `.gitattributes` を確認する
+
+Windows（`core.autocrlf=true`）で生成した `.sh` は CRLF になり、サンドボックス
+（Linuxコンテナ）内で `syntax error near unexpected token $'{\r'` のように、
+原因が分かりにくい形で失敗する。`.sh` を新規生成したら対象プロジェクトの
+`.gitattributes` に `*.sh text eol=lf` があるか確認し、無ければ追加すること。
+`check-prerequisites.sh` がセッション開始時にこの条件を検出して警告するが、
+警告はブロックしないため、生成側でも確認を徹底する。
+
 #### コマンドは1回にまとめる
 
 **ビルド・vet・テストを別々に呼び出してはならない。** サンドボックスはソースツリーを

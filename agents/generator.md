@@ -85,6 +85,25 @@ gh issue view "$TASK_NUMBER"
 bash "${CLAUDE_PLUGIN_ROOT}/scripts/sandbox-exec.sh" '[test-command]'
 ```
 
+#### `--epic` を必ず渡す
+
+呼び出し時は**必ず `--epic` を渡す**（または `DEV_WORKFLOW_EPIC` 環境変数を設定して尊重する）。
+分離の単位は epic であり、`--epic` を渡し忘れると自分の worktree 専用の別コンテナが
+新たに立ち上がってしまい、epic 内の他タスクと同じコンテナ・同じキャッシュを共有できない。
+
+```bash
+bash "${CLAUDE_PLUGIN_ROOT}/scripts/sandbox-exec.sh" --epic epic3 '[test-command]'
+```
+
+#### シェルスクリプトを新規生成したら `.gitattributes` を確認する
+
+Windows（`core.autocrlf=true`）で生成した `.sh` は CRLF になり、サンドボックス
+（Linuxコンテナ）内で `syntax error near unexpected token $'{\r'` のように、
+原因が分かりにくい形で失敗する。`.sh` を新規生成したら対象プロジェクトの
+`.gitattributes` に `*.sh text eol=lf` があるか確認し、無ければ追加すること。
+`check-prerequisites.sh` がセッション開始時にこの条件を検出して警告するが、
+警告はブロックしないため、生成側でも確認を徹底する。
+
 #### コマンドは1回にまとめる
 
 **ビルド・vet・テストを別々に呼び出してはならない。** サンドボックスはソースツリーを
@@ -351,16 +370,16 @@ git commit -m "feat: セッショントークンの有効期限を検証する (
 プロジェクトルートに `Dockerfile.dev` または `docker-compose.dev.yml` を配置する。
 どちらも無い場合、コンテナ実行を前提とした自律モードは開始できない。
 
+**`docker build` / `docker compose up` を直接叩いてはならない。** イメージのビルド・
+コンテナの起動・compose サービスの起動は、すべて `sandbox-exec.sh` に集約されている。
+呼び出し側がやることは `--print-plan` で解決結果を確認し、コマンドを投入するだけである。
+
 ```bash
-if [ -f Dockerfile.dev ]; then
-  docker build -f Dockerfile.dev -t "dev-sandbox:$(basename "$(pwd)")" .
-elif [ -f docker-compose.dev.yml ]; then
-  docker compose -f docker-compose.dev.yml up -d
-else
-  echo "ERROR: Dockerfile.dev または docker-compose.dev.yml が見つかりません"
-  exit 1
-fi
+bash "${CLAUDE_PLUGIN_ROOT}/scripts/sandbox-exec.sh" --epic "$EPIC_NUM" --print-plan
 ```
+
+`--print-plan` が `mode=none` を返す場合、`Dockerfile.dev` も `docker-compose.dev.yml` も
+見つかっていないので、自律モードを開始せずに停止する。
 
 ## 安全ルール（例外なし）
 

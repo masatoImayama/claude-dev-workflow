@@ -1,3 +1,9 @@
+# .gitattributes自身もLFで統一する。
+# 自己参照ルールが無いと、このファイル自体がCRLF化され、git のパターン解決
+# （git check-attr 等）が壊れる（実際に発生した障害。行末の\rがパターン文字列に
+# 混入し、以下の *.sh / *.toml のルールごと機能しなくなった）。
+.gitattributes text eol=lf
+
 # シェルスクリプトは必ずLFでチェックアウトする。
 # Windowsのcore.autocrlf=trueでCRLFに変換されると、行末の\rが文字列に混入し
 # フックスクリプトが誤動作する。
@@ -6,3 +12,12 @@
 # 設定ファイル・ドキュメントもUTF-8/LFで統一する
 *.json text eol=lf
 *.md text eol=lf
+
+# Codexエージェント定義（オーバーレイ・生成物）もLFで統一する。
+# *.shと同じ理由・同じ障害クラス: core.autocrlf=trueの環境でCRLF化されると、
+# adapters/codex/build.shのinclude展開（1行ずつのcase一致）が壊れ、
+# build.sh --checkが生成物を誤ってSTALEと判定する。
+*.toml text eol=lf
+
+# Dockerfile.dev もLFで統一する（docker build自体はCRLFでも動くが、他ファイルとの一貫性のため）
+Dockerfile* text eol=lf

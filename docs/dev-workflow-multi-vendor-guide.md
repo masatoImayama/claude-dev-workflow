@@ -960,6 +960,35 @@ Claude Code側の挙動を一切変えずに、ベンダー中立な内容を単
 - [ ] Codex 側で緩む点（`maxTurns` 相当なし、worktree分離なし、`sandbox_mode` の粒度が粗い）を明記
 - [ ] marketplace リポジトリ側のコピーとSHAを更新して配信
 
+### Phase F: サンドボックスの分離単位是正（Epic #3, 完了）
+
+v0.10.0 実運用で、期待（epic単位で分離）と実装（worktree単位で分離＋リポジトリ単位でキャッシュ共有）が
+ずれていたことが判明した（詳細は `epic/epic3/sandbox-epic-scope` のEpic本文を参照）。
+
+- [x] `tests/run-tests.sh`（Docker非依存）・`Dockerfile.dev`・`--print-plan` の骨格を追加
+- [x] バインドマウントをリポジトリルートに固定し、コンテナを epic 単位にする
+      （`dw-sandbox-<repo>[-<epic>]`。worktree数に依存しない）
+- [x] docker label（`dev-workflow.managed` 等）による後片付け（`--ls` / `--down` / `--down --all`）
+- [x] `--reset-cache` に列挙表示・running検出のガードと `--force` を追加
+      （キャッシュ volume はリポジトリ単位のまま。作用範囲が epic ではないための誤爆防止）
+- [x] イメージのビルド責務を `sandbox-exec.sh` に集約（`dev-sandbox:<repo>-<hash8>`、
+      イメージID差分によるコンテナ再作成、`--rebuild`）
+- [x] compose モードの修正（`-p` / `--project-directory` をリポジトリルート基準に固定、
+      自動 `up -d`、`container_name` / 固定ホストポートの検出警告）
+- [x] `check-readability.sh` の非対話ハング修正（引数指定時はstdinを読まない、
+      非tty時は `READABILITY_STDIN_TIMEOUT` で読み取りタイムアウト）
+- [x] `check-prerequisites.sh` にCRLF警告（非ブロッキング）を追加
+- [x] `.gitattributes` に `*.toml` / 自己参照の `eol=lf` を追加（`*.sh` は既存）。
+      既存ワーキングツリーの再正規化（`git rm --cached -r . && git reset --hard`）が必要になった
+      実障害を踏まえ、README にも明記
+- [x] 両 run スキル（`skills/run/SKILL.md` / `skills-codex/dev-workflow-run/SKILL.md`）から
+      `docker build` / `docker compose up` の直接記述を削除し `sandbox-exec.sh` に一本化
+- [x] `core/instructions.md` のサンドボックス方針を `sandbox-exec.sh` 集約に合わせて修正
+      （`agents/generator.md` / `codex-agents/generator.toml` を再生成）
+- [x] README.md のサンドボックス節を全面更新（分離単位の表、`--print-plan`、ライフサイクル操作、
+      `--reset-cache` の作用範囲、`--rebuild` の使いどころ、compose の既知の限界、CRLF注意）
+- [x] `plugin.json`（両CLI）を v0.11.0 に更新
+
 ### 調査済みの事項（初版の未確認リスト）
 
 | 項目 | 結論 | 対応 |

@@ -1,0 +1,9 @@
+# dev-workflow: このリポジトリ自身を検証するための開発用サンドボックスイメージ
+#
+# tests/run-tests.sh は Docker を一切使わない（bash -n / shellcheck / --print-plan の
+# ドライラン出力を検証するだけ）ため、Docker CLI はイメージに含めない。
+FROM alpine:3.20
+
+RUN apk add --no-cache bash git shellcheck
+
+WORKDIR /workspace

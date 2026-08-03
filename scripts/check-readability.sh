@@ -9,7 +9,7 @@
 # 違反の通知方法はCLIごとに契約が異なるため、実行中のCLIを判定して出し分ける:
 #   - Claude Code … exit 2 + stderr にメッセージ
 #   - Codex CLI  … exit 0 + stdout に {"continue": false, ...} のJSON
-#   - pre-commit … exit 1 + stderr にメッセージ（--exit-code で明示）
+#   - pre-commit … exit 1 + stderr にメッセージ（DEV_WORKFLOW_HOOK_VENDOR=exit-code で明示）
 #
 # どちらも
 #   - PostToolUse(Write|Edit) フック → ツール結果をブロックし、理由をエージェントに差し戻す（自己修正ループ）
@@ -25,6 +25,8 @@
 #   READABILITY_GUARD=off               # ガード全体を無効化
 #   READABILITY_MAX_BASE64=2000         # 連続するbase64文字列の許容上限（文字数）
 #   READABILITY_MAX_LINE=5000           # ソース1行の許容上限（文字数。ミニファイ検出）
+#   READABILITY_STDIN_TIMEOUT=5         # 引数なし・非tty時にstdinを待つ上限秒数。
+#                                       # 超過すると警告を出してexit 0（素通り）
 #   DEV_WORKFLOW_HOOK_VENDOR=claude|codex|exit-code
 #                                       # ベンダー自動判定を上書きする（デバッグ・CI用）
 #
@@ -44,12 +46,53 @@ MAX_BASE64="${READABILITY_MAX_BASE64:-2000}"
 MAX_LINE="${READABILITY_MAX_LINE:-5000}"
 
 # ── フック入力の読み取り ─────────────────────────────────────────────
-# フック実行時は stdin に JSON が渡る。端末から手で叩いた場合は stdin が tty に
-# なるため読まない（読むとブロックしてしまう）。
+# フック実行時（引数なし）は stdin に JSON が渡る。端末から手で叩いた場合は stdin
+# が tty になるため読まない（読むとブロックしてしまう）。
+# `--git` / `--staged` / ファイル引数が1つでもある場合は検査対象が明確なので、
+# stdin は一切読まない（パイプ越し・CI・エージェントランナーからの呼び出しで
+# EOFが来ずハングする経路を作らないため）。
 HOOK_INPUT=""
-if [ ! -t 0 ]; then
-  HOOK_INPUT="$(cat 2>/dev/null || true)"
-fi
+
+# 引数なし・非tty のときだけ、上限付きで stdin を「全部」読む。
+# フック入力は整形された（複数行の）JSONで来ることがあり、1行しか読まないと
+# 1行目に file_path が無い場合に検査対象を取りこぼして黙って素通りしてしまう
+# （可読性ガードが最優先で守るべきルールを、入力形式の差で無効化してはならない）。
+#
+# 以前は `timeout "$secs" cat` に読み取りを丸ごと委譲していたが、`timeout` は
+# GNU coreutils / BusyBox のコマンドで macOS の既定環境には存在しない
+# （`gtimeout` のみ）。command not found（status 127）を「入力が来なかった」と
+# 誤判定し、macOS では可読性ガードが常時無効化されてしまっていた。
+# 外部コマンドに依存せず、bash 組み込みの `read -t` だけで複数行を読み切る。
+#
+# 注意: `while read -t ...; do ...; done` の直後の `$?` はループの終了ステータスに
+# なり、POSIX仕様上「ループ本体が一度も実行されなければ0」になる。つまり読み取り
+# 自体がタイムアウトで失敗しても、その失敗ステータスはループの外に伝播しない。
+# そのため read の戻り値はループ内で都度チェックし、専用フラグに記録する。
+#   - status > 128: シグナルによる強制終了＝タイムアウト（bashは128+シグナル番号を返す）
+#   - status != 0 かつ <= 128: EOF。ただし改行で終端されていない最終行が
+#     `line` に残ったままループを抜けることがあるため、ループ後に明示的に追加する
+#     （末尾に改行の無い入力でも最終行を取りこぼさない）。
+read_stdin_with_timeout() {
+  local timeout_secs="${READABILITY_STDIN_TIMEOUT:-5}"
+  local line="" content="" rc timed_out=0
+  while :; do
+    IFS= read -r -t "$timeout_secs" line
+    rc=$?
+    if [ "$rc" -gt 128 ]; then
+      timed_out=1
+      break
+    elif [ "$rc" -ne 0 ]; then
+      break
+    fi
+    content+="${line}"$'\n'
+  done
+  if [ "$timed_out" -eq 1 ]; then
+    return 1
+  fi
+  [ -n "$line" ] && content+="$line"
+  printf '%s' "$content"
+  return 0
+}
 
 # ── 実行中のCLIを判定 ────────────────────────────────────────────────
 # Claude Code と Codex CLI はフックのブロック契約が異なるため、出力を出し分ける。
@@ -162,7 +205,15 @@ elif [ "$#" -gt 0 ]; then
   # 引数で指定されたファイル
   files=("$@")
 else
-  # フック入力のJSONから file_path を抽出（PostToolUse 用）
+  # 引数なし: フック入力のJSONから file_path を抽出（PostToolUse 用）。
+  # stdin が tty でなければ、上限付きで読む（既定5秒、READABILITY_STDIN_TIMEOUT で調整可）。
+  # タイムアウトした場合は「フック入力が来ないなら検査対象も無い」として素通りする。
+  if [ ! -t 0 ]; then
+    if ! HOOK_INPUT="$(read_stdin_with_timeout)"; then
+      echo "【可読性ガード】 stdin からの入力が ${READABILITY_STDIN_TIMEOUT:-5}秒 以内に得られなかったため検査をスキップします" >&2
+      exit 0
+    fi
+  fi
   raw=$(printf '%s' "$HOOK_INPUT" | grep -oE '"file_path"[[:space:]]*:[[:space:]]*"[^"]*"' | head -1 \
         | sed -E 's/.*"file_path"[[:space:]]*:[[:space:]]*"([^"]*)".*/\1/')
   if [ -n "$raw" ]; then
@@ -178,8 +229,7 @@ fi
 report=""
 violated=0
 for f in "${files[@]}"; do
-  out=$(check_one "$f")
-  if [ $? -ne 0 ]; then
+  if ! out=$(check_one "$f"); then
     report="${report}${out}\n"
     violated=1
   fi
