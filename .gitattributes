@@ -6,3 +6,6 @@
 # 設定ファイル・ドキュメントもUTF-8/LFで統一する
 *.json text eol=lf
 *.md text eol=lf
+
+# Dockerfile.dev もLFで統一する（docker build自体はCRLFでも動くが、他ファイルとの一貫性のため）
+Dockerfile* text eol=lf

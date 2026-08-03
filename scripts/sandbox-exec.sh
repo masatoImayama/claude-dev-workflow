@@ -14,6 +14,7 @@
 #   bash scripts/sandbox-exec.sh --warm 'go build ./...'             # キャッシュを温める（失敗しても成功扱い）
 #   bash scripts/sandbox-exec.sh --down                              # 常駐コンテナを削除（キャッシュは残す）
 #   bash scripts/sandbox-exec.sh --reset-cache                       # キャッシュ volume も削除
+#   bash scripts/sandbox-exec.sh --print-plan                        # docker に触れず解決結果を表示（ドライラン）
 #
 # 終了コードは実行したコマンドのものをそのまま返す（機械的ゲートの判定に使える）。
 #
@@ -42,6 +43,7 @@ while [ $# -gt 0 ]; do
     --warm)        WARM=1; shift ;;
     --down)        ACTION="down"; shift ;;
     --reset-cache) ACTION="reset-cache"; shift ;;
+    --print-plan)  ACTION="print-plan"; shift ;;
     --)            shift; break ;;
     -*)            echo "ERROR: 未知のオプション: $1" >&2; exit 2 ;;
     *)             break ;;
@@ -86,6 +88,37 @@ cache_mount_args() {
   done
 }
 
+# --print-plan: docker に一切触れず、解決結果を key=value 形式で出力するドライラン。
+# 「コンテナ名・イメージタグ・マウント元」を外から観測できる形にし、テストで固定するために用意する。
+# この時点では現行の解決結果をそのまま出す（挙動は変えない）。
+# repo_root / rel_path / fallback / build_context / compose_* は後続タスクで追加する。
+print_plan() {
+  printf 'mode=%s\n' "${DEV_WORKFLOW_SANDBOX_MODE:-}"
+  printf 'repo=%s\n'  "$PROJECT"
+  printf 'epic=%s\n'  "$EPIC"
+
+  case "${DEV_WORKFLOW_SANDBOX_MODE:-}" in
+    dockerfile)
+      printf 'mount_source=%s\n' "$HOST_PWD"
+      printf 'mount_target=%s\n' "/workspace"
+      printf 'workdir=%s\n'      "/workspace"
+      ;;
+    *)
+      printf 'mount_source=\n'
+      printf 'mount_target=\n'
+      printf 'workdir=\n'
+      ;;
+  esac
+
+  printf 'container=%s\n' "$CONTAINER"
+  printf 'image=%s\n'     "${DEV_WORKFLOW_SANDBOX_IMAGE:-}"
+
+  local path
+  for path in $CACHE_PATHS; do
+    printf 'cache_volume=%s:%s\n' "$(cache_volume_name "$path")" "$path"
+  done
+}
+
 eval "$(bash "${SCRIPT_DIR}/resolve-sandbox.sh")"
 
 case "$ACTION" in
@@ -100,6 +133,10 @@ case "$ACTION" in
       docker volume rm "$(cache_volume_name "$path")" >/dev/null 2>&1 || true
     done
     echo "常駐コンテナとキャッシュ volume を削除しました: ${CONTAINER}"
+    exit 0
+    ;;
+  print-plan)
+    print_plan
     exit 0
     ;;
 esac
