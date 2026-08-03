@@ -193,7 +193,31 @@ assert_eq "epic 未指定時は空" "" "$(get_plan_value epic)"
 assert_eq "mount_target は /workspace" "/workspace" "$(get_plan_value mount_target)"
 assert_eq "workdir は /workspace" "/workspace" "$(get_plan_value workdir)"
 assert_eq "container はリポジトリ名から決まる" "dw-sandbox-${REPO_BASENAME}" "$(get_plan_value container)"
-assert_eq "image はリポジトリ名から決まる" "dev-sandbox:${REPO_BASENAME}" "$(get_plan_value image)"
+
+# image はリポジトリ名 + Dockerfile.dev 内容の hash8（Task #8、仕様書 4.7）で決まる。
+# hash8 の具体的な値は Dockerfile.dev の内容依存のため、ここではプレフィックスと
+# 末尾8文字が16進数であることだけを確認する（内容変更への追随はケース7で検証する）。
+IMAGE_VALUE="$(get_plan_value image)"
+case "$IMAGE_VALUE" in
+  "dev-sandbox:${REPO_BASENAME}-"*) pass "image はリポジトリ名+hash8のプレフィックスを持つ" ;;
+  *) fail "image はリポジトリ名+hash8のプレフィックスを持つ" "image=[${IMAGE_VALUE}]" ;;
+esac
+
+IMAGE_HASH_SUFFIX="${IMAGE_VALUE: -8}"
+case "$IMAGE_HASH_SUFFIX" in
+  [0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f])
+    pass "image の末尾8文字が16進数のhashである" ;;
+  *)
+    fail "image の末尾8文字が16進数のhashである" "suffix=[${IMAGE_HASH_SUFFIX}]" ;;
+esac
+
+assert_eq "dockerfile は Dockerfile.dev" "Dockerfile.dev" "$(get_plan_value dockerfile)"
+
+BUILD_CONTEXT_VALUE="$(get_plan_value build_context)"
+case "$BUILD_CONTEXT_VALUE" in
+  *"$REPO_BASENAME") pass "--print-plan に build_context が出る（一時リポジトリを指す）" ;;
+  *) fail "--print-plan に build_context が出る（一時リポジトリを指す）" "build_context=[${BUILD_CONTEXT_VALUE}]" ;;
+esac
 
 # mount_source はこのケースでは一時リポジトリのパス（pwd -W 相当）を指すはず。
 MOUNT_SOURCE="$(get_plan_value mount_source)"
@@ -675,6 +699,300 @@ case "$RESET_BLOCK_STDERR" in
   *"リポジトリ全体"*) pass "中断メッセージにも作用範囲（リポジトリ全体）の記載がある" ;;
   *) fail "中断メッセージにも作用範囲（リポジトリ全体）の記載がある" "stderr=[${RESET_BLOCK_STDERR}]" ;;
 esac
+
+# ---------------------------------------------------------------------------
+# ケース7: イメージタグの hash 依存性（Task #8、Epic #3 仕様書「5. 検証方針」ケース7）
+#
+# Dockerfile.dev の内容を変更するとタグの hash 部分（末尾8文字）が変わり、内容が同じなら
+# 別リポジトリでも hash が変わらないことを確認する。
+# ---------------------------------------------------------------------------
+
+echo "== イメージタグの hash 依存性（ケース7、Task #8） =="
+
+IMG_REPO="$(make_temp_repo)"
+copy_sandbox_scripts "$IMG_REPO"
+
+IMG_PLAN_OUTPUT="$(
+  cd "$IMG_REPO" || exit 1
+  PATH="${FAKE_BIN_DIR}:${PATH}" bash scripts/sandbox-exec.sh --print-plan
+)"
+IMG_IMAGE="$(plan_value image "$IMG_PLAN_OUTPUT")"
+IMG_DOCKERFILE="$(plan_value dockerfile "$IMG_PLAN_OUTPUT")"
+IMG_BUILD_CONTEXT="$(plan_value build_context "$IMG_PLAN_OUTPUT")"
+IMG_CONTAINER="$(plan_value container "$IMG_PLAN_OUTPUT")"
+IMG_MOUNT_SOURCE="$(plan_value mount_source "$IMG_PLAN_OUTPUT")"
+IMG_HASH_BEFORE="${IMG_IMAGE: -8}"
+
+# --- Dockerfile.dev の内容を変更してコミットすると hash（タグの末尾8文字）が変わる ---
+printf '\n# case7 marker\n' >> "${IMG_REPO}/Dockerfile.dev"
+(
+  cd "$IMG_REPO" || exit 1
+  git add Dockerfile.dev
+  git commit -q -m "case7: change Dockerfile.dev"
+) >/dev/null 2>&1
+
+IMG_PLAN_AFTER_CHANGE="$(
+  cd "$IMG_REPO" || exit 1
+  PATH="${FAKE_BIN_DIR}:${PATH}" bash scripts/sandbox-exec.sh --print-plan
+)"
+IMG_IMAGE_AFTER_CHANGE="$(plan_value image "$IMG_PLAN_AFTER_CHANGE")"
+IMG_HASH_AFTER_CHANGE="${IMG_IMAGE_AFTER_CHANGE: -8}"
+
+if [ "$IMG_HASH_BEFORE" != "$IMG_HASH_AFTER_CHANGE" ]; then
+  pass "ケース7: Dockerfile.dev の内容変更でタグの hash が変わる"
+else
+  fail "ケース7: Dockerfile.dev の内容変更でタグの hash が変わる" "hash が変わりませんでした: ${IMG_HASH_BEFORE}"
+fi
+
+# 以降の自動ビルド系テストは、この時点（Dockerfile.dev 変更後）の IMG_REPO を使い回す。
+# resolve-sandbox.sh の出力は Dockerfile.dev の内容に追随するため、変更後の値で
+# 上書きしておかないと docker build の実引数と食い違う。
+IMG_IMAGE="$(plan_value image "$IMG_PLAN_AFTER_CHANGE")"
+IMG_DOCKERFILE="$(plan_value dockerfile "$IMG_PLAN_AFTER_CHANGE")"
+IMG_BUILD_CONTEXT="$(plan_value build_context "$IMG_PLAN_AFTER_CHANGE")"
+IMG_CONTAINER="$(plan_value container "$IMG_PLAN_AFTER_CHANGE")"
+IMG_MOUNT_SOURCE="$(plan_value mount_source "$IMG_PLAN_AFTER_CHANGE")"
+
+# --- 内容が同じなら別リポジトリ（worktree 相当）でも hash が変わらない ---
+IMG_REPO2="$(make_temp_repo)"
+copy_sandbox_scripts "$IMG_REPO2"
+
+IMG_PLAN2_OUTPUT="$(
+  cd "$IMG_REPO2" || exit 1
+  PATH="${FAKE_BIN_DIR}:${PATH}" bash scripts/sandbox-exec.sh --print-plan
+)"
+IMG_HASH2="$(plan_value image "$IMG_PLAN2_OUTPUT")"
+IMG_HASH2="${IMG_HASH2: -8}"
+
+assert_eq "ケース7: 内容が同じなら別リポジトリでも hash が変わらない" "$IMG_HASH_BEFORE" "$IMG_HASH2"
+
+# ---------------------------------------------------------------------------
+# 自動ビルド・--rebuild・イメージID差分による再作成（Task #8、Epic #3 仕様書 4.7 / 4.3 の1）
+#
+# 偽 docker は状態をファイルに保持し、docker build / docker rm / docker run の呼び出しを
+# 実際の docker を起動せずに検証する。container の存在状態は docker rm / docker run に
+# 応じて更新するため、削除後に作り直されることまで検証できる。
+# ---------------------------------------------------------------------------
+
+echo "== 自動ビルド・--rebuild・イメージID差分による再作成（Task #8） =="
+
+FAKE_DOCKER_IMAGE_DIR="$(mktemp -d "${TMPDIR:-/tmp}/dw-test-fakebin-image.XXXXXX")"
+cat > "${FAKE_DOCKER_IMAGE_DIR}/docker" <<'FAKE_DOCKER_IMAGE'
+#!/bin/bash
+# tests/run-tests.sh 用の偽 docker（イメージ解決・自動ビルド・コンテナ再作成の検証専用）。
+# 実際の docker には一切触れない。呼び出し引数は DW_IMG_LOG にすべて記録する。
+set -u
+
+IMG_LOG="${DW_IMG_LOG:?DW_IMG_LOG is required}"
+STATE_FILE="${DW_IMG_CONTAINER_STATE:?DW_IMG_CONTAINER_STATE is required}"          # 1=存在 0=不在
+RUNNING_FILE="${DW_IMG_CONTAINER_RUNNING_STATE:?DW_IMG_CONTAINER_RUNNING_STATE is required}" # true/false
+RM_LOG="${DW_IMG_RM_LOG:?DW_IMG_RM_LOG is required}"
+RUN_LOG="${DW_IMG_RUN_LOG:?DW_IMG_RUN_LOG is required}"
+
+echo "$*" >> "$IMG_LOG"
+
+case "${1:-}" in
+  image)
+    shift
+    [ "${1:-}" = "inspect" ] || exit 1
+    shift
+    tmpl=""
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        -f) tmpl="$2"; shift 2 ;;
+        *)  shift ;;
+      esac
+    done
+    [ "${DW_IMG_IMAGE_EXISTS:-0}" = "1" ] || exit 1
+    [ -n "$tmpl" ] && printf '%s\n' "${DW_IMG_IMAGE_ID:-sha256:default-image-id}"
+    exit 0
+    ;;
+  build)
+    exit "${DW_IMG_BUILD_EXIT:-0}"
+    ;;
+  container)
+    shift
+    [ "${1:-}" = "inspect" ] || exit 1
+    shift
+    tmpl=""
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        -f) tmpl="$2"; shift 2 ;;
+        *)  shift ;;
+      esac
+    done
+    [ "$(cat "$STATE_FILE" 2>/dev/null)" = "1" ] || exit 1
+    case "$tmpl" in
+      *'Mounts'*)        printf '%s\n' "${DW_IMG_CONTAINER_MOUNT:-}" ;;
+      *'.Image'*)        printf '%s\n' "${DW_IMG_CONTAINER_IMAGE_ID:-}" ;;
+      *'State.Running'*) cat "$RUNNING_FILE" 2>/dev/null || printf 'false\n' ;;
+      '') : ;;
+      *) printf '\n' ;;
+    esac
+    exit 0
+    ;;
+  run)
+    echo "$*" >> "$RUN_LOG"
+    printf '1' > "$STATE_FILE"
+    printf 'true\n' > "$RUNNING_FILE"
+    exit 0
+    ;;
+  start)
+    printf 'true\n' > "$RUNNING_FILE"
+    exit 0
+    ;;
+  rm)
+    shift
+    target=""
+    for a in "$@"; do
+      case "$a" in
+        -f) ;;
+        *)  target="$a" ;;
+      esac
+    done
+    echo "$target" >> "$RM_LOG"
+    printf '0' > "$STATE_FILE"
+    exit 0
+    ;;
+  exec)
+    shift
+    cmd=""
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        -w) shift 2 ;;
+        sh) shift ;;
+        -c) cmd="$2"; shift 2 ;;
+        *)  shift ;;
+      esac
+    done
+    sh -c "$cmd"
+    exit $?
+    ;;
+  *)
+    exit 1
+    ;;
+esac
+FAKE_DOCKER_IMAGE
+chmod +x "${FAKE_DOCKER_IMAGE_DIR}/docker"
+
+IMG_TEST_LOG="$(mktemp "${TMPDIR:-/tmp}/dw-test-imglog.XXXXXX")"
+IMG_TEST_RM_LOG="$(mktemp "${TMPDIR:-/tmp}/dw-test-imgrmlog.XXXXXX")"
+IMG_TEST_RUN_LOG="$(mktemp "${TMPDIR:-/tmp}/dw-test-imgrunlog.XXXXXX")"
+IMG_TEST_STATE_FILE="$(mktemp "${TMPDIR:-/tmp}/dw-test-imgstate.XXXXXX")"
+IMG_TEST_RUNNING_FILE="$(mktemp "${TMPDIR:-/tmp}/dw-test-imgrunning.XXXXXX")"
+
+run_img_case() {
+  # run_img_case <container_exists 0/1> <container_running true/false> <container_image_id>
+  #              <container_mount> <image_exists 0/1> <image_id> [追加の sandbox-exec.sh 引数...]
+  local container_exists="$1" container_running="$2" container_image_id="$3" container_mount="$4"
+  local image_exists="$5" image_id="$6"
+  shift 6
+
+  : > "$IMG_TEST_LOG"
+  : > "$IMG_TEST_RM_LOG"
+  : > "$IMG_TEST_RUN_LOG"
+  printf '%s' "$container_exists" > "$IMG_TEST_STATE_FILE"
+  printf '%s\n' "$container_running" > "$IMG_TEST_RUNNING_FILE"
+
+  (
+    cd "$IMG_REPO" || exit 1
+    DW_IMG_LOG="$IMG_TEST_LOG" \
+      DW_IMG_RM_LOG="$IMG_TEST_RM_LOG" \
+      DW_IMG_RUN_LOG="$IMG_TEST_RUN_LOG" \
+      DW_IMG_CONTAINER_STATE="$IMG_TEST_STATE_FILE" \
+      DW_IMG_CONTAINER_RUNNING_STATE="$IMG_TEST_RUNNING_FILE" \
+      DW_IMG_CONTAINER_IMAGE_ID="$container_image_id" \
+      DW_IMG_CONTAINER_MOUNT="$container_mount" \
+      DW_IMG_IMAGE_EXISTS="$image_exists" \
+      DW_IMG_IMAGE_ID="$image_id" \
+      PATH="${FAKE_DOCKER_IMAGE_DIR}:${PATH}" \
+      bash scripts/sandbox-exec.sh "$@"
+  )
+}
+
+# --- イメージが存在しない場合、docker build が正しい引数で呼ばれる ---
+IMG_A_EXIT=0
+run_img_case 0 false "" "" 0 "" 'true' >/dev/null 2>&1 || IMG_A_EXIT=$?
+assert_exit_code "イメージ未存在時: 実行全体が成功する" 0 "$IMG_A_EXIT"
+
+IMG_A_BUILD_LINE="$(grep '^build ' "$IMG_TEST_LOG" | head -n1)"
+assert_eq "イメージ未存在時: docker build が正しい引数で呼ばれる" \
+  "build -f ${IMG_DOCKERFILE} -t ${IMG_IMAGE} ${IMG_BUILD_CONTEXT}" "$IMG_A_BUILD_LINE"
+
+# --- イメージが存在する場合はビルドしない ---
+IMG_B_EXIT=0
+run_img_case 0 false "" "" 1 "sha256:existing" 'true' >/dev/null 2>&1 || IMG_B_EXIT=$?
+assert_exit_code "イメージ存在時: 実行全体が成功する" 0 "$IMG_B_EXIT"
+
+IMG_B_BUILD_COUNT="$(grep -c '^build ' "$IMG_TEST_LOG" || true)"
+assert_eq "イメージ存在時: docker build を呼ばない" "0" "$IMG_B_BUILD_COUNT"
+
+# --- --rebuild 指定時は存在してもビルドする ---
+IMG_C_EXIT=0
+run_img_case 0 false "" "" 1 "sha256:existing" --rebuild 'true' >/dev/null 2>&1 || IMG_C_EXIT=$?
+assert_exit_code "--rebuild 指定時: 実行全体が成功する" 0 "$IMG_C_EXIT"
+
+IMG_C_BUILD_COUNT="$(grep -c '^build ' "$IMG_TEST_LOG" || true)"
+assert_eq "--rebuild 指定時: イメージが存在してもビルドする" "1" "$IMG_C_BUILD_COUNT"
+
+# --- DEV_WORKFLOW_DOCKER_IMAGE 指定でイメージが無い場合はビルドせずエラーで停止する ---
+: > "$IMG_TEST_LOG"
+: > "$IMG_TEST_RM_LOG"
+: > "$IMG_TEST_RUN_LOG"
+printf '0' > "$IMG_TEST_STATE_FILE"
+printf 'false\n' > "$IMG_TEST_RUNNING_FILE"
+
+EXPLICIT_IMAGE_STDERR="$(
+  cd "$IMG_REPO" || exit 1
+  DEV_WORKFLOW_DOCKER_IMAGE="external/image:notfound" \
+    DW_IMG_LOG="$IMG_TEST_LOG" \
+    DW_IMG_RM_LOG="$IMG_TEST_RM_LOG" \
+    DW_IMG_RUN_LOG="$IMG_TEST_RUN_LOG" \
+    DW_IMG_CONTAINER_STATE="$IMG_TEST_STATE_FILE" \
+    DW_IMG_CONTAINER_RUNNING_STATE="$IMG_TEST_RUNNING_FILE" \
+    DW_IMG_IMAGE_EXISTS=0 \
+    PATH="${FAKE_DOCKER_IMAGE_DIR}:${PATH}" \
+    bash scripts/sandbox-exec.sh 'true' 2>&1 1>/dev/null
+)"
+EXPLICIT_IMAGE_EXIT=$?
+
+if [ "$EXPLICIT_IMAGE_EXIT" -ne 0 ]; then
+  pass "DEV_WORKFLOW_DOCKER_IMAGE 指定でイメージが無い場合は非0で終了する"
+else
+  fail "DEV_WORKFLOW_DOCKER_IMAGE 指定でイメージが無い場合は非0で終了する" "exit=0"
+fi
+
+EXPLICIT_IMAGE_BUILD_COUNT="$(grep -c '^build ' "$IMG_TEST_LOG" || true)"
+assert_eq "DEV_WORKFLOW_DOCKER_IMAGE 指定時: イメージが無くてもビルドしない" "0" "$EXPLICIT_IMAGE_BUILD_COUNT"
+
+case "$EXPLICIT_IMAGE_STDERR" in
+  *"DEV_WORKFLOW_DOCKER_IMAGE"*"external/image:notfound"*)
+    pass "DEV_WORKFLOW_DOCKER_IMAGE 指定時のエラーに取得方法の案内が含まれる" ;;
+  *)
+    fail "DEV_WORKFLOW_DOCKER_IMAGE 指定時のエラーに取得方法の案内が含まれる" "stderr=[${EXPLICIT_IMAGE_STDERR}]" ;;
+esac
+
+# --- 既存コンテナのイメージIDが異なれば削除して作り直す（仕様書 4.3 の1） ---
+IMG_E_EXIT=0
+run_img_case 1 true "sha256:old" "$IMG_MOUNT_SOURCE" 1 "sha256:new" 'true' >/dev/null 2>&1 || IMG_E_EXIT=$?
+assert_exit_code "イメージID差分時: 実行全体が成功する" 0 "$IMG_E_EXIT"
+
+IMG_E_RM_COUNT="$(grep -c . "$IMG_TEST_RM_LOG" || true)"
+assert_eq "イメージID差分時: 既存コンテナが削除される" "1" "$IMG_E_RM_COUNT"
+
+IMG_E_RUN_COUNT="$(grep -c '^run ' "$IMG_TEST_LOG" || true)"
+assert_eq "イメージID差分時: コンテナが作り直される" "1" "$IMG_E_RUN_COUNT"
+
+# --- 既存コンテナのイメージIDが同じなら作り直さない ---
+IMG_F_EXIT=0
+run_img_case 1 true "sha256:same" "$IMG_MOUNT_SOURCE" 1 "sha256:same" 'true' >/dev/null 2>&1 || IMG_F_EXIT=$?
+assert_exit_code "イメージID同一時: 実行全体が成功する" 0 "$IMG_F_EXIT"
+
+IMG_F_RM_COUNT="$(grep -c . "$IMG_TEST_RM_LOG" || true)"
+assert_eq "イメージID同一時: 既存コンテナを削除しない" "0" "$IMG_F_RM_COUNT"
+
+IMG_F_RUN_COUNT="$(grep -c '^run ' "$IMG_TEST_LOG" || true)"
+assert_eq "イメージID同一時: コンテナを作り直さない" "0" "$IMG_F_RUN_COUNT"
 
 # ---------------------------------------------------------------------------
 # 結果集計

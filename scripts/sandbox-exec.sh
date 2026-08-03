@@ -20,9 +20,22 @@
 #                                                                     # 同一リポジトリの管理コンテナが1つでも running
 #                                                                     # なら中断し、--force の指定を促す
 #   bash scripts/sandbox-exec.sh --reset-cache --force                # running でも強制的に削除する
+#   bash scripts/sandbox-exec.sh --rebuild 'make test'                # イメージを強制再ビルドしてから実行する
 #   bash scripts/sandbox-exec.sh --print-plan                        # docker に触れず解決結果を表示（ドライラン）
 #
 # 終了コードは実行したコマンドのものをそのまま返す（機械的ゲートの判定に使える）。
+#
+# イメージの自動ビルドと再作成（仕様書 4.7 / 4.3 の 1）:
+#   dockerfile モードでは、イメージが存在しない、または --rebuild 指定時に
+#   `docker build -f <Dockerfile> -t <イメージ> <ビルドコンテキスト>` を自動実行する。
+#   タグは resolve-sandbox.sh が Dockerfile の内容の hash から決めるため、内容が変われば
+#   自動的に別タグになる。ただし hash は Dockerfile 自体の内容しか見ないため、
+#   COPY 対象（go.mod / package.json 等）だけを変更した場合は検知できない。
+#   その逃げ道が --rebuild であり、内容に変更が無くても強制的に再ビルド・コンテナ作り直しを行う。
+#   DEV_WORKFLOW_DOCKER_IMAGE で既存イメージを明示指定した場合はビルド責務を持たない。
+#   イメージが無ければビルドせず、取得方法を示すエラーで停止する。
+#   既存の常駐コンテナのイメージIDが解決タグの現在のイメージIDと異なる場合も、
+#   バージョンスキュー解消のため削除して作り直す（理由を stderr に出す）。
 #
 # 参照する環境変数:
 #   DEV_WORKFLOW_CACHE_PATHS      volume 化するコンテナ内パス（スペース区切り）。既定は下記 DEFAULT_CACHE_PATHS
@@ -46,6 +59,7 @@ EPIC=""
 WARM=0
 ALL=0
 FORCE=0
+REBUILD=0
 ACTION="exec"
 
 while [ $# -gt 0 ]; do
@@ -57,6 +71,7 @@ while [ $# -gt 0 ]; do
     --ls)          ACTION="ls"; shift ;;
     --reset-cache) ACTION="reset-cache"; shift ;;
     --force)       FORCE=1; shift ;;
+    --rebuild)     REBUILD=1; shift ;;
     --print-plan)  ACTION="print-plan"; shift ;;
     --)            shift; break ;;
     -*)            echo "ERROR: 未知のオプション: $1" >&2; exit 2 ;;
@@ -149,7 +164,7 @@ cache_mount_args() {
 
 # --print-plan: docker に一切触れず、解決結果を key=value 形式で出力するドライラン。
 # 「コンテナ名・イメージタグ・マウント元」を外から観測できる形にし、テストで固定するために用意する。
-# build_context / compose_* は後続タスク（#8, #9）で追加する。
+# compose_* は後続タスク（#9）で追加する。
 print_plan() {
   printf 'mode=%s\n' "${DEV_WORKFLOW_SANDBOX_MODE:-}"
   printf 'repo=%s\n'  "$PROJECT"
@@ -173,6 +188,8 @@ print_plan() {
 
   printf 'container=%s\n' "$CONTAINER"
   printf 'image=%s\n'     "${DEV_WORKFLOW_SANDBOX_IMAGE:-}"
+  printf 'dockerfile=%s\n'     "${DEV_WORKFLOW_SANDBOX_DOCKERFILE:-}"
+  printf 'build_context=%s\n' "${DEV_WORKFLOW_SANDBOX_CONTEXT:-}"
 
   local path
   for path in $CACHE_PATHS; do
@@ -268,6 +285,41 @@ list_running_containers_in_repo() {
   done < <(list_managed_candidate_names)
 }
 
+# イメージ解決とビルド（仕様書 4.7）。
+# - DEV_WORKFLOW_SANDBOX_DOCKERFILE が非空（= Dockerfile.dev からビルドする運用）の場合は、
+#   イメージが存在しないか --rebuild 指定時に docker build を実行し、ビルド責務をここに集約する。
+# - DEV_WORKFLOW_SANDBOX_DOCKERFILE が空（= DEV_WORKFLOW_DOCKER_IMAGE で既存イメージを明示指定）
+#   の場合はビルドしない。イメージが無ければ、取得方法を示すエラーで停止する
+#   （利用者が用意した既存イメージの責務を勝手に肩代わりしないため）。
+image_exists() {
+  docker image inspect "$1" >/dev/null 2>&1
+}
+
+image_id_of() {
+  docker image inspect -f '{{.Id}}' "$1" 2>/dev/null || true
+}
+
+ensure_sandbox_image() {
+  if [ -n "$DEV_WORKFLOW_SANDBOX_DOCKERFILE" ]; then
+    if [ "$REBUILD" -eq 1 ] || ! image_exists "$DEV_WORKFLOW_SANDBOX_IMAGE"; then
+      echo "サンドボックスイメージをビルドします: ${DEV_WORKFLOW_SANDBOX_IMAGE} (${DEV_WORKFLOW_SANDBOX_DOCKERFILE})" >&2
+      docker build -f "$DEV_WORKFLOW_SANDBOX_DOCKERFILE" -t "$DEV_WORKFLOW_SANDBOX_IMAGE" "$DEV_WORKFLOW_SANDBOX_CONTEXT" || {
+        echo "ERROR: イメージのビルドに失敗しました: ${DEV_WORKFLOW_SANDBOX_IMAGE}" >&2
+        exit 1
+      }
+    fi
+  else
+    if [ "$REBUILD" -eq 1 ]; then
+      echo "WARNING: DEV_WORKFLOW_DOCKER_IMAGE 指定時はビルド責務を持たないため --rebuild を無視します" >&2
+    fi
+    if ! image_exists "$DEV_WORKFLOW_SANDBOX_IMAGE"; then
+      echo "ERROR: DEV_WORKFLOW_DOCKER_IMAGE=${DEV_WORKFLOW_SANDBOX_IMAGE} で指定されたイメージが見つかりません。" >&2
+      echo "       事前に 'docker pull' や 'docker build' 等でイメージを用意するか、DEV_WORKFLOW_DOCKER_IMAGE の指定を外して Dockerfile.dev からの自動ビルドを使ってください。" >&2
+      exit 1
+    fi
+  fi
+}
+
 eval "$(bash "${SCRIPT_DIR}/resolve-sandbox.sh")"
 
 case "$ACTION" in
@@ -349,13 +401,35 @@ case "$DEV_WORKFLOW_SANDBOX_MODE" in
     ;;
 
   dockerfile)
-    # 既存コンテナのマウント元が期待値（MOUNT_SOURCE）と異なる場合は、別ツリーを
-    # 実行してしまう経路になるため削除して作り直す（仕様書 4.3 の 2）。
-    # イメージID差分による再作成は #8 で追加する。
+    # イメージが無ければ自動ビルドする（--rebuild 指定時は強制的に再ビルドする）。
+    ensure_sandbox_image
+
+    # 既存コンテナは次のいずれかに該当すれば削除して作り直す（仕様書 4.3）:
+    #   1. イメージIDが解決タグの現在のイメージIDと異なる（バージョンスキュー解消）
+    #   2. マウント元が期待値（MOUNT_SOURCE）と異なる（別ツリー実行の防止）
+    #   3. --rebuild が明示指定されている（内容が変わっていなくても作り直す）
     if docker container inspect "$CONTAINER" >/dev/null 2>&1; then
+      RECREATE=0
+
       EXISTING_MOUNT="$(container_field "$CONTAINER" "$MOUNT_SOURCE_TEMPLATE")"
       if [ -n "$EXISTING_MOUNT" ] && [ "$EXISTING_MOUNT" != "$MOUNT_SOURCE" ]; then
         echo "WARNING: 既存コンテナ ${CONTAINER} のマウント元 (${EXISTING_MOUNT}) が期待値 (${MOUNT_SOURCE}) と異なるため削除して作り直します（別ツリー実行の防止）" >&2
+        RECREATE=1
+      fi
+
+      CURRENT_IMAGE_ID="$(image_id_of "$DEV_WORKFLOW_SANDBOX_IMAGE")"
+      EXISTING_IMAGE_ID="$(container_field "$CONTAINER" '{{.Image}}')"
+      if [ -n "$CURRENT_IMAGE_ID" ] && [ -n "$EXISTING_IMAGE_ID" ] && [ "$EXISTING_IMAGE_ID" != "$CURRENT_IMAGE_ID" ]; then
+        echo "WARNING: 既存コンテナ ${CONTAINER} のイメージ (${EXISTING_IMAGE_ID}) が現在のイメージ ${DEV_WORKFLOW_SANDBOX_IMAGE} (${CURRENT_IMAGE_ID}) と異なるため削除して作り直します（バージョンスキューの解消）" >&2
+        RECREATE=1
+      fi
+
+      if [ "$REBUILD" -eq 1 ]; then
+        echo "WARNING: --rebuild が指定されたため既存コンテナ ${CONTAINER} を削除して作り直します" >&2
+        RECREATE=1
+      fi
+
+      if [ "$RECREATE" -eq 1 ]; then
         docker rm -f "$CONTAINER" >/dev/null 2>&1 || true
       fi
     fi
