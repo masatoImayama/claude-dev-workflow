@@ -98,11 +98,29 @@ copy_sandbox_scripts() {
   cp "${REPO_ROOT}/scripts/sandbox-exec.sh"    "${dest}/scripts/sandbox-exec.sh"
   cp "${REPO_ROOT}/scripts/resolve-sandbox.sh" "${dest}/scripts/resolve-sandbox.sh"
   cp "${REPO_ROOT}/scripts/lib/container-membership.sh" "${dest}/scripts/lib/container-membership.sh"
+  cp "${REPO_ROOT}/scripts/lib/compose-conflicts.sh"    "${dest}/scripts/lib/compose-conflicts.sh"
   cp "${REPO_ROOT}/Dockerfile.dev"             "${dest}/Dockerfile.dev"
   (
     cd "$dest" || exit 1
     git add scripts Dockerfile.dev
     git commit -q -m "add sandbox scripts"
+  ) >/dev/null 2>&1
+}
+
+copy_sandbox_scripts_no_dockerfile() {
+  # copy_sandbox_scripts_no_dockerfile <dest_repo_dir>
+  # compose モード検証用。Dockerfile.dev を置かないことで resolve-sandbox.sh が
+  # compose モードを解決するようにする（Dockerfile.dev が優先されてしまうため）。
+  local dest="$1"
+  mkdir -p "${dest}/scripts/lib"
+  cp "${REPO_ROOT}/scripts/sandbox-exec.sh"    "${dest}/scripts/sandbox-exec.sh"
+  cp "${REPO_ROOT}/scripts/resolve-sandbox.sh" "${dest}/scripts/resolve-sandbox.sh"
+  cp "${REPO_ROOT}/scripts/lib/container-membership.sh" "${dest}/scripts/lib/container-membership.sh"
+  cp "${REPO_ROOT}/scripts/lib/compose-conflicts.sh"    "${dest}/scripts/lib/compose-conflicts.sh"
+  (
+    cd "$dest" || exit 1
+    git add scripts
+    git commit -q -m "add sandbox scripts (no dockerfile)"
   ) >/dev/null 2>&1
 }
 
@@ -993,6 +1011,342 @@ assert_eq "イメージID同一時: 既存コンテナを削除しない" "0" "$
 
 IMG_F_RUN_COUNT="$(grep -c '^run ' "$IMG_TEST_LOG" || true)"
 assert_eq "イメージID同一時: コンテナを作り直さない" "0" "$IMG_F_RUN_COUNT"
+
+# ---------------------------------------------------------------------------
+# ケース10: compose_conflict_warnings（Docker 非依存の衝突検出関数、Task #9）
+#
+# container_name / 固定ホストポートの検出を、docker を一切起動せずに純粋関数として
+# 直接検証する（Epic #3 仕様書 4.8）。
+# ---------------------------------------------------------------------------
+
+echo "== compose_conflict_warnings（衝突検出・Docker 非依存） =="
+
+# shellcheck source=../scripts/lib/compose-conflicts.sh
+. "${REPO_ROOT}/scripts/lib/compose-conflicts.sh"
+
+COMPOSE_CONFLICT_DIR="$(mktemp -d "${TMPDIR:-/tmp}/dw-test-compose-conflict.XXXXXX")"
+
+COMPOSE_FILE_CONTAINER_NAME="${COMPOSE_CONFLICT_DIR}/container-name.yml"
+cat > "$COMPOSE_FILE_CONTAINER_NAME" <<'YAML'
+services:
+  app:
+    build: .
+    container_name: myapp
+    volumes:
+      - .:/workspace
+YAML
+
+COMPOSE_FILE_FIXED_PORT="${COMPOSE_CONFLICT_DIR}/fixed-port.yml"
+cat > "$COMPOSE_FILE_FIXED_PORT" <<'YAML'
+services:
+  app:
+    build: .
+    ports:
+      - "8080:80"
+    volumes:
+      - .:/workspace
+YAML
+
+COMPOSE_FILE_NO_CONFLICT="${COMPOSE_CONFLICT_DIR}/no-conflict.yml"
+cat > "$COMPOSE_FILE_NO_CONFLICT" <<'YAML'
+services:
+  app:
+    build: .
+    ports:
+      - "3000"
+    volumes:
+      - .:/workspace
+YAML
+
+CONTAINER_NAME_WARNINGS="$(compose_conflict_warnings "$COMPOSE_FILE_CONTAINER_NAME")"
+if [ -n "$CONTAINER_NAME_WARNINGS" ]; then
+  pass "container_name: を含む compose ファイルで警告が出る"
+else
+  fail "container_name: を含む compose ファイルで警告が出る" "警告が空でした"
+fi
+
+FIXED_PORT_WARNINGS="$(compose_conflict_warnings "$COMPOSE_FILE_FIXED_PORT")"
+if [ -n "$FIXED_PORT_WARNINGS" ]; then
+  pass "固定ホストポートを含む compose ファイルで警告が出る"
+else
+  fail "固定ホストポートを含む compose ファイルで警告が出る" "警告が空でした"
+fi
+
+NO_CONFLICT_WARNINGS="$(compose_conflict_warnings "$COMPOSE_FILE_NO_CONFLICT")"
+assert_eq "衝突が無い compose ファイル（コンテナ側ポートのみ）では警告が出ない" "" "$NO_CONFLICT_WARNINGS"
+
+# ---------------------------------------------------------------------------
+# ケース8: compose モードの compose_project / compose_file / compose_service / workdir
+# （Epic #3 仕様書「5. 検証方針」ケース8、Task #9）
+#
+# --project-directory がどの worktree から叩いてもリポジトリルートを指すこと、
+# -p に渡るプロジェクト名が worktree 名に依存しないことが本タスクの本丸。
+# ---------------------------------------------------------------------------
+
+echo "== compose モード（ケース8） =="
+
+COMPOSE_REPO="$(make_temp_repo)"
+copy_sandbox_scripts_no_dockerfile "$COMPOSE_REPO"
+
+COMPOSE_FILE_DEFAULT="${COMPOSE_REPO}/docker-compose.dev.yml"
+cat > "$COMPOSE_FILE_DEFAULT" <<'YAML'
+services:
+  app:
+    build: .
+    volumes:
+      - .:/workspace
+YAML
+(
+  cd "$COMPOSE_REPO" || exit 1
+  git add docker-compose.dev.yml
+  git commit -q -m "add compose file"
+) >/dev/null 2>&1
+
+COMPOSE_REPO_BASENAME="$(basename "$COMPOSE_REPO")"
+
+# --- print-plan（リポジトリルートから） ---
+COMPOSE_CASE1_OUTPUT="$(print_plan_in "$COMPOSE_REPO")"
+
+assert_eq "compose: mode=compose" "compose" "$(plan_value mode "$COMPOSE_CASE1_OUTPUT")"
+assert_eq "compose: compose_file は docker-compose.dev.yml" "docker-compose.dev.yml" "$(plan_value compose_file "$COMPOSE_CASE1_OUTPUT")"
+assert_eq "compose: compose_service は既定値 app" "app" "$(plan_value compose_service "$COMPOSE_CASE1_OUTPUT")"
+assert_eq "compose: compose_project は dw-<repo>" "dw-${COMPOSE_REPO_BASENAME}" "$(plan_value compose_project "$COMPOSE_CASE1_OUTPUT")"
+assert_eq "compose: workdir はリポジトリルートで /workspace" "/workspace" "$(plan_value workdir "$COMPOSE_CASE1_OUTPUT")"
+
+# --- agent worktree から叩いても compose_project が worktree 名に依存しない（本タスクの本丸） ---
+COMPOSE_AGENT_WORKTREE_DIR="${COMPOSE_REPO}/.claude/worktrees/agent-x"
+make_worktree "$COMPOSE_REPO" "$COMPOSE_AGENT_WORKTREE_DIR" "compose-agent-worktree-branch"
+
+COMPOSE_CASE_AGENT_OUTPUT="$(print_plan_in "$COMPOSE_AGENT_WORKTREE_DIR")"
+
+assert_eq "compose: agent worktree からでも compose_project は同一（worktree 名非依存）" \
+  "$(plan_value compose_project "$COMPOSE_CASE1_OUTPUT")" "$(plan_value compose_project "$COMPOSE_CASE_AGENT_OUTPUT")"
+assert_eq "compose: agent worktree からの workdir は相対パス" \
+  "/workspace/.claude/worktrees/agent-x" "$(plan_value workdir "$COMPOSE_CASE_AGENT_OUTPUT")"
+
+# --- epic worktree からも compose_project が同一（agent worktree とも一致） ---
+COMPOSE_EPIC_WORKTREE_DIR="${COMPOSE_REPO}/.claude/worktrees/epic7"
+make_worktree "$COMPOSE_REPO" "$COMPOSE_EPIC_WORKTREE_DIR" "compose-epic-worktree-branch"
+
+COMPOSE_CASE_EPIC_OUTPUT="$(print_plan_in "$COMPOSE_EPIC_WORKTREE_DIR")"
+
+assert_eq "compose: epic worktree の compose_project も agent worktree と同一" \
+  "$(plan_value compose_project "$COMPOSE_CASE_AGENT_OUTPUT")" "$(plan_value compose_project "$COMPOSE_CASE_EPIC_OUTPUT")"
+
+# ---------------------------------------------------------------------------
+# compose モードの実行系（偽 docker で `docker compose` を模擬する）。
+#
+# 偽 docker は `compose -p PROJECT --project-directory DIR -f FILE <サブコマンド>...`
+# を解釈し、状態ファイルでサービスの running / not-running を切り替える。
+# 実際の docker には一切触れない。呼び出し引数は DW_COMPOSE_LOG にすべて記録する。
+# ---------------------------------------------------------------------------
+
+FAKE_DOCKER_COMPOSE_DIR="$(mktemp -d "${TMPDIR:-/tmp}/dw-test-fakebin-compose.XXXXXX")"
+cat > "${FAKE_DOCKER_COMPOSE_DIR}/docker" <<'FAKE_DOCKER_COMPOSE'
+#!/bin/bash
+# tests/run-tests.sh 用の偽 docker（compose モード専用）。実際の docker には一切触れない。
+set -u
+
+LOG="${DW_COMPOSE_LOG:?DW_COMPOSE_LOG is required}"
+STATE_FILE="${DW_COMPOSE_SERVICE_STATE:?DW_COMPOSE_SERVICE_STATE is required}"   # "" | running
+UP_SUCCEEDS="${DW_COMPOSE_UP_SUCCEEDS:-1}"
+WORKDIR_OK="${DW_COMPOSE_WORKDIR_OK:-1}"
+
+echo "$*" >> "$LOG"
+
+case "${1:-}" in
+  compose)
+    shift
+    # 先頭の共通オプション（-p / --project-directory / -f）を読み飛ばしてサブコマンドを取り出す
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        -p|--project-directory|-f) shift 2 ;;
+        *) break ;;
+      esac
+    done
+    sub="${1:-}"
+    shift || true
+    case "$sub" in
+      ps)
+        state="$(cat "$STATE_FILE" 2>/dev/null || true)"
+        if [ "$state" = "running" ]; then
+          echo "fake-compose-container-id"
+        fi
+        exit 0
+        ;;
+      up)
+        if [ "$UP_SUCCEEDS" = "1" ]; then
+          printf 'running\n' > "$STATE_FILE"
+        fi
+        exit 0
+        ;;
+      exec)
+        case "$*" in
+          *"test -d"*)
+            [ "$WORKDIR_OK" = "1" ] && exit 0 || exit 1
+            ;;
+          *)
+            # -c の次の引数がコマンド文字列（quoting により1引数として渡ってくる）
+            cmd=""
+            prev=""
+            for a in "$@"; do
+              [ "$prev" = "-c" ] && cmd="$a"
+              prev="$a"
+            done
+            sh -c "$cmd"
+            exit $?
+            ;;
+        esac
+        ;;
+      *)
+        exit 1
+        ;;
+    esac
+    ;;
+  container)
+    shift
+    [ "${1:-}" = "inspect" ] || exit 1
+    shift
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        -f) shift 2 ;;
+        *)  shift ;;
+      esac
+    done
+    state="$(cat "$STATE_FILE" 2>/dev/null || true)"
+    if [ "$state" = "running" ]; then echo "true"; else echo "false"; fi
+    exit 0
+    ;;
+  *)
+    exit 1
+    ;;
+esac
+FAKE_DOCKER_COMPOSE
+chmod +x "${FAKE_DOCKER_COMPOSE_DIR}/docker"
+
+COMPOSE_TEST_LOG="$(mktemp "${TMPDIR:-/tmp}/dw-test-composelog.XXXXXX")"
+COMPOSE_TEST_STATE_FILE="$(mktemp "${TMPDIR:-/tmp}/dw-test-composestate.XXXXXX")"
+
+run_compose_case() {
+  # run_compose_case <dir> <initial_state> <up_succeeds 0/1> <workdir_ok 0/1> [追加のsandbox-exec.sh引数...]
+  local dir="$1" initial_state="$2" up_succeeds="$3" workdir_ok="$4"
+  shift 4
+
+  : > "$COMPOSE_TEST_LOG"
+  printf '%s' "$initial_state" > "$COMPOSE_TEST_STATE_FILE"
+
+  (
+    cd "$dir" || exit 1
+    DW_COMPOSE_LOG="$COMPOSE_TEST_LOG" \
+      DW_COMPOSE_SERVICE_STATE="$COMPOSE_TEST_STATE_FILE" \
+      DW_COMPOSE_UP_SUCCEEDS="$up_succeeds" \
+      DW_COMPOSE_WORKDIR_OK="$workdir_ok" \
+      PATH="${FAKE_DOCKER_COMPOSE_DIR}:${PATH}" \
+      bash scripts/sandbox-exec.sh "$@"
+  )
+}
+
+# --- agent worktree から叩いても --project-directory がリポジトリルートを指す（本タスクの本丸） ---
+COMPOSE_HOST_ROOT="$(plan_value repo_root "$COMPOSE_CASE1_OUTPUT")"
+
+COMPOSE_RUN1_EXIT=0
+run_compose_case "$COMPOSE_AGENT_WORKTREE_DIR" "running" 1 1 'true' >/dev/null 2>&1 || COMPOSE_RUN1_EXIT=$?
+assert_exit_code "compose: agent worktree からの実行が成功する" 0 "$COMPOSE_RUN1_EXIT"
+
+case "$(cat "$COMPOSE_TEST_LOG")" in
+  *"--project-directory ${COMPOSE_HOST_ROOT}"*)
+    pass "compose: agent worktree から叩いても --project-directory がリポジトリルートを指す" ;;
+  *)
+    fail "compose: agent worktree から叩いても --project-directory がリポジトリルートを指す" \
+      "log=[$(cat "$COMPOSE_TEST_LOG")] expected_root=[${COMPOSE_HOST_ROOT}]" ;;
+esac
+
+case "$(cat "$COMPOSE_TEST_LOG")" in
+  *"-p dw-${COMPOSE_REPO_BASENAME} "*)
+    pass "compose: -p に渡るプロジェクト名が agent worktree でも repo 基準" ;;
+  *)
+    fail "compose: -p に渡るプロジェクト名が agent worktree でも repo 基準" "log=[$(cat "$COMPOSE_TEST_LOG")]" ;;
+esac
+
+# --- サービス未起動時に up -d が呼ばれる ---
+COMPOSE_RUN2_EXIT=0
+run_compose_case "$COMPOSE_REPO" "" 1 1 'true' >/dev/null 2>&1 || COMPOSE_RUN2_EXIT=$?
+assert_exit_code "compose: サービス未起動から up -d 成功時は実行全体が成功する" 0 "$COMPOSE_RUN2_EXIT"
+
+if grep -q ' up -d app$' "$COMPOSE_TEST_LOG"; then
+  pass "compose: サービス未起動時に up -d が呼ばれる"
+else
+  fail "compose: サービス未起動時に up -d が呼ばれる" "log=[$(cat "$COMPOSE_TEST_LOG")]"
+fi
+
+# --- up -d しても起動しない場合、サービス名と DEV_WORKFLOW_COMPOSE_SERVICE を含むエラーで停止する ---
+COMPOSE_RUN3_STDERR="$(run_compose_case "$COMPOSE_REPO" "" 0 1 'true' 2>&1 1>/dev/null)"
+COMPOSE_RUN3_EXIT=$?
+
+if [ "$COMPOSE_RUN3_EXIT" -ne 0 ]; then
+  pass "compose: up -d しても起動しない場合は非0で終了する"
+else
+  fail "compose: up -d しても起動しない場合は非0で終了する" "exit=0"
+fi
+
+case "$COMPOSE_RUN3_STDERR" in
+  *"app"*) pass "compose: 起動失敗エラーにサービス名が含まれる" ;;
+  *) fail "compose: 起動失敗エラーにサービス名が含まれる" "stderr=[${COMPOSE_RUN3_STDERR}]" ;;
+esac
+
+case "$COMPOSE_RUN3_STDERR" in
+  *"DEV_WORKFLOW_COMPOSE_SERVICE"*) pass "compose: 起動失敗エラーに DEV_WORKFLOW_COMPOSE_SERVICE の案内が含まれる" ;;
+  *) fail "compose: 起動失敗エラーに DEV_WORKFLOW_COMPOSE_SERVICE の案内が含まれる" "stderr=[${COMPOSE_RUN3_STDERR}]" ;;
+esac
+
+# --- workdir が無い場合、DEV_WORKFLOW_COMPOSE_WORKDIR に言及したエラーで停止する ---
+COMPOSE_RUN4_STDERR="$(run_compose_case "$COMPOSE_REPO" "running" 1 0 'true' 2>&1 1>/dev/null)"
+COMPOSE_RUN4_EXIT=$?
+
+if [ "$COMPOSE_RUN4_EXIT" -ne 0 ]; then
+  pass "compose: workdir が無い場合は非0で終了する"
+else
+  fail "compose: workdir が無い場合は非0で終了する" "exit=0"
+fi
+
+case "$COMPOSE_RUN4_STDERR" in
+  *"DEV_WORKFLOW_COMPOSE_WORKDIR"*) pass "compose: workdir 不在エラーに DEV_WORKFLOW_COMPOSE_WORKDIR の案内が含まれる" ;;
+  *) fail "compose: workdir 不在エラーに DEV_WORKFLOW_COMPOSE_WORKDIR の案内が含まれる" "stderr=[${COMPOSE_RUN4_STDERR}]" ;;
+esac
+
+# --- container_name: を含む compose ファイルを使うと、実行時に stderr へ警告が出る（停止はしない） ---
+COMPOSE_WARN_REPO="$(make_temp_repo)"
+copy_sandbox_scripts_no_dockerfile "$COMPOSE_WARN_REPO"
+cat > "${COMPOSE_WARN_REPO}/docker-compose.dev.yml" <<'YAML'
+services:
+  app:
+    build: .
+    container_name: myapp
+    volumes:
+      - .:/workspace
+YAML
+(
+  cd "$COMPOSE_WARN_REPO" || exit 1
+  git add docker-compose.dev.yml
+  git commit -q -m "add compose file with container_name"
+) >/dev/null 2>&1
+
+COMPOSE_WARN_STDERR="$(
+  : > "$COMPOSE_TEST_LOG"
+  printf 'running' > "$COMPOSE_TEST_STATE_FILE"
+  cd "$COMPOSE_WARN_REPO" || exit 1
+  DW_COMPOSE_LOG="$COMPOSE_TEST_LOG" \
+    DW_COMPOSE_SERVICE_STATE="$COMPOSE_TEST_STATE_FILE" \
+    DW_COMPOSE_UP_SUCCEEDS=1 \
+    DW_COMPOSE_WORKDIR_OK=1 \
+    PATH="${FAKE_DOCKER_COMPOSE_DIR}:${PATH}" \
+    bash scripts/sandbox-exec.sh 'true' 2>&1 1>/dev/null
+)"
+
+case "$COMPOSE_WARN_STDERR" in
+  *"container_name"*) pass "compose: 実行時に container_name の衝突警告が stderr に出る" ;;
+  *) fail "compose: 実行時に container_name の衝突警告が stderr に出る" "stderr=[${COMPOSE_WARN_STDERR}]" ;;
+esac
 
 # ---------------------------------------------------------------------------
 # 結果集計
