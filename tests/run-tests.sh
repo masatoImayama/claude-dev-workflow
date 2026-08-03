@@ -1397,12 +1397,59 @@ COMPOSE_CASE_EPIC_OUTPUT="$(print_plan_in "$COMPOSE_EPIC_WORKTREE_DIR")"
 assert_eq "compose: epic worktree の compose_project も agent worktree と同一" \
   "$(plan_value compose_project "$COMPOSE_CASE_AGENT_OUTPUT")" "$(plan_value compose_project "$COMPOSE_CASE_EPIC_OUTPUT")"
 
+# --- リポジトリ外の worktree（フォールバック）では compose_project も分離される（issue #27） ---
+#
+# 修正前は CONTAINER だけがフォールバック接尾辞で分離され、COMPOSE_PROJECT は
+# 常に dw-<repo> のままだった。compose は project 名だけで既存サービスを探すため、
+# リポジトリルートからの実行とリポジトリ外worktreeからの実行が同じ project を
+# 共有してしまい、片方が起動した compose サービスへもう片方が警告なしに exec してしまう
+# （実行系の再現テストは下記の compose_project 分離を前提にした別ケースで検証する）。
+COMPOSE_OUTSIDE_WORKTREE_DIR="$(mktemp -d "${TMPDIR:-/tmp}/dw-test-compose-outside.XXXXXX")"
+make_worktree "$COMPOSE_REPO" "$COMPOSE_OUTSIDE_WORKTREE_DIR" "compose-outside-worktree-branch"
+
+COMPOSE_CASE_OUTSIDE_STDERR="$(mktemp "${TMPDIR:-/tmp}/dw-test-compose-outside-stderr.XXXXXX")"
+COMPOSE_CASE_OUTSIDE_OUTPUT="$(
+  cd "$COMPOSE_OUTSIDE_WORKTREE_DIR" || exit 1
+  PATH="${FAKE_BIN_DIR}:${PATH}" bash scripts/sandbox-exec.sh --print-plan 2>"$COMPOSE_CASE_OUTSIDE_STDERR"
+)"
+
+assert_eq "compose: リポジトリ外worktreeでは fallback=1" "1" "$(plan_value fallback "$COMPOSE_CASE_OUTSIDE_OUTPUT")"
+
+COMPOSE_OUTSIDE_PROJECT="$(plan_value compose_project "$COMPOSE_CASE_OUTSIDE_OUTPUT")"
+COMPOSE_ROOT_PROJECT="$(plan_value compose_project "$COMPOSE_CASE1_OUTPUT")"
+if [ "$COMPOSE_OUTSIDE_PROJECT" != "$COMPOSE_ROOT_PROJECT" ]; then
+  pass "compose: リポジトリ外worktree（フォールバック）では compose_project が分離される（issue #27）"
+else
+  fail "compose: リポジトリ外worktree（フォールバック）では compose_project が分離される（issue #27）" \
+    "compose_project=[${COMPOSE_OUTSIDE_PROJECT}]（共有 project と同一でした）"
+fi
+
+COMPOSE_OUTSIDE_CONTAINER="$(plan_value container "$COMPOSE_CASE_OUTSIDE_OUTPUT")"
+COMPOSE_ROOT_CONTAINER="$(plan_value container "$COMPOSE_CASE1_OUTPUT")"
+if [ "$COMPOSE_OUTSIDE_CONTAINER" != "$COMPOSE_ROOT_CONTAINER" ]; then
+  pass "compose: リポジトリ外worktree（フォールバック）では container も分離される（issue #27）"
+else
+  fail "compose: リポジトリ外worktree（フォールバック）では container も分離される（issue #27）" \
+    "container=[${COMPOSE_OUTSIDE_CONTAINER}]（共有コンテナと同一でした）"
+fi
+
+if [ -s "$COMPOSE_CASE_OUTSIDE_STDERR" ]; then
+  pass "compose: リポジトリ外worktreeのフォールバック時に stderr へ警告する"
+else
+  fail "compose: リポジトリ外worktreeのフォールバック時に stderr へ警告する" "stderr が空でした"
+fi
+
 # ---------------------------------------------------------------------------
 # compose モードの実行系（偽 docker で `docker compose` を模擬する）。
 #
 # 偽 docker は `compose -p PROJECT --project-directory DIR -f FILE <サブコマンド>...`
 # を解釈し、状態ファイルでサービスの running / not-running を切り替える。
 # 実際の docker には一切触れない。呼び出し引数は DW_COMPOSE_LOG にすべて記録する。
+#
+# DW_COMPOSE_MOUNT_SOURCE（既定は未設定=空）: `container inspect -f <Mountsを含むテンプレート>`
+# の戻り値。既存サービスのマウント元検証（issue #27）を検証するために使う。
+# `docker rm -f <id>` を呼ぶと状態ファイルを空にし、以後 running ではなくなったものとして扱う
+# （issue #27 の「不一致なら削除して作り直す」を再現するため）。
 # ---------------------------------------------------------------------------
 
 FAKE_DOCKER_COMPOSE_DIR="$(mktemp -d "${TMPDIR:-/tmp}/dw-test-fakebin-compose.XXXXXX")"
@@ -1415,6 +1462,7 @@ LOG="${DW_COMPOSE_LOG:?DW_COMPOSE_LOG is required}"
 STATE_FILE="${DW_COMPOSE_SERVICE_STATE:?DW_COMPOSE_SERVICE_STATE is required}"   # "" | running
 UP_SUCCEEDS="${DW_COMPOSE_UP_SUCCEEDS:-1}"
 WORKDIR_OK="${DW_COMPOSE_WORKDIR_OK:-1}"
+MOUNT_SOURCE="${DW_COMPOSE_MOUNT_SOURCE:-}"
 
 echo "$*" >> "$LOG"
 
@@ -1444,6 +1492,10 @@ case "${1:-}" in
         fi
         exit 0
         ;;
+      down)
+        printf '\n' > "$STATE_FILE"
+        exit 0
+        ;;
       exec)
         case "$*" in
           *"test -d"*)
@@ -1471,14 +1523,29 @@ case "${1:-}" in
     shift
     [ "${1:-}" = "inspect" ] || exit 1
     shift
+    tmpl=""
     while [ $# -gt 0 ]; do
       case "$1" in
-        -f) shift 2 ;;
+        -f) tmpl="$2"; shift 2 ;;
         *)  shift ;;
       esac
     done
-    state="$(cat "$STATE_FILE" 2>/dev/null || true)"
-    if [ "$state" = "running" ]; then echo "true"; else echo "false"; fi
+    case "$tmpl" in
+      *'Mounts'*)
+        printf '%s\n' "$MOUNT_SOURCE"
+        ;;
+      *)
+        state="$(cat "$STATE_FILE" 2>/dev/null || true)"
+        if [ "$state" = "running" ]; then echo "true"; else echo "false"; fi
+        ;;
+    esac
+    exit 0
+    ;;
+  rm)
+    shift
+    # `docker rm -f <id>`。マウント元不一致で再作成する際に呼ばれる（issue #27）。
+    # 実際の docker には触れず、状態ファイルを空にして「削除済み」を再現する。
+    printf '\n' > "$STATE_FILE"
     exit 0
     ;;
   *)
@@ -1493,6 +1560,8 @@ COMPOSE_TEST_STATE_FILE="$(mktemp "${TMPDIR:-/tmp}/dw-test-composestate.XXXXXX")
 
 run_compose_case() {
   # run_compose_case <dir> <initial_state> <up_succeeds 0/1> <workdir_ok 0/1> [追加のsandbox-exec.sh引数...]
+  # 環境変数 COMPOSE_TEST_MOUNT_SOURCE が設定されていれば、既存サービスのマウント元検証
+  # （issue #27）を再現するための DW_COMPOSE_MOUNT_SOURCE として渡す（未設定なら空のまま）。
   local dir="$1" initial_state="$2" up_succeeds="$3" workdir_ok="$4"
   shift 4
 
@@ -1505,6 +1574,7 @@ run_compose_case() {
       DW_COMPOSE_SERVICE_STATE="$COMPOSE_TEST_STATE_FILE" \
       DW_COMPOSE_UP_SUCCEEDS="$up_succeeds" \
       DW_COMPOSE_WORKDIR_OK="$workdir_ok" \
+      DW_COMPOSE_MOUNT_SOURCE="${COMPOSE_TEST_MOUNT_SOURCE:-}" \
       PATH="${FAKE_DOCKER_COMPOSE_DIR}:${PATH}" \
       bash scripts/sandbox-exec.sh "$@"
   )
@@ -1610,6 +1680,84 @@ COMPOSE_WARN_STDERR="$(
 case "$COMPOSE_WARN_STDERR" in
   *"container_name"*) pass "compose: 実行時に container_name の衝突警告が stderr に出る" ;;
   *) fail "compose: 実行時に container_name の衝突警告が stderr に出る" "stderr=[${COMPOSE_WARN_STDERR}]" ;;
+esac
+
+# ---------------------------------------------------------------------------
+# 既存サービスが running でも、マウント元が期待値（MOUNT_SOURCE）と異なれば削除して
+# 作り直す（issue #27）。フォールバック時の compose_project 分離（本コミットで修正済み）が
+# 主たる対策だが、その二重チェックとして dockerfile モードと同様の検証をここでも固定する。
+# ---------------------------------------------------------------------------
+
+echo "== compose: 既存サービスのマウント元検証（issue #27） =="
+
+COMPOSE_TEST_MOUNT_SOURCE="/some/other/tree"
+COMPOSE_MISMATCH_STDERR="$(run_compose_case "$COMPOSE_REPO" "running" 1 1 'true' 2>&1 1>/dev/null)"
+COMPOSE_MISMATCH_EXIT=$?
+unset COMPOSE_TEST_MOUNT_SOURCE
+
+assert_exit_code "compose: マウント元不一致を検出して削除・作り直し後に成功する（issue #27）" 0 "$COMPOSE_MISMATCH_EXIT"
+
+case "$COMPOSE_MISMATCH_STDERR" in
+  *"マウント元"*"削除して作り直します"*)
+    pass "compose: 既存サービスのマウント元不一致を検出して警告する（issue #27）" ;;
+  *)
+    fail "compose: 既存サービスのマウント元不一致を検出して警告する（issue #27）" \
+      "stderr=[${COMPOSE_MISMATCH_STDERR}]" ;;
+esac
+
+if grep -q '^rm -f fake-compose-container-id$' "$COMPOSE_TEST_LOG"; then
+  pass "compose: マウント元不一致の既存コンテナを docker rm -f で削除する（issue #27）"
+else
+  fail "compose: マウント元不一致の既存コンテナを docker rm -f で削除する（issue #27）" \
+    "log=[$(cat "$COMPOSE_TEST_LOG")]"
+fi
+
+if grep -q ' up -d app$' "$COMPOSE_TEST_LOG"; then
+  pass "compose: マウント元不一致で削除した後は up -d で作り直す（issue #27）"
+else
+  fail "compose: マウント元不一致で削除した後は up -d で作り直す（issue #27）" \
+    "log=[$(cat "$COMPOSE_TEST_LOG")]"
+fi
+
+# --- マウント元が一致していれば、running なサービスを削除せず再利用する（回帰防止） ---
+COMPOSE_TEST_MOUNT_SOURCE="$COMPOSE_HOST_ROOT"
+COMPOSE_MATCH_EXIT=0
+run_compose_case "$COMPOSE_REPO" "running" 1 1 'true' >/dev/null 2>&1 || COMPOSE_MATCH_EXIT=$?
+unset COMPOSE_TEST_MOUNT_SOURCE
+
+assert_exit_code "compose: マウント元一致時は成功する" 0 "$COMPOSE_MATCH_EXIT"
+
+if grep -q '^rm -f fake-compose-container-id$' "$COMPOSE_TEST_LOG"; then
+  fail "compose: マウント元が一致していれば既存コンテナを削除しない（回帰防止）" \
+    "log=[$(cat "$COMPOSE_TEST_LOG")]"
+else
+  pass "compose: マウント元が一致していれば既存コンテナを削除しない（回帰防止）"
+fi
+
+# ---------------------------------------------------------------------------
+# --down が compose モードのとき docker compose down を -p / --project-directory 付きで
+# 呼ぶことを固定する（issue #28）。本 Epic で compose モードは対象サービスが running で
+# なければ up -d を自動実行するようになった一方、以前の --down は dw-sandbox-* という
+# 名前のコンテナしか削除せず、compose が起動したコンテナを落とす主体がいなかった。
+# ---------------------------------------------------------------------------
+
+echo "== compose: --down（issue #28） =="
+
+COMPOSE_DOWN_EXIT=0
+COMPOSE_DOWN_STDOUT="$(run_compose_case "$COMPOSE_REPO" "running" 1 1 --down 2>/dev/null)" || COMPOSE_DOWN_EXIT=$?
+assert_exit_code "compose: --down は成功する（issue #28）" 0 "$COMPOSE_DOWN_EXIT"
+
+case "$(cat "$COMPOSE_TEST_LOG")" in
+  *"compose -p dw-${COMPOSE_REPO_BASENAME} --project-directory ${COMPOSE_HOST_ROOT} -f docker-compose.dev.yml down"*)
+    pass "compose: --down は docker compose down を -p / --project-directory 付きで呼ぶ（issue #28）" ;;
+  *)
+    fail "compose: --down は docker compose down を -p / --project-directory 付きで呼ぶ（issue #28）" \
+      "log=[$(cat "$COMPOSE_TEST_LOG")]" ;;
+esac
+
+case "$COMPOSE_DOWN_STDOUT" in
+  *"dw-${COMPOSE_REPO_BASENAME}"*) pass "compose: --down の出力に project 名が表示される（issue #28）" ;;
+  *) fail "compose: --down の出力に project 名が表示される（issue #28）" "output=[${COMPOSE_DOWN_STDOUT}]" ;;
 esac
 
 # ---------------------------------------------------------------------------

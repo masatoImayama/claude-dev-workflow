@@ -13,8 +13,10 @@
 #   bash scripts/sandbox-exec.sh --epic epic259 'make test'          # Epic単位でコンテナを分ける
 #   bash scripts/sandbox-exec.sh --warm 'go build ./...'             # キャッシュを温める（失敗しても成功扱い）
 #   bash scripts/sandbox-exec.sh --down                              # 現在の repo+epic のコンテナを削除（キャッシュは残す）
+#                                                                     # compose モード時は現在の project を `compose down` する
 #   bash scripts/sandbox-exec.sh --down --all                        # 現在のリポジトリに属する管理コンテナを全て削除
-#   bash scripts/sandbox-exec.sh --ls                                # 管理コンテナを一覧表示（他リポジトリ分も含む）
+#                                                                     # compose モード時は同一リポジトリの project も全て down する
+#   bash scripts/sandbox-exec.sh --ls                                # 管理コンテナを一覧表示（他リポジトリ分も含む。compose project の状態も表示）
 #   bash scripts/sandbox-exec.sh --reset-cache                       # キャッシュ volume を削除
 #                                                                     # 【作用範囲はepicではなくリポジトリ全体】
 #                                                                     # 同一リポジトリの管理コンテナが1つでも running
@@ -48,10 +50,16 @@
 #   --project-directory をリポジトリルートに固定することで、compose ファイル内の相対マウント
 #   （`.`）がどの worktree から叩いても同じツリーを指すようにする（別ツリー実行の防止）。
 #   PROJECT は worktree 名に依存しないため、agent worktree から叩いても epic worktree と
-#   同じ project になる。対象サービスが running でなければ `up -d` を試み、それでも
-#   起動しなければサービス名と DEV_WORKFLOW_COMPOSE_SERVICE を含むエラーで停止する。
+#   同じ project になる（リポジトリ外worktreeのフォールバック時は他と分離される。issue #27）。
+#   対象サービスが running でなければ `up -d` を試み、それでも起動しなければサービス名と
+#   DEV_WORKFLOW_COMPOSE_SERVICE を含むエラーで停止する。既存サービスが running でも
+#   マウント元が期待値と異なれば削除して作り直す（issue #27）。
 #   compose ファイルに container_name や固定ホストポートがあれば stderr に警告する
 #   （-p では解決できない衝突であり、停止はしない）。
+#   `--down` / `--down --all` / `--ls` は compose モードのときも対象にする（issue #28）:
+#   `--down` は現在の project を `docker compose down` で落とし、`--down --all` は
+#   同一リポジトリの `dw-<repo>` 接頭辞を持つ project をすべて列挙表示のうえ落とす。
+#   `--ls` にも compose project の状態（running/stopped）を表示する。
 
 set -u
 
@@ -174,15 +182,19 @@ PROJECT="$(basename "$REPO_ROOT")"
 SLUG="$(sanitize "$PROJECT")"
 [ -n "$EPIC" ] && SLUG="${SLUG}-$(sanitize "$EPIC")"
 
-# compose モードのプロジェクト名（仕様書 4.8）: dw-<sanitize(repo)>[-<sanitize(epic)>]。
-# フォールバック時のディレクトリ名接尾辞（下記）は含めない。worktree 名に一切依存しないため、
-# agent worktree から叩いても epic worktree と同じ project になる。
-COMPOSE_PROJECT="dw-${SLUG}"
-
-# フォールバック時は当該ディレクトリ名をコンテナ名に含め、epic 共有コンテナと混ざらないようにする。
+# フォールバック時（リポジトリ外worktree）は当該ディレクトリ名を接尾辞に含め、
+# CONTAINER と COMPOSE_PROJECT の両方を epic 共有のものと分離する（issue #27）。
+# 以前はこの接尾辞を CONTAINER にだけ反映し、COMPOSE_PROJECT は反映していなかった。
+# compose は project 名だけで既存サービスを探すため、フォールバック時に project 名が
+# 分離されていないと、別ツリー向けの running サービスへ警告なしに exec してしまっていた。
 [ "$FALLBACK" -eq 1 ] && SLUG="${SLUG}-$(sanitize "$(basename "$CUR")")"
 
 CONTAINER="dw-sandbox-${SLUG}"
+
+# compose モードのプロジェクト名（仕様書 4.8）: dw-<sanitize(repo)>[-<sanitize(epic)>][-<フォールバック接尾辞>]。
+# CONTAINER と同じ SLUG から作るため、通常時は worktree 名に依存せず agent worktree から
+# 叩いても epic worktree と同じ project になり、フォールバック時は CONTAINER と同様に分離される。
+COMPOSE_PROJECT="dw-${SLUG}"
 
 cache_volume_name() {
   printf 'dw-cache-%s-%s' \
@@ -365,14 +377,107 @@ ensure_sandbox_image() {
   fi
 }
 
+# compose モードの後片付け（issue #28）。
+# 本 Epic で compose モードは対象サービスが running でなければ up -d を自動実行するように
+# なった一方、--down / --down --all / --ls は docker label / dw-sandbox- 名の常駐コンテナしか
+# 見ておらず、compose が起動したコンテナを落とす主体がいなかった。この関数群は
+# compose_cmd（-p / --project-directory 付きの docker compose 呼び出し）を、ACTION の
+# 分岐（down/ls）と通常の exec 経路の両方から共有するために eval より前で定義する。
+compose_cmd() {
+  docker compose -p "$COMPOSE_PROJECT" --project-directory "$MOUNT_SOURCE" \
+    -f "$DEV_WORKFLOW_SANDBOX_COMPOSE" "$@"
+}
+
+# 同一リポジトリに属する compose project 名（dw-<repo> 接頭辞）を列挙する。
+# compose が作るコンテナは com.docker.compose.project ラベルを持つため、それを一次情報にする。
+list_compose_projects_in_repo() {
+  local prefix
+  prefix="dw-$(sanitize "$PROJECT")"
+  docker ps -a --filter "label=com.docker.compose.project" \
+    --format '{{ index .Labels "com.docker.compose.project" }}' 2>/dev/null \
+    | sort -u \
+    | while IFS= read -r proj; do
+        [ -n "$proj" ] || continue
+        case "$proj" in
+          "$prefix"|"${prefix}"-*) printf '%s\n' "$proj" ;;
+        esac
+      done
+}
+
+# --ls に compose project の状態を表示する（issue #28）。他の管理コンテナ一覧
+# （list_managed）とは別出力にし、compose を使っていないプロジェクトでは何も出さない。
+list_managed_compose() {
+  local proj
+  local -a projects=()
+
+  while IFS= read -r proj; do
+    [ -n "$proj" ] && projects+=("$proj")
+  done < <(list_compose_projects_in_repo)
+
+  [ "${#projects[@]}" -gt 0 ] || return 0
+
+  echo ""
+  echo "compose project（repo=${PROJECT}）:"
+  printf '%-40s %s\n' "PROJECT" "STATUS"
+  for proj in "${projects[@]}"; do
+    if docker ps --filter "label=com.docker.compose.project=${proj}" --format '{{.ID}}' 2>/dev/null | grep -q .; then
+      printf '%-40s %s\n' "$proj" "running"
+    else
+      printf '%-40s %s\n' "$proj" "stopped"
+    fi
+  done
+}
+
+# --down --all の compose 版。同一リポジトリに属する project をすべて列挙表示したうえで
+# 1つずつ down する（issue #28）。dockerfile モードの残骸（dw-sandbox-*）は down_all が
+# 別途処理するため、ここでは compose project だけを対象にする。
+down_all_compose() {
+  local proj
+  local -a targets=()
+
+  while IFS= read -r proj; do
+    [ -n "$proj" ] && targets+=("$proj")
+  done < <(list_compose_projects_in_repo)
+
+  if [ "${#targets[@]}" -eq 0 ]; then
+    echo "削除対象の compose project はありません（repo=${PROJECT}）"
+    return 0
+  fi
+
+  echo "削除対象の compose project（repo=${PROJECT}）:"
+  for proj in "${targets[@]}"; do
+    echo "  - ${proj}"
+  done
+
+  for proj in "${targets[@]}"; do
+    docker compose -p "$proj" --project-directory "$MOUNT_SOURCE" \
+      -f "$DEV_WORKFLOW_SANDBOX_COMPOSE" down >/dev/null 2>&1 || true
+  done
+
+  echo "compose project を削除しました: ${#targets[@]}件"
+}
+
 eval "$(bash "${SCRIPT_DIR}/resolve-sandbox.sh")"
 
 case "$ACTION" in
   down)
     if [ "$ALL" -eq 1 ]; then
       down_all
+      # dockerfile モードの残骸（dw-sandbox-*）とは別系統なので、compose モードで
+      # 解決された場合は compose project も併せて掃除する（issue #28）。
+      [ "$DEV_WORKFLOW_SANDBOX_MODE" = "compose" ] && down_all_compose
       exit 0
     fi
+
+    if [ "$DEV_WORKFLOW_SANDBOX_MODE" = "compose" ]; then
+      # compose が作るコンテナは dw-sandbox-<slug> という名前を持たないため、
+      # docker rm ではなく docker compose down で project ごと落とす（issue #28）。
+      echo "削除対象の compose project: ${COMPOSE_PROJECT}"
+      compose_cmd down >/dev/null 2>&1 || true
+      echo "compose project を削除しました: ${COMPOSE_PROJECT}（キャッシュ volume は残しています）"
+      exit 0
+    fi
+
     echo "削除対象のコンテナ: ${CONTAINER}"
     docker rm -f "$CONTAINER" >/dev/null 2>&1 || true
     echo "常駐コンテナを削除しました: ${CONTAINER}（キャッシュ volume は残しています）"
@@ -380,6 +485,8 @@ case "$ACTION" in
     ;;
   ls)
     list_managed
+    # compose モードで解決された場合のみ compose project の状態も表示する（issue #28）。
+    [ "$DEV_WORKFLOW_SANDBOX_MODE" = "compose" ] && list_managed_compose
     exit 0
     ;;
   reset-cache)
@@ -438,10 +545,7 @@ case "$DEV_WORKFLOW_SANDBOX_MODE" in
     # --project-directory は MOUNT_SOURCE（通常 HOST_ROOT。リポジトリ外 worktree の
     # フォールバック時のみ CUR）を指定する。これにより compose ファイル内の相対マウント
     # （`.`）がどの worktree から叩いても同じツリーを指す（別ツリー実行の防止）。
-    compose_cmd() {
-      docker compose -p "$COMPOSE_PROJECT" --project-directory "$MOUNT_SOURCE" \
-        -f "$DEV_WORKFLOW_SANDBOX_COMPOSE" "$@"
-    }
+    # compose_cmd 自体は eval より前で定義済み（--down / --ls とも共有するため）。
 
     # 衝突要因の検出（container_name / 固定ホストポート）。Docker 非依存の関数で判定し、
     # 見つかっても警告のみで停止しない（-p では解決できない衝突であり、
@@ -450,12 +554,32 @@ case "$DEV_WORKFLOW_SANDBOX_MODE" in
       [ -n "$warning_line" ] && echo "WARNING: ${warning_line}" >&2
     done < <(compose_conflict_warnings "$DEV_WORKFLOW_SANDBOX_COMPOSE")
 
+    compose_service_container_id() {
+      compose_cmd ps -q "$COMPOSE_SERVICE" 2>/dev/null || true
+    }
+
     compose_service_running() {
       local cid
-      cid="$(compose_cmd ps -q "$COMPOSE_SERVICE" 2>/dev/null || true)"
+      cid="$(compose_service_container_id)"
       [ -n "$cid" ] || return 1
       [ "$(docker container inspect -f '{{.State.Running}}' "$cid" 2>/dev/null || true)" = "true" ]
     }
+
+    # 既存サービスの再利用前にマウント元を検証する（issue #27）。
+    # フォールバック時の compose_project 分離（本コミットで修正済み）が主たる対策だが、
+    # 手動で project 名を揃えて叩かれた場合等に備え、running なサービスが見つかっても
+    # マウント元が期待値（MOUNT_SOURCE）と異なれば、dockerfile モードと同様に削除して
+    # 作り直す。正規化済み比較は normalize_mount_source を再利用する（issue #25）。
+    COMPOSE_MOUNT_TEMPLATE='{{ range .Mounts }}{{ if eq .Destination "'"$COMPOSE_WORKDIR_BASE"'" }}{{ .Source }}{{ end }}{{ end }}'
+
+    if compose_service_running; then
+      EXISTING_COMPOSE_CID="$(compose_service_container_id)"
+      EXISTING_COMPOSE_MOUNT="$(docker container inspect -f "$COMPOSE_MOUNT_TEMPLATE" "$EXISTING_COMPOSE_CID" 2>/dev/null || true)"
+      if [ -n "$EXISTING_COMPOSE_MOUNT" ] && [ "$(normalize_mount_source "$EXISTING_COMPOSE_MOUNT")" != "$(normalize_mount_source "$MOUNT_SOURCE")" ]; then
+        echo "WARNING: compose サービス '${COMPOSE_SERVICE}'（project=${COMPOSE_PROJECT}）の既存コンテナのマウント元 (${EXISTING_COMPOSE_MOUNT}) が期待値 (${MOUNT_SOURCE}) と異なるため削除して作り直します（別ツリー実行の防止）" >&2
+        docker rm -f "$EXISTING_COMPOSE_CID" >/dev/null 2>&1 || true
+      fi
+    fi
 
     # サービスの起動確認と自動 up（仕様書 4.8 の 3）。
     if ! compose_service_running; then

@@ -375,9 +375,9 @@ compose モードで exec するサービス名は `DEV_WORKFLOW_COMPOSE_SERVICE
 
 | コマンド | 動作 |
 | --- | --- |
-| `--down` | 現在の repo + epic のコンテナ1個を削除する（キャッシュ volume は残す） |
-| `--down --all` | 現在のリポジトリに属する管理コンテナをすべて削除する（削除前に対象名を列挙表示。label が無い旧命名の残骸も、マウント元がリポジトリルート配下かで判定して回収する） |
-| `--ls` | 管理コンテナを一覧表示する（NAME / REPO / EPIC / IMAGE / STATUS / CREATED。他リポジトリ分も含む） |
+| `--down` | 現在の repo + epic のコンテナ1個を削除する（キャッシュ volume は残す）。**compose モードのときは** `docker compose -p <project> --project-directory <root> -f <compose_file> down` で現在の project を落とす |
+| `--down --all` | 現在のリポジトリに属する管理コンテナをすべて削除する（削除前に対象名を列挙表示。label が無い旧命名の残骸も、マウント元がリポジトリルート配下かで判定して回収する）。**compose モードのときは** `dw-<repo>` 接頭辞を持つ compose project も列挙表示のうえすべて down する |
+| `--ls` | 管理コンテナを一覧表示する（NAME / REPO / EPIC / IMAGE / STATUS / CREATED。他リポジトリ分も含む）。**compose モードのときは** compose project の一覧（PROJECT / STATUS）も併せて表示する |
 | `--reset-cache [--force]` | キャッシュ volume を削除する（下記「作用範囲」を参照） |
 | `--rebuild` | イメージを強制再ビルドし、コンテナも作り直してからコマンドを実行する |
 | `--print-plan` | docker に一切触れず、解決結果を `key=value` 形式で表示するドライラン（下記） |
@@ -452,12 +452,19 @@ bash "${CLAUDE_PLUGIN_ROOT}/scripts/sandbox-exec.sh" --epic epic259 --print-plan
 
 呼び出しは `docker compose -p <PROJECT> --project-directory <HOST_ROOT> -f <compose_file> ...` で行い、
 `--project-directory` をリポジトリルートに固定することで、compose ファイル内の相対マウント（`.`）が
-どの worktree から叩いても同じツリーを指すようにしています。
+どの worktree から叩いても同じツリーを指すようにしています。`PROJECT`（`dw-<repo>[-<epic>]`）は
+コンテナ名と同じ元から作るため、リポジトリ外に作られた worktree（フォールバック時）はコンテナ名・
+project 名の両方が epic 共有のものと分離されます。既存サービスが running でもマウント元が期待値と
+異なれば削除して作り直すため、別ツリーのファイルへ静かに exec してしまう経路はありません。
 
 **既知の限界**: compose ファイルが `container_name:` または固定ホストポート（例: `- "8080:8080"`）を
 使っていると、`-p` によるプロジェクト名の分離では解決できない衝突が起き、**epic の並行実行ができません**。
 `sandbox-exec.sh` はこれを検出して stderr に警告しますが、自動では直せません。
 `container_name:` を使わない・ホストポートは固定せずコンテナ側ポートのみ指定する、で回避してください。
+
+**後片付け**: compose モードで起動されたコンテナは通常の `dw-sandbox-*` という名前を持たないため、
+`--down` / `--down --all` / `--ls` はいずれも `docker compose ... down`（`-p` / `--project-directory` 付き）
+を使って対応します。詳細は上記「ライフサイクル操作」を参照してください。
 
 ### Windows の CRLF に注意
 
