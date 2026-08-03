@@ -29,25 +29,27 @@ GitHub issue に記載されたタスクを1つずつ、サンドボックス内
 
 ## 作業フロー
 
-### 0. Epicブランチを最新に同期し、ベースを検証する
+### 0. 渡されたベースに対して検証する（fetch/checkout/pull は行わない）
 
-**タスク開始前に必ず実行する。** 古いベースや別のブランチから分岐すると、先行タスクの変更が
-存在しないツリー上で実装・テストすることになり、それでもテストは通ってしまう。
+**`git fetch` / `git checkout` / `git pull` は実行しない。** 同期は run が epic worktree で
+済ませており、generator の isolation worktree はそこ（run から渡された `WAVE_BASE` のコミット）
+から分岐しているため、generator 側での同期はそもそも不要である。
+
+- `git checkout "${EPIC_BRANCH}"` は isolation worktree では**必ず失敗する**。epic worktree が
+  同じブランチを checkout 済みのため（実機検証: `fatal: '...' is already used by worktree at
+  '...'` / exit 128）
+- `git pull` は成功しうるが害がある。epic tip が動いていた場合に自分の merge-base を
+  `WAVE_BASE` から動かし、`scripts/merge-lane.sh` の完全一致検証を偽陰性にする
+- `git fetch` は大リポジトリで毎タスクの固定コストになる
+
+代わりに、**渡された `WAVE_BASE`（run から渡されたコミットハッシュ）に対する検証を1回だけ**行う。
+実装を始める前に、自分の HEAD がその `WAVE_BASE` の子孫であることを機械的に確認する:
 
 ```bash
-git fetch origin
-git checkout "${EPIC_BRANCH}"
-git pull origin "${EPIC_BRANCH}"
-```
-
-**同期しただけで先に進んではならない。** 実装を始める前に、自分の HEAD が指示されたベースの
-子孫であることを機械的に確認する:
-
-```bash
-# 指定ベースの子孫でなければ、作業を開始せずに報告して終了する
-git merge-base --is-ancestor "origin/${EPIC_BRANCH}" HEAD || {
-  echo "ERROR: 指定ベース origin/${EPIC_BRANCH} の子孫ではありません"
-  echo "実際の分岐元: $(git merge-base "origin/${EPIC_BRANCH}" HEAD)"
+# run から渡されたベースのコミットハッシュに対して検証する（同期は行わない）
+git merge-base --is-ancestor "<WAVE_BASE>" HEAD || {
+  echo "ERROR: 指定ベース <WAVE_BASE> の子孫ではありません"
+  echo "実際の分岐元: $(git merge-base "<WAVE_BASE>" HEAD)"
   exit 1
 }
 ```
@@ -171,9 +173,9 @@ git commit -m "feat: [内容] (#[task番号])"
 ## Task #[番号] 完了
 
 ### ベース（実出力を貼る。自己申告しない）
-$ git merge-base --is-ancestor origin/[epicブランチ] HEAD && echo OK
+$ git merge-base --is-ancestor [WAVE_BASE] HEAD && echo OK
 [実出力]
-$ git log --oneline -1 $(git merge-base origin/[epicブランチ] HEAD)
+$ git log --oneline -1 $(git merge-base [WAVE_BASE] HEAD)
 [実出力]
 
 ### 変更ファイル
