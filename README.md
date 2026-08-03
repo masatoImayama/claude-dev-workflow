@@ -325,6 +325,23 @@ DEV_WORKFLOW_DOCKERFILE=path                # 使用する Dockerfile（既定: 
 bash "${CLAUDE_PLUGIN_ROOT}/scripts/resolve-sandbox.sh" --print
 ```
 
+### 分離単位（コンテナ = epic / キャッシュ = リポジトリ / イメージ = Dockerfileのhash）
+
+3つの資源はそれぞれ異なる単位で分離・共有されます。
+
+| 資源 | 分離・共有の単位 | 命名 |
+| --- | --- | --- |
+| コンテナ | **epic 単位** | `dw-sandbox-<repo>[-<epic>]` |
+| キャッシュ volume | **リポジトリ単位**（epic 間で共有） | `dw-cache-<repo>-<path>` |
+| イメージ | **Dockerfile 内容の hash 単位** | `dev-sandbox:<repo>-<hash8>` |
+
+バインドマウントはリポジトリルートに固定しているため、generator の isolation worktree
+（`.claude/worktrees/agent-*`）や epic worktree がいくつ増えてもコンテナは epic あたり1個のままです。
+**あえて非対称にしています**: キャッシュだけリポジトリ単位で共有し続けるのは、それが v0.10.0 の性能改善
+（40秒→17秒）の本体であり、epic 単位にすると新しい epic が毎回コールドスタートに戻ってしまうためです。
+非対称であることの唯一の実害は `--reset-cache` の誤爆（他 epic のキャッシュまで巻き込む）なので、
+そこだけを running コンテナ検出のガードで潰しています（後述）。
+
 ### サンドボックスへのコマンド投入
 
 `docker run` を直接組み立てず、`sandbox-exec.sh` を使います。
@@ -332,18 +349,17 @@ bash "${CLAUDE_PLUGIN_ROOT}/scripts/resolve-sandbox.sh" --print
 ```bash
 bash "${CLAUDE_PLUGIN_ROOT}/scripts/sandbox-exec.sh" --epic epic259 'make test'
 bash "${CLAUDE_PLUGIN_ROOT}/scripts/sandbox-exec.sh" --epic epic259 --warm 'go build ./...'
-bash "${CLAUDE_PLUGIN_ROOT}/scripts/sandbox-exec.sh" --epic epic259 --down          # 常駐コンテナを削除
-bash "${CLAUDE_PLUGIN_ROOT}/scripts/sandbox-exec.sh" --epic epic259 --reset-cache   # キャッシュ volume も削除
 ```
 
 このスクリプトが引き受けること:
 
 | 項目 | 内容 |
 | --- | --- |
+| イメージの解決とビルド | `Dockerfile.dev` があれば内容の hash でタグ付けして自動ビルドする（`DEV_WORKFLOW_DOCKER_IMAGE` 指定時はビルドしない） |
 | ビルドキャッシュの永続化 | `docker run --rm` はコンテナ層ごとキャッシュを毎回捨てる。言語ごとのキャッシュディレクトリを named volume 化して次回に残す |
-| コンテナの再利用 | Epic単位で常駐させ `docker exec` で叩き、起動オーバーヘッドを消す |
+| コンテナの再利用 | epic単位で常駐させ `docker exec` で叩き、起動オーバーヘッドを消す。既存コンテナのマウント元・イメージIDが期待値と異なれば削除して作り直す |
 | Windows のパス変換対策 | Git Bash（MSYS）は `-w /workspace` を `C:/Program Files/Git/workspace` に変換して `docker run` を失敗させる |
-| イメージタグの安定化 | タグをリポジトリ名基準にし、worktree ごとに同じイメージをビルドし直す事故を防ぐ |
+| イメージタグの安定化 | タグをリポジトリ名 + Dockerfile 内容の hash にし、worktree ごとに同じイメージをビルドし直す事故を防ぐ |
 
 終了コードは実行したコマンドのものがそのまま返るので、機械的ゲートの判定に使えます。
 
@@ -354,6 +370,133 @@ compose モードで exec するサービス名は `DEV_WORKFLOW_COMPOSE_SERVICE
 > **待ち時間の主因はコンパイルではなくバインドマウントのI/O**（Windows 実測）。
 > フルツリーを走査するコマンドは1回ごとに走査コストを払うため、
 > **ビルド・vet・テストを別々に呼ばず1回にまとめる**ことが最も効きます。
+
+### ライフサイクル操作
+
+| コマンド | 動作 |
+| --- | --- |
+| `--down` | 現在の repo + epic のコンテナ1個を削除する（キャッシュ volume は残す） |
+| `--down --all` | 現在のリポジトリに属する管理コンテナをすべて削除する（削除前に対象名を列挙表示。label が無い旧命名の残骸も、マウント元がリポジトリルート配下かで判定して回収する） |
+| `--ls` | 管理コンテナを一覧表示する（NAME / REPO / EPIC / IMAGE / STATUS / CREATED。他リポジトリ分も含む） |
+| `--reset-cache [--force]` | キャッシュ volume を削除する（下記「作用範囲」を参照） |
+| `--rebuild` | イメージを強制再ビルドし、コンテナも作り直してからコマンドを実行する |
+| `--print-plan` | docker に一切触れず、解決結果を `key=value` 形式で表示するドライラン（下記） |
+
+```bash
+bash "${CLAUDE_PLUGIN_ROOT}/scripts/sandbox-exec.sh" --epic epic259 --down
+bash "${CLAUDE_PLUGIN_ROOT}/scripts/sandbox-exec.sh" --down --all
+bash "${CLAUDE_PLUGIN_ROOT}/scripts/sandbox-exec.sh" --ls
+bash "${CLAUDE_PLUGIN_ROOT}/scripts/sandbox-exec.sh" --reset-cache
+bash "${CLAUDE_PLUGIN_ROOT}/scripts/sandbox-exec.sh" --epic epic259 --rebuild 'make test'
+bash "${CLAUDE_PLUGIN_ROOT}/scripts/sandbox-exec.sh" --epic epic259 --print-plan
+```
+
+#### `--reset-cache` の作用範囲はリポジトリ全体（epicではない）
+
+キャッシュ volume はリポジトリ単位で共有しているため、`--reset-cache` は**現在の epic だけでなく
+同一リポジトリの全 epic のキャッシュを削除**します。誤爆を防ぐため:
+
+1. 削除対象の volume 名をすべて列挙表示します（成否によらず必ず表示）。
+2. 同一リポジトリの管理コンテナが**1つでも running なら中断**し、`--force` の指定を促します
+   （他 epic が実行中にキャッシュを壊さないためのガード）。
+3. `--force` を指定した場合のみ、running なコンテナがあっても実行します。
+
+#### `--rebuild` の使いどころ
+
+イメージタグは `Dockerfile.dev` の内容の hash（`git hash-object` の先頭8文字）から自動的に決まるため、
+`Dockerfile.dev` 自体を編集すれば自動的に別タグになり、再ビルドされます。
+しかし hash は **Dockerfile の内容しか見ない**ため、`COPY go.mod .` のように Dockerfile がコピーする
+対象ファイル（`go.mod` / `package.json` 等）だけを変更した場合は、タグが変わらず古い内容のイメージが
+再利用されてしまいます。この逃げ道が `--rebuild` です。内容に変更が無くても強制的に
+`docker build` からやり直し、コンテナも作り直します。
+
+#### `--print-plan`（ドライラン）
+
+docker に一切触れず、解決結果を `key=value` 形式で標準出力に表示して終了します（exit 0）。
+人間のデバッグ手段としても、CI・テストでの検証手段としても使えます。
+
+```bash
+bash "${CLAUDE_PLUGIN_ROOT}/scripts/sandbox-exec.sh" --epic epic259 --print-plan
+```
+
+出力キー:
+
+| キー | 内容 |
+| --- | --- |
+| `mode` | `dockerfile` / `compose` / `none` |
+| `repo` | リポジトリ名（`basename(REPO_ROOT)`。worktree名は使わない） |
+| `epic` | epic 識別子（`--epic` または `DEV_WORKFLOW_EPIC`。無ければ空） |
+| `repo_root` | ホスト側のリポジトリルート |
+| `mount_source` | マウント元（dockerfileモード時） |
+| `mount_target` | マウント先（常に `/workspace`） |
+| `workdir` | コンテナ内の作業ディレクトリ（リポジトリルートからの相対パスを反映） |
+| `rel_path` | リポジトリルートからの相対パス（ルート直下なら空） |
+| `fallback` | `1` ならリポジトリ外worktreeのフォールバック中（`0`が通常） |
+| `container` | コンテナ名 |
+| `image` | イメージタグ |
+| `dockerfile` | 使用する Dockerfile のパス（dockerfileモード時） |
+| `build_context` | ビルドコンテキスト（dockerfileモード時） |
+| `compose_file` / `compose_project` / `compose_service` | composeモード時の設定 |
+| `cache_volume` | `<volume名>:<コンテナ内パス>`（キャッシュパスの数だけ複数行） |
+
+### compose モード
+
+`docker-compose.dev.yml` を使う場合、compose ファイルは次の要求仕様を満たす必要があります。
+
+- **常駐サービス名**: 既定 `app`（`DEV_WORKFLOW_COMPOSE_SERVICE` で変更可）
+- **マウント**: 当該サービスが `.:/workspace` をマウントすること
+  （異なるマウント先にする場合は `DEV_WORKFLOW_COMPOSE_WORKDIR` で上書きする）
+- **長時間常駐**: `sleep infinity` 等でプロセスが終了しないこと
+  （running でなければ `sandbox-exec.sh` が `up -d` を試み、それでも起動しなければ原因の分かる
+  エラーで停止する）
+
+呼び出しは `docker compose -p <PROJECT> --project-directory <HOST_ROOT> -f <compose_file> ...` で行い、
+`--project-directory` をリポジトリルートに固定することで、compose ファイル内の相対マウント（`.`）が
+どの worktree から叩いても同じツリーを指すようにしています。
+
+**既知の限界**: compose ファイルが `container_name:` または固定ホストポート（例: `- "8080:8080"`）を
+使っていると、`-p` によるプロジェクト名の分離では解決できない衝突が起き、**epic の並行実行ができません**。
+`sandbox-exec.sh` はこれを検出して stderr に警告しますが、自動では直せません。
+`container_name:` を使わない・ホストポートは固定せずコンテナ側ポートのみ指定する、で回避してください。
+
+### Windows の CRLF に注意
+
+このリポジトリは `.gitattributes` で以下を LF 固定しています。
+
+```
+*.sh text eol=lf
+*.toml text eol=lf
+.gitattributes text eol=lf
+```
+
+Windows の `core.autocrlf=true` 環境では、これが無いとシェルスクリプトが CRLF でチェックアウトされ、
+行末の `\r` が文字列に混入して `syntax error near unexpected token $'{\r'` のような形で壊れます
+（`.gitattributes` 自身も対象にしないと、そのファイル自体がCRLF化されて `git check-attr` の
+パターン解決ごと壊れるため、自己参照ルールも必須です）。
+
+**注意: `.gitattributes` にルールを追加しただけでは、既にリポジトリにコミット済みのファイルは
+遡って正規化されません。** 新しいルールを追加した直後は、次のコマンドで既存のワーキングツリーを
+再正規化する必要があります（本 Epic で実際にこれを踏みました）。
+
+```bash
+git rm --cached -r .
+git reset --hard
+```
+
+新規にシェルスクリプトを追加する場合は、`.gitattributes` に対象パターンが含まれているか確認してください。
+
+### 環境変数一覧
+
+```bash
+DEV_WORKFLOW_DOCKER_IMAGE=my-image:tag       # 既存イメージを使う（ビルドしない）
+DEV_WORKFLOW_DOCKER_COMPOSE_FILE=path.yml    # 使用する compose ファイル
+DEV_WORKFLOW_DOCKERFILE=path                 # 使用する Dockerfile（既定: Dockerfile.dev）
+DEV_WORKFLOW_CACHE_PATHS="/path1 /path2"     # volume化するコンテナ内パス（スペース区切り）
+DEV_WORKFLOW_EPIC=epic259                    # --epic 未指定時に参照する epic 識別子
+DEV_WORKFLOW_COMPOSE_SERVICE=app             # composeモードでexecするサービス名
+DEV_WORKFLOW_COMPOSE_WORKDIR=/workspace      # composeモードでのコンテナ内マウント先の基点
+READABILITY_STDIN_TIMEOUT=5                  # 可読性ガードが引数なし・非tty時にstdinを待つ上限秒数
+```
 
 ## Slack通知
 
