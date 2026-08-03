@@ -25,6 +25,10 @@
 
 set -u
 
+NOTIFY_SLACK_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=./lib/marker-root.sh
+. "${NOTIFY_SLACK_DIR}/lib/marker-root.sh"
+
 EVENT="${1:-unknown}"
 ARG="${2:-}"
 
@@ -76,18 +80,9 @@ CWD="$(json_field cwd)"
 # 自律実行中であることを示すマーカー。
 # skillはworktree（.claude/worktrees/<epicN>）内から実行されるが、hookのcwdはメインリポの
 # ルートなので、両者が同じファイルを見るようメインリポのルートに固定する
-MARKER_ROOT="$CWD"
-GIT_COMMON="$(git -C "$CWD" rev-parse --git-common-dir 2>/dev/null || true)"
-if [ -n "$GIT_COMMON" ]; then
-  case "$GIT_COMMON" in
-    /*|[A-Za-z]:*) ;;                       # 絶対パスならそのまま
-    *) GIT_COMMON="$CWD/$GIT_COMMON" ;;     # 相対パスならcwd基準で解決
-  esac
-  if ! MAIN_ROOT="$(cd "$GIT_COMMON/.." 2>/dev/null && pwd)"; then
-    MAIN_ROOT=""
-  fi
-  [ -n "$MAIN_ROOT" ] && MARKER_ROOT="$MAIN_ROOT"
-fi
+# （解決処理は scripts/lib/marker-root.sh に共通化してある）
+MARKER_ROOT="$(dev_workflow_marker_root "$CWD")"
+[ -n "$MARKER_ROOT" ] || MARKER_ROOT="$CWD"
 RUN_MARKER="$MARKER_ROOT/.claude/.dev-workflow-run"
 
 # 通知が多すぎるときに、実際どのpayloadで発火しているかを追えるようにする

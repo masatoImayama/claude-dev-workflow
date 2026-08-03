@@ -526,6 +526,104 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+# ケース7c: dev_workflow_marker_root（マーカー置き場の解決・外部プロセス0、Task #43）
+#
+# heartbeat.sh（フックから高頻度に呼ばれる。Phase 2 で追加予定）の前提として、この関数は
+# 解決処理の中で外部プロセスを一切起動しない。worktree の .git は
+# `gitdir: <メインリポ>/.git/worktrees/<名前>` という1行ファイルなので bash の read だけで
+# 解析できる（Epic #42 仕様書「3. ファイルと責務」）。
+#
+# ---------------------------------------------------------------------------
+
+echo "== dev_workflow_marker_root（マーカー置き場の解決・外部プロセス0・Task #43） =="
+
+MARKER_ROOT_LIB="${REPO_ROOT}/scripts/lib/marker-root.sh"
+
+# shellcheck source=../scripts/lib/marker-root.sh
+. "$MARKER_ROOT_LIB"
+
+canon_root() {
+  # canon_root <dir>  ディレクトリの正規化された絶対パスを返す（pwd -W があれば使う）
+  (
+    cd "$1" 2>/dev/null || exit 1
+    pwd -W 2>/dev/null || pwd
+  )
+}
+
+# Windows では mktemp が /tmp 配下（MSYS のエイリアス）を返すことがあり、これは
+# dev_workflow_marker_root の -d .git 分岐（渡された表現をそのまま返す）と、
+# .git ファイル分岐（git 自身が書いた実パスを読む。Windows では常にドライブレター形式）とで
+# 表現が食い違う原因になる（実機で確認済み。ドライブレター形式どうしの揺れは
+# _dev_workflow_marker_root_normalize が吸収するが、/tmp エイリアスの実パスへの
+# 解決は対象外＝コマンド置換なしでは原理的にできない）。
+# そのため一時リポジトリのパスは最初に canon_root で実パスへ正規化してから使う。
+MR_REPO="$(canon_root "$(make_temp_repo)")"
+MR_EXPECTED="$MR_REPO"
+
+assert_eq "dev_workflow_marker_root: メインリポのルートで正しいパスを返す" \
+  "$MR_EXPECTED" "$(dev_workflow_marker_root "$MR_REPO")"
+
+mkdir -p "${MR_REPO}/sub/dir"
+assert_eq "dev_workflow_marker_root: メインリポのサブディレクトリから呼んでもルートを返す" \
+  "$MR_EXPECTED" "$(dev_workflow_marker_root "${MR_REPO}/sub/dir")"
+
+MR_EPIC_WT="${MR_REPO}/.claude/worktrees/epic9"
+make_worktree "$MR_REPO" "$MR_EPIC_WT" "mr-epic-branch"
+assert_eq "dev_workflow_marker_root: epic worktree（.claude/worktrees/epicN）からメインリポのルートを返す" \
+  "$MR_EXPECTED" "$(dev_workflow_marker_root "$MR_EPIC_WT")"
+
+MR_AGENT_WT="${MR_REPO}/.claude/worktrees/agent-x"
+make_worktree "$MR_REPO" "$MR_AGENT_WT" "mr-agent-branch"
+assert_eq "dev_workflow_marker_root: agent worktree（.claude/worktrees/agent-xxx）からメインリポのルートを返す" \
+  "$MR_EXPECTED" "$(dev_workflow_marker_root "$MR_AGENT_WT")"
+
+MR_NONGIT="$(mktemp -d "${TMPDIR:-/tmp}/dw-test-nongit.XXXXXX")"
+MR_NONGIT_OUT="$(dev_workflow_marker_root "$MR_NONGIT")"
+MR_NONGIT_EXIT=$?
+assert_eq "dev_workflow_marker_root: git 管理外のディレクトリでは空文字を返す" "" "$MR_NONGIT_OUT"
+assert_exit_code "dev_workflow_marker_root: git 管理外のディレクトリでは非0終了する" 1 "$MR_NONGIT_EXIT"
+
+MR_OVERRIDE_VALUE="/custom/marker/root/for/test"
+MR_OVERRIDE_OUT="$(DEV_WORKFLOW_MARKER_ROOT="$MR_OVERRIDE_VALUE" dev_workflow_marker_root "$MR_REPO")"
+assert_eq "dev_workflow_marker_root: DEV_WORKFLOW_MARKER_ROOT が最優先で使われる" \
+  "$MR_OVERRIDE_VALUE" "$MR_OVERRIDE_OUT"
+
+# CLAUDE_PROJECT_DIR はそのまま使う仕様（正規化しない）なので、既に実パス化済みの
+# $MR_REPO をそのまま渡す。
+MR_CLAUDE_PROJECT_OUT="$(CLAUDE_PROJECT_DIR="$MR_REPO" dev_workflow_marker_root "${MR_REPO}/sub/dir")"
+assert_eq "dev_workflow_marker_root: CLAUDE_PROJECT_DIR 直下に .git があればそれを使う" \
+  "$MR_EXPECTED" "$MR_CLAUDE_PROJECT_OUT"
+
+# --- 解決処理が外部コマンド・コマンド置換を一切起動していないことの静的確認 ---
+# コメント行は対象外にし、単語境界での一致だけを見る
+# （"gitdir:" 等の識別子内の "git" 部分文字列や、算術展開 $(( )) の "$(" を
+# 誤検知しないよう、"git "は後ろに空白を要求し、"$(" は直後が "(" でないものだけを見る）
+MR_FORBIDDEN_HITS="$(grep -v '^[[:space:]]*#' "$MARKER_ROOT_LIB" \
+  | grep -E '(^|[^A-Za-z0-9_])(git|sed|dirname|basename)[[:space:]]|\$\([^(]|`' || true)"
+if [ -z "$MR_FORBIDDEN_HITS" ]; then
+  pass "dev_workflow_marker_root: 解決処理が外部コマンド・コマンド置換を使っていない"
+else
+  fail "dev_workflow_marker_root: 解決処理が外部コマンド・コマンド置換を使っていない" "$MR_FORBIDDEN_HITS"
+fi
+
+# --- 性能: 100回呼び出しが十分速いこと（外部プロセス0の下地。受け入れ条件10） ---
+MR_PERF_START=""
+printf -v MR_PERF_START '%(%s)T' -1
+MR_PERF_I=0
+while [ "$MR_PERF_I" -lt 100 ]; do
+  dev_workflow_marker_root "$MR_EPIC_WT" >/dev/null
+  MR_PERF_I=$((MR_PERF_I + 1))
+done
+MR_PERF_END=""
+printf -v MR_PERF_END '%(%s)T' -1
+MR_PERF_ELAPSED=$((MR_PERF_END - MR_PERF_START))
+if [ "$MR_PERF_ELAPSED" -lt 2 ]; then
+  pass "dev_workflow_marker_root: 100回呼び出しが2秒未満（実測 ${MR_PERF_ELAPSED}s、外部プロセス0の下地・受け入れ条件10）"
+else
+  fail "dev_workflow_marker_root: 100回呼び出しが2秒未満" "実測 ${MR_PERF_ELAPSED}s"
+fi
+
+# ---------------------------------------------------------------------------
 # ケース8: --ls / --down --all（偽 docker で label・マウント元を注入し、実際の docker を起動せず検証する）
 #
 # 偽 docker は DW_TEST_MANIFEST（name|managed|repo|epic|image|status|created|mount_source|root_label
