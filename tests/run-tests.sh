@@ -2823,6 +2823,66 @@ PW_ENV_LANES_OUTPUT="$(DEV_WORKFLOW_MAX_LANES=5 bash "$PLAN_WAVES_SCRIPT" --from
 assert_eq "DEV_WORKFLOW_MAX_LANES で既定の lanes を上書きできる" "5" \
   "$(printf '%s\n' "$PW_ENV_LANES_OUTPUT" | awk -F'\t' '$1=="lanes"{print $2}')"
 
+# --- ケース11: --epic に非数値を渡すと exit 2（Task #39: sandbox-exec.sh の --epic とは
+#     別契約で、plan-waves.sh の --epic は数値のEpic issue番号でなければならない） ---
+bash "$PLAN_WAVES_SCRIPT" --epic epic14 >/dev/null 2>&1
+assert_exit_code "--epic に epic14 のような非数値を渡すと exit 2" 2 "$?"
+
+bash "$PLAN_WAVES_SCRIPT" --epic abc >/dev/null 2>&1
+assert_exit_code "--epic に abc のような非数値を渡すと exit 2" 2 "$?"
+
+# 数値の --epic 単体が拒否されないことは、ケース12（gh フェッチが exit 0 で完了すること）で確認する。
+
+# --- ケース12: gh モードで --limit 200 が付き、本文の「- Epic: #N」行でEpic外を除外し、
+#     行が無いタスクはフェイルオープンで含める（Task #39: Epic混入対策と30件上限対策） ---
+PW_GH_FAKE_DIR="$(mktemp -d "${TMPDIR:-/tmp}/dw-test-pw-ghfake.XXXXXX")"
+PW_GH_CALL_MARKER="$(mktemp "${TMPDIR:-/tmp}/dw-test-pw-ghcall.XXXXXX")"
+cat > "${PW_GH_FAKE_DIR}/gh" <<'FAKE_GH'
+#!/bin/bash
+# tests/run-tests.sh 用の偽 gh。load_from_gh が渡す引数を記録し、issue list 呼び出しには
+# 固定のレコード（<番号><US><前提行><US><Epic行>、US=0x1f）を返す。実ネットワークには
+# 一切触れない。区切り文字は load_from_gh の実装（@tsv ではなく join("")）に合わせる。
+US=$'\x1f'
+echo "$*" >> "${PW_GH_CALL_MARKER}"
+case "$*" in
+  *"issue list --label task --state open"*)
+    printf '100%s%s- Epic: #14\n' "$US" "$US"    # 指定Epicと一致 -> 含める
+    printf '200%s%s- Epic: #3\n' "$US" "$US"     # 別Epic -> 除外する
+    printf '300%s%s\n' "$US" "$US"               # Epic行が無い旧形式 -> フェイルオープンで含める
+    ;;
+esac
+FAKE_GH
+chmod +x "${PW_GH_FAKE_DIR}/gh"
+
+PW_GH_OUTPUT="$(PATH="${PW_GH_FAKE_DIR}:${PATH}" PW_GH_CALL_MARKER="$PW_GH_CALL_MARKER" bash "$PLAN_WAVES_SCRIPT" --epic 14)"
+PW_GH_EXIT=$?
+PW_GH_CALL="$(cat "$PW_GH_CALL_MARKER")"
+
+assert_exit_code "gh モード: --epic 14 は exit 0" 0 "$PW_GH_EXIT"
+
+case "$PW_GH_CALL" in
+  *"--limit 200"*) pass "gh モード: issue list に --limit 200 が付く（30件上限対策）" ;;
+  *) fail "gh モード: issue list に --limit 200 が付く（30件上限対策）" "call=[${PW_GH_CALL}]" ;;
+esac
+
+if printf '%s\n' "$PW_GH_OUTPUT" | grep -q '^task	100	'; then
+  pass "gh モード: 指定Epicと一致する #100 は対象に含まれる"
+else
+  fail "gh モード: 指定Epicと一致する #100 は対象に含まれる" "output=[${PW_GH_OUTPUT}]"
+fi
+
+if printf '%s\n' "$PW_GH_OUTPUT" | grep -q '^task	200	'; then
+  fail "gh モード: 別Epic（#3）を明記する #200 は除外される" "output=[${PW_GH_OUTPUT}]"
+else
+  pass "gh モード: 別Epic（#3）を明記する #200 は除外される"
+fi
+
+if printf '%s\n' "$PW_GH_OUTPUT" | grep -q '^task	300	'; then
+  pass "gh モード: Epic行が無い #300 はフェイルオープンで含まれる"
+else
+  fail "gh モード: Epic行が無い #300 はフェイルオープンで含まれる" "output=[${PW_GH_OUTPUT}]"
+fi
+
 # ---------------------------------------------------------------------------
 # merge-lane.sh（merge-base 検証と wave ブランチ統合。Task #16）
 #

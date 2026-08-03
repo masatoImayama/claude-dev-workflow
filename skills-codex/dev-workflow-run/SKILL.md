@@ -30,7 +30,8 @@ Epic issue 本文の「ブランチ」セクションからブランチ名を取
 
 ```bash
 EPIC_BRANCH=$(gh issue view <epic番号> --json body -q '.body' | grep -oE 'epic/epic[0-9]+/[^`]+' | head -1)
-EPIC_NUM=$(printf '%s' "$EPIC_BRANCH" | grep -oE 'epic[0-9]+' | head -1)
+EPIC_NUM=$(printf '%s' "$EPIC_BRANCH" | grep -oE 'epic[0-9]+' | head -1)   # sandbox-exec.sh の --epic 用の識別子（epicXX形式）
+EPIC_ISSUE_NUM="${EPIC_NUM#epic}"   # plan-waves.sh の --epic 用（数値のEpic issue番号。ブランチ名epic/epicXXのXX部分=Epic issue番号）
 
 git fetch origin
 git rev-parse --verify "origin/${EPIC_BRANCH}" >/dev/null 2>&1 || { echo "ERROR: ブランチ ${EPIC_BRANCH} が見つかりません"; exit 1; }
@@ -171,7 +172,9 @@ WAVE_NO=0        # wave ブランチ名に使う通し番号。1タスク=1レ�
 そのうち**先頭の1件だけ**を今回処理するタスクとする。
 
 ```bash
-PLAN_ARGS=(--epic "$EPIC_NUM" --lanes 1)
+# plan-waves.sh の --epic は数値のEpic issue番号（$EPIC_ISSUE_NUM）。sandbox-exec.sh の
+# --epic（epicXX形式の $EPIC_NUM）とは別の契約なので取り違えないこと
+PLAN_ARGS=(--epic "$EPIC_ISSUE_NUM" --lanes 1)
 [ -n "$SKIPPED_CSV" ] && PLAN_ARGS+=(--skipped "$SKIPPED_CSV")
 PLAN="$(bash "${CLAUDE_PLUGIN_ROOT}/scripts/plan-waves.sh" "${PLAN_ARGS[@]}")"
 PLAN_EXIT=$?

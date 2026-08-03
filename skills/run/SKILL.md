@@ -51,7 +51,8 @@ Epic issue本文の「ブランチ」セクションからブランチ名を取�
 ```bash
 # Epic issueからブランチ名を取得 (形式: epic/epicXX/[機能名])
 EPIC_BRANCH=$(gh issue view $ARGUMENTS --json body -q '.body' | grep -oP '`epic/epic\d+/[^`]+`' | tr -d '`' | head -1)
-EPIC_NUM=$(printf '%s' "$EPIC_BRANCH" | grep -oP 'epic\d+' | head -1)   # 例: epic259
+EPIC_NUM=$(printf '%s' "$EPIC_BRANCH" | grep -oP 'epic\d+' | head -1)   # 例: epic259（sandbox-exec.sh の --epic 用の識別子）
+EPIC_ISSUE_NUM="${EPIC_NUM#epic}"   # 例: 259（plan-waves.sh の --epic 用。数値のEpic issue番号。ブランチ名の命名規則epic/epicXX上、epicXXの数値部分=Epic issue番号）
 
 # ブランチの存在確認
 git fetch origin
@@ -240,7 +241,9 @@ plannerは介在しない。タスクの実行順序は`- 前提: #N`が作る**
 
 ```bash
 # ドライラン: 現在のウェーブ分解を人間向けに確認する（依存宣言のレビューにも使える）
-bash "${CLAUDE_PLUGIN_ROOT}/scripts/plan-waves.sh" --epic "$EPIC_NUM" --lanes "$LANES" --print
+# plan-waves.sh の --epic は数値のEpic issue番号（$EPIC_ISSUE_NUM）。sandbox-exec.sh の
+# --epic（epicXX形式の $EPIC_NUM）とは別の契約なので取り違えないこと
+bash "${CLAUDE_PLUGIN_ROOT}/scripts/plan-waves.sh" --epic "$EPIC_ISSUE_NUM" --lanes "$LANES" --print
 ```
 
 ### `--lanes`（並列度）の受け取り
@@ -294,7 +297,7 @@ fmt_duration() {
 
 ```bash
 cd "$EPIC_WT"
-PLAN_ARGS=(--epic "$EPIC_NUM" --lanes "$LANES")
+PLAN_ARGS=(--epic "$EPIC_ISSUE_NUM" --lanes "$LANES")
 [ -n "$SKIPPED_CSV" ] && PLAN_ARGS+=(--skipped "$SKIPPED_CSV")
 PLAN="$(bash "${CLAUDE_PLUGIN_ROOT}/scripts/plan-waves.sh" "${PLAN_ARGS[@]}")"
 PLAN_EXIT=$?

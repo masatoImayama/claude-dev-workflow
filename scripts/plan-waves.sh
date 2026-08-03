@@ -10,10 +10,17 @@
 #   bash scripts/plan-waves.sh --epic <Epic issue番号> [--lanes N] [--skipped 4,7] [--print]
 #   bash scripts/plan-waves.sh --from-file <TSV> [--lanes N] [--skipped 4,7] [--print]
 #
-# --epic: 既定の入力は `gh issue list --label task --state open --json number,body`。
+# --epic: 数値の Epic issue 番号（例: 14）。既定の入力は
+#         `gh issue list --label task --state open --json number,body --limit 200`。
 #         依存先が既に closed（同一 Epic の完了済みタスク）なら充足済み扱いにするため、
 #         最初のフェッチに含まれない依存番号は `gh issue view` で個別に state/labels を確認する
 #         （task ラベル付き closed のみ充足済み。それ以外は unknown-dep として警告し無視する）。
+#
+#         Epic 混入対策: 本文の「- Epic: #N」行（`skills/run/SKILL.md` の Task/Review issue
+#         テンプレートが書く行）を見て、N が指定 Epic と異なるタスクだけを除外する。行が無い
+#         （旧形式の Task issue）場合はフェイルオープンで含める。`gh issue list --search` は
+#         数値・記号をトークン化して "Epic: #3" が "#34" 等にもマッチする誤検出を起こすため
+#         （Task #39 対応時に実データで確認済み）、本文の完全一致抽出のみを信頼する。
 #
 # --from-file: タブ区切り、1行1タスク。テストが GitHub に依存しないようにするための入力差し替え。
 #   <issue番号>\t<state: open|closed>\t<前提行の生テキスト（無ければ空文字列）>
@@ -96,6 +103,12 @@ if [ "$LANES" -lt 1 ]; then
   exit 2
 fi
 
+if [ -n "$EPIC" ]; then
+  case "$EPIC" in
+    ''|*[!0-9]*) echo "ERROR: --epic は数値のEpic issue番号で指定してください: [${EPIC}]" >&2; exit 2 ;;
+  esac
+fi
+
 SOURCE_MODE="file"
 [ -n "$EPIC" ] && SOURCE_MODE="gh"
 
@@ -131,12 +144,21 @@ load_from_file() {
 }
 
 load_from_gh() {
-  local num deps_line
-  while IFS=$'\t' read -r num deps_line; do
+  # フィールド区切りは @tsv（タブ）ではなく Unit Separator（0x1f）を使う。tab は bash の read が
+  # 「IFS空白文字」として連続する区切りを1個に畳んでしまうため、前提行が空でそのあとに
+  # Epic行が続く行（実データで頻出）だと3列目が2列目にずれて誤検出する
+  # （Task #39 対応時、テスト実装中に実際にこの畳み込みで検出漏れを起こして発覚した）。
+  local num deps_line epic_line epic_in_line
+  while IFS=$'\x1f' read -r num deps_line epic_line; do
     [ -n "$num" ] || continue
+    # 本文の「- Epic: #N」行から N を取り出す（無ければ空文字＝フェイルオープンで含める）。
+    epic_in_line="$(printf '%s' "$epic_line" | grep -oE '#[0-9]+' | head -1 | tr -d '#')"
+    if [ -n "$epic_in_line" ] && [ "$epic_in_line" != "$EPIC" ]; then
+      continue
+    fi
     register_task "$num" "open" "$deps_line"
-  done < <(gh issue list --label task --state open --json number,body \
-    -q '.[] | [(.number|tostring), ((.body // "") | split("\n") | map(select(startswith("- 前提:"))) | (.[0] // ""))] | @tsv')
+  done < <(gh issue list --label task --state open --json number,body --limit 200 \
+    -q '.[] | [(.number|tostring), ((.body // "") | split("\n") | map(select(startswith("- 前提:"))) | (.[0] // "")), ((.body // "") | split("\n") | map(select(startswith("- Epic:"))) | (.[0] // ""))] | join("\u001f")')
 }
 
 if [ "$SOURCE_MODE" = "file" ]; then

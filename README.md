@@ -294,7 +294,7 @@ bash "${CLAUDE_PLUGIN_ROOT}/scripts/plan-waves.sh" --epic 259 --lanes 3 --print
   #16
 ```
 
-- `--epic <Epic issue番号>`: `gh issue list --label task --state open --json number,body` から依存グラフを構築する
+- `--epic <Epic issue番号>`: 数値のEpic issue番号。`gh issue list --label task --state open --json number,body --limit 200` から依存グラフを構築する。本文の「- Epic: #N」行でNが異なるタスクは除外する（行が無い場合はフェイルオープンで含める）
 - `--from-file <TSV>`: GitHub に依存しないテスト用の入力差し替え
 - `--lanes N`: 並列度（既定は `DEV_WORKFLOW_MAX_LANES`、無ければ3）
 - `--skipped 4,7`: カンマ区切りの issue 番号。それらに依存するタスクを推移的にスキップする
