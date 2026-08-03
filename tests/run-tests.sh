@@ -2623,6 +2623,207 @@ RG35_GIT_HANG_EXIT=$?
 assert_exit_code "timeoutコマンドがPATHに無くても、stdinを開いたまま--gitを叩けば即座に返る" 0 "$RG35_GIT_HANG_EXIT"
 
 # ---------------------------------------------------------------------------
+# plan-waves.sh（依存グラフとウェーブ分解、Task #15、Epic #14 仕様書 5.2）
+#
+# --from-file はタブ区切り、1行1タスク: <番号>\t<state:open|closed>\t<前提行の生テキスト>。
+# 前提行が空文字列＝「- 前提:」行そのものが無い（宣言漏れ）を意味する。docker には一切触れない。
+# ---------------------------------------------------------------------------
+
+echo "== plan-waves.sh（依存グラフとウェーブ分解） =="
+
+PLAN_WAVES_SCRIPT="${REPO_ROOT}/scripts/plan-waves.sh"
+
+pw_value() {
+  # pw_value <task番号> <field> <output>
+  # 出力の "task <n> wave <W> subbatch <S> deps <deps>" 行から field の値を取り出す
+  printf '%s\n' "$3" | awk -F'\t' -v n="$1" -v f="$2" '
+    $1=="task" && $2==n {
+      for (i=1; i<=NF; i++) { if ($i==f) { print $(i+1); exit } }
+    }'
+}
+
+pw_wave_tasks() {
+  # pw_wave_tasks <wave番号> <output>
+  printf '%s\n' "$2" | awk -F'\t' -v w="$1" '$1=="wave" && $2==w {print $4}'
+}
+
+# --- ケース1: Epic #3 の実 issue データ（#4〜#13 の "- 前提:" 宣言）で6ウェーブになる ---
+# #4 は実際に「- 前提:」行が無い（宣言漏れの実例）。fail-safe は「自分より番号が小さい
+# 全タスクに依存」だが、#4 は最小番号なので依存は空になり、警告だけが出る。
+PW_EPIC3_FIXTURE="$(mktemp "${TMPDIR:-/tmp}/dw-test-pw-epic3.XXXXXX")"
+cat > "$PW_EPIC3_FIXTURE" <<'FIXTURE'
+4	open
+5	open	- 前提: #4
+6	open	- 前提: #5（label による所属判定を使う）
+7	open	- 前提: #6
+8	open	- 前提: #5
+9	open	- 前提: #5
+10	open	- 前提: #4
+11	open	- 前提: #4
+12	open	- 前提: #7, #9, #11（全実装の完了後）
+13	open	- 前提: #12
+FIXTURE
+
+PW_EPIC3_OUTPUT="$(bash "$PLAN_WAVES_SCRIPT" --from-file "$PW_EPIC3_FIXTURE")"
+PW_EPIC3_EXIT=$?
+
+assert_exit_code "Epic #3 実データ: exit 0" 0 "$PW_EPIC3_EXIT"
+assert_eq "Epic #3 実データ: 既定の lanes は3" "3" "$(printf '%s\n' "$PW_EPIC3_OUTPUT" | awk -F'\t' '$1=="lanes"{print $2}')"
+assert_eq "Epic #3 実データ: W1={4}" "4" "$(pw_wave_tasks 1 "$PW_EPIC3_OUTPUT")"
+assert_eq "Epic #3 実データ: W2={5,10,11}" "5,10,11" "$(pw_wave_tasks 2 "$PW_EPIC3_OUTPUT")"
+assert_eq "Epic #3 実データ: W3={6,8,9}" "6,8,9" "$(pw_wave_tasks 3 "$PW_EPIC3_OUTPUT")"
+assert_eq "Epic #3 実データ: W4={7}" "7" "$(pw_wave_tasks 4 "$PW_EPIC3_OUTPUT")"
+assert_eq "Epic #3 実データ: W5={12}" "12" "$(pw_wave_tasks 5 "$PW_EPIC3_OUTPUT")"
+assert_eq "Epic #3 実データ: W6={13}" "13" "$(pw_wave_tasks 6 "$PW_EPIC3_OUTPUT")"
+
+if printf '%s\n' "$PW_EPIC3_OUTPUT" | grep -q '^wave	7	'; then
+  fail "Epic #3 実データ: ウェーブは6個で打ち止め（W7が存在しない）"
+else
+  pass "Epic #3 実データ: ウェーブは6個で打ち止め（W7が存在しない）"
+fi
+
+assert_eq "Epic #3 実データ: #12 の deps は 7,9,11" "7,9,11" "$(pw_value 12 deps "$PW_EPIC3_OUTPUT")"
+assert_eq "Epic #3 実データ: #4 は実際に宣言漏れ（前提行が無い）として警告される" \
+  "1" "$(printf '%s\n' "$PW_EPIC3_OUTPUT" | grep -c '^warn	missing-deps	4$')"
+
+# --- ケース2: --lanes 2 でウェーブ2が {5,10} と {11} のサブバッチに割れる ---
+PW_LANES2_OUTPUT="$(bash "$PLAN_WAVES_SCRIPT" --from-file "$PW_EPIC3_FIXTURE" --lanes 2)"
+
+assert_eq "--lanes 2: #5 は subbatch 1" "1" "$(pw_value 5 subbatch "$PW_LANES2_OUTPUT")"
+assert_eq "--lanes 2: #10 は subbatch 1" "1" "$(pw_value 10 subbatch "$PW_LANES2_OUTPUT")"
+assert_eq "--lanes 2: #11 は subbatch 2" "2" "$(pw_value 11 subbatch "$PW_LANES2_OUTPUT")"
+
+# --- ケース3: 「- 前提:」行が無いタスクが「自分より小さい全タスクに依存」となり、
+#     全件宣言漏れなら完全逐次になる ---
+PW_SERIAL_FIXTURE="$(mktemp "${TMPDIR:-/tmp}/dw-test-pw-serial.XXXXXX")"
+cat > "$PW_SERIAL_FIXTURE" <<'FIXTURE'
+501	open
+502	open
+503	open
+FIXTURE
+
+PW_SERIAL_OUTPUT="$(bash "$PLAN_WAVES_SCRIPT" --from-file "$PW_SERIAL_FIXTURE")"
+
+assert_eq "宣言漏れの完全逐次: #501 は wave1（依存なし）" "1" "$(pw_value 501 wave "$PW_SERIAL_OUTPUT")"
+assert_eq "宣言漏れの完全逐次: #502 は wave2（#501 に依存）" "2" "$(pw_value 502 wave "$PW_SERIAL_OUTPUT")"
+assert_eq "宣言漏れの完全逐次: #503 は wave3（#501,#502 に依存）" "3" "$(pw_value 503 wave "$PW_SERIAL_OUTPUT")"
+assert_eq "宣言漏れの完全逐次: #503 の deps は 501,502" "501,502" "$(pw_value 503 deps "$PW_SERIAL_OUTPUT")"
+PW_SERIAL_MISSING_COUNT="$(printf '%s\n' "$PW_SERIAL_OUTPUT" | grep -c '^warn	missing-deps	')"
+assert_eq "宣言漏れの完全逐次: 3件すべてに missing-deps 警告が出る" "3" "$PW_SERIAL_MISSING_COUNT"
+
+# --- ケース4: 循環依存で exit 3 になり、循環に含まれるタスクが列挙される ---
+PW_CYCLE_FIXTURE="$(mktemp "${TMPDIR:-/tmp}/dw-test-pw-cycle.XXXXXX")"
+cat > "$PW_CYCLE_FIXTURE" <<'FIXTURE'
+601	open	- 前提: #602
+602	open	- 前提: #601
+FIXTURE
+
+PW_CYCLE_STDERR="$(bash "$PLAN_WAVES_SCRIPT" --from-file "$PW_CYCLE_FIXTURE" 2>&1 1>/dev/null)"
+PW_CYCLE_EXIT=$?
+
+assert_exit_code "循環依存: exit 3" 3 "$PW_CYCLE_EXIT"
+case "$PW_CYCLE_STDERR" in
+  *"601"*"602"*|*"602"*"601"*) pass "循環依存: 循環に含まれる両タスクがエラーに列挙される" ;;
+  *) fail "循環依存: 循環に含まれる両タスクがエラーに列挙される" "stderr=[${PW_CYCLE_STDERR}]" ;;
+esac
+
+# --- ケース5: Epic外・存在しない issue への依存が warn unknown-dep として報告され、無視される ---
+PW_UNKNOWN_FIXTURE="$(mktemp "${TMPDIR:-/tmp}/dw-test-pw-unknown.XXXXXX")"
+cat > "$PW_UNKNOWN_FIXTURE" <<'FIXTURE'
+701	open	- 前提: #999
+FIXTURE
+
+PW_UNKNOWN_OUTPUT="$(bash "$PLAN_WAVES_SCRIPT" --from-file "$PW_UNKNOWN_FIXTURE")"
+
+assert_eq "unknown-dep: 未知の依存は警告として報告される" "1" \
+  "$(printf '%s\n' "$PW_UNKNOWN_OUTPUT" | grep -c '^warn	unknown-dep	701	999$')"
+assert_eq "unknown-dep: 未知の依存は無視され #701 は wave1 になる" "1" "$(pw_value 701 wave "$PW_UNKNOWN_OUTPUT")"
+assert_eq "unknown-dep: #701 の deps は空（未知の依存を数えない）" "" "$(pw_value 701 deps "$PW_UNKNOWN_OUTPUT")"
+
+# --- ケース6: --skipped の伝播が推移的に効く ---
+PW_SKIP_FIXTURE="$(mktemp "${TMPDIR:-/tmp}/dw-test-pw-skip.XXXXXX")"
+cat > "$PW_SKIP_FIXTURE" <<'FIXTURE'
+801	open
+802	open	- 前提: #801
+803	open	- 前提: #802
+FIXTURE
+
+PW_SKIP_OUTPUT="$(bash "$PLAN_WAVES_SCRIPT" --from-file "$PW_SKIP_FIXTURE" --skipped 802)"
+
+if printf '%s\n' "$PW_SKIP_OUTPUT" | grep -q '^task	802	'; then
+  fail "スキップ伝播: 明示的にスキップした #802 はタスク一覧に出ない" "output=[${PW_SKIP_OUTPUT}]"
+else
+  pass "スキップ伝播: 明示的にスキップした #802 はタスク一覧に出ない"
+fi
+
+if printf '%s\n' "$PW_SKIP_OUTPUT" | grep -q '^task	803	'; then
+  fail "スキップ伝播: #802 に依存する #803 も推移的にスキップされタスク一覧に出ない" "output=[${PW_SKIP_OUTPUT}]"
+else
+  pass "スキップ伝播: #802 に依存する #803 も推移的にスキップされタスク一覧に出ない"
+fi
+
+assert_eq "スキップ伝播: #803 の skip 行に理由（依存先 #802）が出る" "1" \
+  "$(printf '%s\n' "$PW_SKIP_OUTPUT" | grep -c '^skip	803	reason	depends-on-skipped	802$')"
+
+if printf '%s\n' "$PW_SKIP_OUTPUT" | grep -q '^task	801	'; then
+  pass "スキップ伝播: スキップに依存しない #801 は影響を受けない"
+else
+  fail "スキップ伝播: スキップに依存しない #801 は影響を受けない" "output=[${PW_SKIP_OUTPUT}]"
+fi
+
+# --- ケース7: クローズ済み issue への依存が充足済みとして扱われる ---
+PW_CLOSED_FIXTURE="$(mktemp "${TMPDIR:-/tmp}/dw-test-pw-closed.XXXXXX")"
+cat > "$PW_CLOSED_FIXTURE" <<'FIXTURE'
+901	closed
+902	open	- 前提: #901
+FIXTURE
+
+PW_CLOSED_OUTPUT="$(bash "$PLAN_WAVES_SCRIPT" --from-file "$PW_CLOSED_FIXTURE")"
+
+assert_eq "closed依存: クローズ済み依存は充足済みとして扱われ #902 は wave1 になる" "1" "$(pw_value 902 wave "$PW_CLOSED_OUTPUT")"
+assert_eq "closed依存: #902 の deps は空（クローズ済みを数えない）" "" "$(pw_value 902 deps "$PW_CLOSED_OUTPUT")"
+if printf '%s\n' "$PW_CLOSED_OUTPUT" | grep -q '^task	901	'; then
+  fail "closed依存: クローズ済みタスク自体はウェーブ計画の対象に含まれない" "output=[${PW_CLOSED_OUTPUT}]"
+else
+  pass "closed依存: クローズ済みタスク自体はウェーブ計画の対象に含まれない"
+fi
+if printf '%s\n' "$PW_CLOSED_OUTPUT" | grep -q '^warn	unknown-dep	902	901$'; then
+  fail "closed依存: クローズ済み依存は unknown-dep として警告されない" "output=[${PW_CLOSED_OUTPUT}]"
+else
+  pass "closed依存: クローズ済み依存は unknown-dep として警告されない"
+fi
+
+# --- ケース8: --print が人間向けの表を出す（ドライラン） ---
+PW_PRINT_OUTPUT="$(bash "$PLAN_WAVES_SCRIPT" --from-file "$PW_EPIC3_FIXTURE" --print)"
+
+case "$PW_PRINT_OUTPUT" in
+  *"ウェーブ分解"*) pass "--print: 人間向けの見出しが出る" ;;
+  *) fail "--print: 人間向けの見出しが出る" "output=[${PW_PRINT_OUTPUT}]" ;;
+esac
+case "$PW_PRINT_OUTPUT" in
+  *"lanes"$'\t'*) fail "--print: 機械可読な TSV ではなく人間向け表示になっている" "output=[${PW_PRINT_OUTPUT}]" ;;
+  *) pass "--print: 機械可読な TSV ではなく人間向け表示になっている" ;;
+esac
+
+# --- ケース9: 引数バリデーション（引数エラーは exit 2） ---
+bash "$PLAN_WAVES_SCRIPT" >/dev/null 2>&1
+assert_exit_code "--epic も --from-file も無ければ exit 2" 2 "$?"
+
+bash "$PLAN_WAVES_SCRIPT" --epic 14 --from-file "$PW_EPIC3_FIXTURE" >/dev/null 2>&1
+assert_exit_code "--epic と --from-file の同時指定は exit 2" 2 "$?"
+
+bash "$PLAN_WAVES_SCRIPT" --from-file "$PW_EPIC3_FIXTURE" --lanes abc >/dev/null 2>&1
+assert_exit_code "--lanes に数値以外を渡すと exit 2" 2 "$?"
+
+bash "$PLAN_WAVES_SCRIPT" --from-file "${TMPDIR:-/tmp}/dw-test-pw-no-such-file" >/dev/null 2>&1
+assert_exit_code "--from-file に存在しないファイルを渡すと exit 2" 2 "$?"
+
+# --- ケース10: DEV_WORKFLOW_MAX_LANES で既定の --lanes を上書きできる ---
+PW_ENV_LANES_OUTPUT="$(DEV_WORKFLOW_MAX_LANES=5 bash "$PLAN_WAVES_SCRIPT" --from-file "$PW_EPIC3_FIXTURE")"
+assert_eq "DEV_WORKFLOW_MAX_LANES で既定の lanes を上書きできる" "5" \
+  "$(printf '%s\n' "$PW_ENV_LANES_OUTPUT" | awk -F'\t' '$1=="lanes"{print $2}')"
+
+# ---------------------------------------------------------------------------
 # 結果集計
 # ---------------------------------------------------------------------------
 
