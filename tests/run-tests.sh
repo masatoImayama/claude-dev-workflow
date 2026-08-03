@@ -1688,6 +1688,39 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+# 役割定義・生成物に docker 直接呼び出しの記述が残っていない（回帰防止 #26）
+#
+# core/roles/evaluator.md の「テスト実行（サンドボックス内）」節が、イメージタグを
+# hash 付けに変えた本Epicの変更に追随せず、`docker run --rm ... dev-sandbox:[project]` /
+# `docker compose -f docker-compose.dev.yml exec app` という旧い直接呼び出しのまま
+# 生成物（agents/evaluator.md・codex-agents/evaluator.toml）に伝播していた。
+# Task #12・#13 が対象ファイル一覧に evaluator.md を含めていなかったことが原因なので、
+# ファイル名を列挙するのではなく core/roles・agents・codex-agents をディレクトリごと
+# 走査する。core/instructions.md も同じ理由で対象に含める。
+# ---------------------------------------------------------------------------
+
+echo "== 役割定義・生成物に docker 直接呼び出しの記述が残っていない（回帰防止 #26） =="
+
+FORBIDDEN_SANDBOX_PATTERN='docker run --rm|dev-sandbox:\[project\]|docker compose -f docker-compose\.dev\.yml exec'
+
+check_no_forbidden_sandbox_calls() {
+  # check_no_forbidden_sandbox_calls <説明> <検査対象（ファイルまたはディレクトリ）>
+  local desc="$1" target="$2"
+  local hits
+  hits="$(grep -rnE "$FORBIDDEN_SANDBOX_PATTERN" "$target" 2>/dev/null || true)"
+  if [ -z "$hits" ]; then
+    pass "$desc"
+  else
+    fail "$desc" "$hits"
+  fi
+}
+
+check_no_forbidden_sandbox_calls "core/roles/ に docker 直接呼び出しが残っていない" "${REPO_ROOT}/core/roles"
+check_no_forbidden_sandbox_calls "core/instructions.md に docker 直接呼び出しが残っていない" "${REPO_ROOT}/core/instructions.md"
+check_no_forbidden_sandbox_calls "agents/ に docker 直接呼び出しが残っていない" "${REPO_ROOT}/agents"
+check_no_forbidden_sandbox_calls "codex-agents/ に docker 直接呼び出しが残っていない" "${REPO_ROOT}/codex-agents"
+
+# ---------------------------------------------------------------------------
 # 結果集計
 # ---------------------------------------------------------------------------
 
