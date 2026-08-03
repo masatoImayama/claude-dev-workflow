@@ -9,7 +9,7 @@
 # 違反の通知方法はCLIごとに契約が異なるため、実行中のCLIを判定して出し分ける:
 #   - Claude Code … exit 2 + stderr にメッセージ
 #   - Codex CLI  … exit 0 + stdout に {"continue": false, ...} のJSON
-#   - pre-commit … exit 1 + stderr にメッセージ（--exit-code で明示）
+#   - pre-commit … exit 1 + stderr にメッセージ（DEV_WORKFLOW_HOOK_VENDOR=exit-code で明示）
 #
 # どちらも
 #   - PostToolUse(Write|Edit) フック → ツール結果をブロックし、理由をエージェントに差し戻す（自己修正ループ）
@@ -25,6 +25,8 @@
 #   READABILITY_GUARD=off               # ガード全体を無効化
 #   READABILITY_MAX_BASE64=2000         # 連続するbase64文字列の許容上限（文字数）
 #   READABILITY_MAX_LINE=5000           # ソース1行の許容上限（文字数。ミニファイ検出）
+#   READABILITY_STDIN_TIMEOUT=5         # 引数なし・非tty時にstdinを待つ上限秒数。
+#                                       # 超過すると警告を出してexit 0（素通り）
 #   DEV_WORKFLOW_HOOK_VENDOR=claude|codex|exit-code
 #                                       # ベンダー自動判定を上書きする（デバッグ・CI用）
 #
@@ -44,12 +46,27 @@ MAX_BASE64="${READABILITY_MAX_BASE64:-2000}"
 MAX_LINE="${READABILITY_MAX_LINE:-5000}"
 
 # ── フック入力の読み取り ─────────────────────────────────────────────
-# フック実行時は stdin に JSON が渡る。端末から手で叩いた場合は stdin が tty に
-# なるため読まない（読むとブロックしてしまう）。
+# フック実行時（引数なし）は stdin に JSON が渡る。端末から手で叩いた場合は stdin
+# が tty になるため読まない（読むとブロックしてしまう）。
+# `--git` / `--staged` / ファイル引数が1つでもある場合は検査対象が明確なので、
+# stdin は一切読まない（パイプ越し・CI・エージェントランナーからの呼び出しで
+# EOFが来ずハングする経路を作らないため）。
 HOOK_INPUT=""
-if [ ! -t 0 ]; then
-  HOOK_INPUT="$(cat 2>/dev/null || true)"
-fi
+
+# 引数なし・非tty のときだけ、上限付きで stdin を読む。
+# `read -t` はタイムアウト時に exit status > 128 を返す（bashの仕様）ため、
+# それを持って「入力が来なかった」と判定する。
+read_stdin_with_timeout() {
+  local timeout_secs="${READABILITY_STDIN_TIMEOUT:-5}"
+  local line=""
+  IFS= read -r -t "$timeout_secs" line
+  local status=$?
+  if [ "$status" -gt 128 ]; then
+    return 1
+  fi
+  printf '%s' "$line"
+  return 0
+}
 
 # ── 実行中のCLIを判定 ────────────────────────────────────────────────
 # Claude Code と Codex CLI はフックのブロック契約が異なるため、出力を出し分ける。
@@ -162,7 +179,15 @@ elif [ "$#" -gt 0 ]; then
   # 引数で指定されたファイル
   files=("$@")
 else
-  # フック入力のJSONから file_path を抽出（PostToolUse 用）
+  # 引数なし: フック入力のJSONから file_path を抽出（PostToolUse 用）。
+  # stdin が tty でなければ、上限付きで読む（既定5秒、READABILITY_STDIN_TIMEOUT で調整可）。
+  # タイムアウトした場合は「フック入力が来ないなら検査対象も無い」として素通りする。
+  if [ ! -t 0 ]; then
+    if ! HOOK_INPUT="$(read_stdin_with_timeout)"; then
+      echo "【可読性ガード】 stdin からの入力が ${READABILITY_STDIN_TIMEOUT:-5}秒 以内に得られなかったため検査をスキップします" >&2
+      exit 0
+    fi
+  fi
   raw=$(printf '%s' "$HOOK_INPUT" | grep -oE '"file_path"[[:space:]]*:[[:space:]]*"[^"]*"' | head -1 \
         | sed -E 's/.*"file_path"[[:space:]]*:[[:space:]]*"([^"]*)".*/\1/')
   if [ -n "$raw" ]; then

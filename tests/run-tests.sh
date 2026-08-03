@@ -1475,6 +1475,153 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+# check-readability.sh の非対話ハング修正（Task #10、Epic #3 仕様書 4.9）
+#
+# `--git` / `--staged` / ファイル引数が1つでもあれば stdin を一切読まない。
+# 引数なし・非ttyのフック経路だけ上限付きで読み、タイムアウト時は exit 0 で
+# 素通りする。ガード本体の判定ロジック（base64ブロブ検出・長い行検出）は
+# 変更しない仕様のため、違反検出が従来どおり働くこともあわせて検証する。
+#
+# 「stdinを読まない」ことの検証は、プロセス置換 `< <(sleep N)` で終端しない
+# stdinを用意して行う。パイプ（`sleep N | cmd`）だと親シェルが sleep の終了まで
+# 待たされてテストが遅くなるが、プロセス置換なら判定対象コマンドが先に終われば
+# 親シェルはバックグラウンドの sleep を待たない。もしスクリプトが誤って stdin を
+# 読もうとした場合だけ `timeout` に引っかかり、それを失敗として検出する。
+# ---------------------------------------------------------------------------
+
+echo "== check-readability.sh（非対話ハング修正・Task #10） =="
+
+CHECK_READABILITY_SCRIPT="${REPO_ROOT}/scripts/check-readability.sh"
+
+RG_TMP_REPO="$(make_temp_repo)"
+RG_CLEAN_FILE="clean.txt"
+(
+  cd "$RG_TMP_REPO" || exit 1
+  printf 'clean file\n' > "$RG_CLEAN_FILE"
+) >/dev/null 2>&1
+
+# --- --git はstdinが開いたままでもハングせず即座に返る ---
+RG_GIT_EXIT=0
+(
+  cd "$RG_TMP_REPO" || exit 1
+  timeout 5 bash "$CHECK_READABILITY_SCRIPT" --git < <(sleep 10) >/dev/null 2>&1
+)
+RG_GIT_EXIT=$?
+assert_exit_code "--git はstdinが開いたままでもハングせず即座に返る" 0 "$RG_GIT_EXIT"
+
+# --- ファイル引数を渡した場合もstdinを読まない ---
+RG_FILEARG_EXIT=0
+(
+  cd "$RG_TMP_REPO" || exit 1
+  timeout 5 bash "$CHECK_READABILITY_SCRIPT" "$RG_CLEAN_FILE" < <(sleep 10) >/dev/null 2>&1
+)
+RG_FILEARG_EXIT=$?
+assert_exit_code "ファイル引数を渡した場合もstdinを読まず即座に返る" 0 "$RG_FILEARG_EXIT"
+
+# --- --staged も同様 ---
+(
+  cd "$RG_TMP_REPO" || exit 1
+  git add "$RG_CLEAN_FILE"
+) >/dev/null 2>&1
+
+RG_STAGED_EXIT=0
+(
+  cd "$RG_TMP_REPO" || exit 1
+  timeout 5 bash "$CHECK_READABILITY_SCRIPT" --staged < <(sleep 10) >/dev/null 2>&1
+)
+RG_STAGED_EXIT=$?
+assert_exit_code "--stagedもstdinが開いたままでもハングせず即座に返る" 0 "$RG_STAGED_EXIT"
+
+# --- 引数なし・非ttyで入力が来ない場合、タイムアウト後にexit 0で素通りする ---
+# テストを遅くしないよう READABILITY_STDIN_TIMEOUT=1 で短くする。
+RG_TIMEOUT_STDERR="$(mktemp "${TMPDIR:-/tmp}/dw-test-rg-timeout-stderr.XXXXXX")"
+RG_TIMEOUT_EXIT=0
+timeout 5 env READABILITY_STDIN_TIMEOUT=1 bash "$CHECK_READABILITY_SCRIPT" \
+  < <(sleep 10) >/dev/null 2>"$RG_TIMEOUT_STDERR"
+RG_TIMEOUT_EXIT=$?
+assert_exit_code "引数なし・非ttyで入力が来ない場合はタイムアウト後exit 0で素通りする" 0 "$RG_TIMEOUT_EXIT"
+
+if grep -q "1秒" "$RG_TIMEOUT_STDERR"; then
+  pass "タイムアウト時にREADABILITY_STDIN_TIMEOUTの秒数を含む警告がstderrに出る"
+else
+  fail "タイムアウト時にREADABILITY_STDIN_TIMEOUTの秒数を含む警告がstderrに出る" "stderr=[$(cat "$RG_TIMEOUT_STDERR")]"
+fi
+
+# --- 引数なし・非ttyでフックJSONが渡された場合は従来どおり処理される（クリーンなファイル） ---
+RG_HOOK_CLEAN_EXIT=0
+(
+  cd "$RG_TMP_REPO" || exit 1
+  printf '{"tool_input":{"file_path":"%s"}}' "$RG_CLEAN_FILE" | bash "$CHECK_READABILITY_SCRIPT" >/dev/null 2>&1
+)
+RG_HOOK_CLEAN_EXIT=$?
+assert_exit_code "フックJSONのfile_pathから抽出したクリーンなファイルはexit 0" 0 "$RG_HOOK_CLEAN_EXIT"
+
+# --- 引数なし・非ttyでフックJSONが渡された場合は従来どおり処理される（違反ファイル） ---
+RG_VIOLATION_FILE="violation.txt"
+(
+  cd "$RG_TMP_REPO" || exit 1
+  head -c 3000 /dev/zero | tr '\0' 'A' > "$RG_VIOLATION_FILE"
+) >/dev/null 2>&1
+
+RG_HOOK_VIOLATION_EXIT=0
+(
+  cd "$RG_TMP_REPO" || exit 1
+  printf '{"tool_input":{"file_path":"%s"}}' "$RG_VIOLATION_FILE" \
+    | READABILITY_MAX_BASE64=50 bash "$CHECK_READABILITY_SCRIPT" >/dev/null 2>&1
+)
+RG_HOOK_VIOLATION_EXIT=$?
+assert_exit_code "フックJSON経由でも違反ファイルはブロックされる" 2 "$RG_HOOK_VIOLATION_EXIT"
+
+# --- 違反検出ロジックは従来どおり働く（巨大なbase64ブロブ） ---
+RG_BLOB_EXIT=0
+(
+  cd "$RG_TMP_REPO" || exit 1
+  READABILITY_MAX_BASE64=50 bash "$CHECK_READABILITY_SCRIPT" "$RG_VIOLATION_FILE" >/dev/null 2>&1
+)
+RG_BLOB_EXIT=$?
+assert_exit_code "巨大なbase64ブロブを含むファイルはexit 2" 2 "$RG_BLOB_EXIT"
+
+# --- 違反検出ロジックは従来どおり働く（極端に長い行）。
+# base64文字集合に含まれない '-' で埋めることで、base64ブロブ検出とは
+# 独立に「長い行」ルール単体の検出を確認する。
+RG_LONGLINE_FILE="longline.txt"
+(
+  cd "$RG_TMP_REPO" || exit 1
+  head -c 6000 /dev/zero | tr '\0' '-' > "$RG_LONGLINE_FILE"
+  printf '\n' >> "$RG_LONGLINE_FILE"
+) >/dev/null 2>&1
+
+RG_LONGLINE_EXIT=0
+(
+  cd "$RG_TMP_REPO" || exit 1
+  bash "$CHECK_READABILITY_SCRIPT" "$RG_LONGLINE_FILE" >/dev/null 2>&1
+)
+RG_LONGLINE_EXIT=$?
+assert_exit_code "極端に長い行を含むファイルはexit 2" 2 "$RG_LONGLINE_EXIT"
+
+# --- クリーンなファイルはexit 0（引数指定） ---
+RG_CLEAN_EXIT=0
+(
+  cd "$RG_TMP_REPO" || exit 1
+  bash "$CHECK_READABILITY_SCRIPT" "$RG_CLEAN_FILE" >/dev/null 2>&1
+)
+RG_CLEAN_EXIT=$?
+assert_exit_code "クリーンなファイルはexit 0" 0 "$RG_CLEAN_EXIT"
+
+# --- ヘッダコメントに実在しない --exit-code の記述が残っていない ---
+if grep -q -- '--exit-code' "$CHECK_READABILITY_SCRIPT"; then
+  fail "ヘッダコメントに実在しない--exit-codeの記述が残っていない" "grep hit: $(grep -n -- '--exit-code' "$CHECK_READABILITY_SCRIPT")"
+else
+  pass "ヘッダコメントに実在しない--exit-codeの記述が残っていない"
+fi
+
+if grep -q "DEV_WORKFLOW_HOOK_VENDOR=exit-code" "$CHECK_READABILITY_SCRIPT"; then
+  pass "ヘッダコメントがDEV_WORKFLOW_HOOK_VENDOR=exit-codeの正しい説明に修正されている"
+else
+  fail "ヘッダコメントがDEV_WORKFLOW_HOOK_VENDOR=exit-codeの正しい説明に修正されている" "grepで見つかりませんでした"
+fi
+
+# ---------------------------------------------------------------------------
 # 結果集計
 # ---------------------------------------------------------------------------
 
