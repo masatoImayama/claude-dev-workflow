@@ -1349,6 +1349,132 @@ case "$COMPOSE_WARN_STDERR" in
 esac
 
 # ---------------------------------------------------------------------------
+# CRLF 警告（crlf_warning_message、Docker 非依存の純粋関数、Task #11、Epic #3 仕様書 4.10）
+#
+# check-prerequisites.sh を source しても本体（gh/docker/git リポジトリチェック等）が
+# 実行されないことを利用し、crlf_warning_message だけを直接呼び出して検証する。
+# 一時 git リポジトリの core.autocrlf / .gitattributes を組み合わせて条件を再現する。
+# ---------------------------------------------------------------------------
+
+echo "== crlf_warning_message（CRLF警告・Docker非依存。Task #11） =="
+
+CHECK_PREREQS_SCRIPT="${REPO_ROOT}/scripts/check-prerequisites.sh"
+
+make_crlf_test_repo() {
+  # make_crlf_test_repo <autocrlf値> <gitattributes内容 or 空>
+  # core.autocrlf と .gitattributes を指定して一時リポジトリを作り、パスを返す。
+  local autocrlf="$1" attrs="$2"
+  local dir
+  dir="$(mktemp -d "${TMPDIR:-/tmp}/dw-test-crlf-repo.XXXXXX")"
+  (
+    cd "$dir" || exit 1
+    git init -q
+    git config user.email "dev-workflow-test@example.com"
+    git config user.name "dev-workflow test"
+    git config core.autocrlf "$autocrlf"
+    if [ -n "$attrs" ]; then
+      printf '%s\n' "$attrs" > .gitattributes
+    fi
+  ) >/dev/null 2>&1
+  printf '%s' "$dir"
+}
+
+crlf_warning_in() {
+  # crlf_warning_in <dir>  <dir> 内で check-prerequisites.sh を source し
+  # crlf_warning_message を呼び出した標準出力を返す（stderr は捨てる）。
+  local dir="$1"
+  (
+    cd "$dir" || exit 1
+    # shellcheck source=../scripts/check-prerequisites.sh
+    source "$CHECK_PREREQS_SCRIPT"
+    crlf_warning_message
+  ) 2>/dev/null
+}
+
+# --- autocrlf=true かつ .gitattributes に *.sh の eol=lf が無ければ警告が出る ---
+CRLF_NOATTR_REPO="$(make_crlf_test_repo true "")"
+CRLF_NOATTR_WARNING="$(crlf_warning_in "$CRLF_NOATTR_REPO")"
+
+if [ -n "$CRLF_NOATTR_WARNING" ]; then
+  pass "autocrlf=true かつ eol=lf 未設定なら警告が出る"
+else
+  fail "autocrlf=true かつ eol=lf 未設定なら警告が出る" "警告が空でした"
+fi
+
+case "$CRLF_NOATTR_WARNING" in
+  *".gitattributes"*) pass "警告文に .gitattributes への言及がある" ;;
+  *) fail "警告文に .gitattributes への言及がある" "warning=[${CRLF_NOATTR_WARNING}]" ;;
+esac
+
+case "$CRLF_NOATTR_WARNING" in
+  *"*.sh text eol=lf"*) pass "警告文に *.sh text eol=lf の追記案内がある" ;;
+  *) fail "警告文に *.sh text eol=lf の追記案内がある" "warning=[${CRLF_NOATTR_WARNING}]" ;;
+esac
+
+if printf '%s' "$CRLF_NOATTR_WARNING" | grep -qF '$'"'"'{\r'"'"''; then
+  pass "警告文に構文エラーの症状（\$'{\\r'）が含まれる"
+else
+  fail "警告文に構文エラーの症状（\$'{\\r'）が含まれる" "warning=[${CRLF_NOATTR_WARNING}]"
+fi
+
+# --- autocrlf=true でも .gitattributes に *.sh text eol=lf があれば警告は出ない ---
+CRLF_WITHATTR_REPO="$(make_crlf_test_repo true "*.sh text eol=lf")"
+CRLF_WITHATTR_WARNING="$(crlf_warning_in "$CRLF_WITHATTR_REPO")"
+
+assert_eq "autocrlf=true でも *.sh text eol=lf があれば警告が出ない" "" "$CRLF_WITHATTR_WARNING"
+
+# --- autocrlf=false なら警告は出ない ---
+CRLF_FALSE_REPO="$(make_crlf_test_repo false "")"
+CRLF_FALSE_WARNING="$(crlf_warning_in "$CRLF_FALSE_REPO")"
+
+assert_eq "autocrlf=false なら警告が出ない" "" "$CRLF_FALSE_WARNING"
+
+# --- autocrlf=input でも警告は出ない（true のときだけが対象） ---
+CRLF_INPUT_REPO="$(make_crlf_test_repo input "")"
+CRLF_INPUT_WARNING="$(crlf_warning_in "$CRLF_INPUT_REPO")"
+
+assert_eq "autocrlf=input なら警告が出ない" "" "$CRLF_INPUT_WARNING"
+
+# --- 警告が出るケースでも check-prerequisites.sh 全体の終了コードは変わらない（exit 2 でブロックしない） ---
+#
+# check-prerequisites.sh 本体は gh/docker の実コマンドを呼び、gh 認証済みなら
+# `git config --global credential.helper` まで書き換える副作用を持つ。テストで
+# 実ホストの状態を変えないよう、gh/docker は偽コマンドに差し替え、--global の参照先も
+# 隔離した HOME に向ける（実際の docker/gh には一切触れない）。
+CRLF_FAKE_BIN_DIR="$(mktemp -d "${TMPDIR:-/tmp}/dw-test-crlf-fakebin.XXXXXX")"
+cat > "${CRLF_FAKE_BIN_DIR}/gh" <<'FAKE_GH'
+#!/bin/bash
+# tests/run-tests.sh 用の偽 gh。認証済み扱いにして常に成功させる。
+exit 0
+FAKE_GH
+chmod +x "${CRLF_FAKE_BIN_DIR}/gh"
+cat > "${CRLF_FAKE_BIN_DIR}/docker" <<'FAKE_DOCKER_PREREQ'
+#!/bin/bash
+# tests/run-tests.sh 用の偽 docker。起動済み扱いにして常に成功させる。
+exit 0
+FAKE_DOCKER_PREREQ
+chmod +x "${CRLF_FAKE_BIN_DIR}/docker"
+
+CRLF_FAKE_HOME="$(mktemp -d "${TMPDIR:-/tmp}/dw-test-crlf-fakehome.XXXXXX")"
+printf '[credential]\n\thelper = gh\n' > "${CRLF_FAKE_HOME}/.gitconfig"
+
+CRLF_FULL_STDERR="$(mktemp "${TMPDIR:-/tmp}/dw-test-crlf-full-stderr.XXXXXX")"
+CRLF_FULL_EXIT=0
+(
+  cd "$CRLF_NOATTR_REPO" || exit 1
+  HOME="$CRLF_FAKE_HOME" PATH="${CRLF_FAKE_BIN_DIR}:${PATH}" \
+    bash "$CHECK_PREREQS_SCRIPT" 1>/dev/null 2>"$CRLF_FULL_STDERR"
+) || CRLF_FULL_EXIT=$?
+
+assert_exit_code "偽gh/偽dockerが揃った状態でCRLF警告があっても exit 0（ブロックしない）" 0 "$CRLF_FULL_EXIT"
+
+if grep -q "core.autocrlf=true" "$CRLF_FULL_STDERR"; then
+  pass "check-prerequisites.sh 本体からも CRLF 警告が stderr に出る"
+else
+  fail "check-prerequisites.sh 本体からも CRLF 警告が stderr に出る" "stderr=[$(cat "$CRLF_FULL_STDERR")]"
+fi
+
+# ---------------------------------------------------------------------------
 # 結果集計
 # ---------------------------------------------------------------------------
 
