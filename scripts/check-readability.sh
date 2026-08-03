@@ -53,18 +53,24 @@ MAX_LINE="${READABILITY_MAX_LINE:-5000}"
 # EOFが来ずハングする経路を作らないため）。
 HOOK_INPUT=""
 
-# 引数なし・非tty のときだけ、上限付きで stdin を読む。
-# `read -t` はタイムアウト時に exit status > 128 を返す（bashの仕様）ため、
-# それを持って「入力が来なかった」と判定する。
+# 引数なし・非tty のときだけ、上限付きで stdin を「全部」読む。
+# フック入力は整形された（複数行の）JSONで来ることがあり、1行しか読まないと
+# 1行目に file_path が無い場合に検査対象を取りこぼして黙って素通りしてしまう
+# （可読性ガードが最優先で守るべきルールを、入力形式の差で無効化してはならない）。
+# `timeout` にstdin読み取り（`cat`）を丸ごと委譲し、既定秒数以内にEOFが来なければ
+# `timeout` が `cat` を強制終了する。強制終了時の終了コードは実装依存で、
+# GNU coreutils は 124 を返すが、Alpine(BusyBox) 等の timeout はシグナルによる
+# 終了コード（例: SIGTERMで143）を返す。両方を区別せず「非0なら入力が来なかった」
+# として扱う（正常にEOFへ到達した cat は常に 0 を返すため、これで安全に判定できる）。
 read_stdin_with_timeout() {
   local timeout_secs="${READABILITY_STDIN_TIMEOUT:-5}"
-  local line=""
-  IFS= read -r -t "$timeout_secs" line
+  local content
+  content="$(timeout "$timeout_secs" cat 2>/dev/null)"
   local status=$?
-  if [ "$status" -gt 128 ]; then
+  if [ "$status" -ne 0 ]; then
     return 1
   fi
-  printf '%s' "$line"
+  printf '%s' "$content"
   return 0
 }
 

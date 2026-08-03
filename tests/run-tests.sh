@@ -1985,6 +1985,125 @@ check_no_forbidden_sandbox_calls "agents/ に docker 直接呼び出しが残っ
 check_no_forbidden_sandbox_calls "codex-agents/ に docker 直接呼び出しが残っていない" "${REPO_ROOT}/codex-agents"
 
 # ---------------------------------------------------------------------------
+# check-readability.sh: 複数行フックJSONの読み取り（回帰防止 #31）
+#
+# Task #10 のハング修正で stdin を「上限付きで読む」形にした際、実装が
+# `read -r -t` を1回しか呼ばず先頭1行しか読んでいなかった。フック入力は
+# 整形された（複数行の）JSONで来ることがあり、1行目に file_path が無い場合
+# 検査対象を取りこぼして警告もログも無く exit 0 してしまう欠陥があった
+# （可読性ガードが最優先で守るルールが、入力形式の差で黙って無効化される）。
+#
+# ここでは stdin 全体をタイムアウト付きで読み切る修正後の実装が、
+#   1) 複数行JSONでも file_path を抽出して違反を検出できること
+#   2) 1行目に file_path が無い複数行JSONでも検出できること
+#   3) Task #10 で固定した「stdinを開いたままでもハングしない」性質を
+#      壊していないこと
+# を確認する。
+# ---------------------------------------------------------------------------
+
+echo "== check-readability.sh（複数行フックJSONの読み取り・回帰防止 #31） =="
+
+RG31_TMP_REPO="$(make_temp_repo)"
+RG31_VIOLATION_FILE="violation.txt"
+(
+  cd "$RG31_TMP_REPO" || exit 1
+  head -c 3000 /dev/zero | tr '\0' 'A' > "$RG31_VIOLATION_FILE"
+) >/dev/null 2>&1
+
+# --- 整形された（複数行の）フックJSON。file_path は先頭行ではなく途中の行にある ---
+RG31_MULTILINE_JSON=$(cat <<EOF
+{
+  "session_id": "abc123",
+  "tool_input": {
+    "file_path": "${RG31_VIOLATION_FILE}"
+  },
+  "tool_name": "Write"
+}
+EOF
+)
+
+RG31_MULTILINE_EXIT=0
+(
+  cd "$RG31_TMP_REPO" || exit 1
+  printf '%s' "$RG31_MULTILINE_JSON" \
+    | READABILITY_MAX_BASE64=50 bash "$CHECK_READABILITY_SCRIPT" >/dev/null 2>&1
+)
+RG31_MULTILINE_EXIT=$?
+assert_exit_code "複数行に整形されたフックJSONでもfile_pathを抽出して違反を検出する" 2 "$RG31_MULTILINE_EXIT"
+
+# --- 1行目に file_path が無い複数行JSON（file_path はJSONの末尾近くの行にある） ---
+RG31_LATE_FIELD_JSON=$(cat <<EOF
+{
+  "session_id": "abc123",
+  "cwd": "/tmp/somewhere",
+  "hook_event_name": "PostToolUse",
+  "tool_name": "Write",
+  "tool_input": {
+    "content": "dummy",
+    "file_path": "${RG31_VIOLATION_FILE}"
+  }
+}
+EOF
+)
+
+RG31_LATE_FIELD_EXIT=0
+(
+  cd "$RG31_TMP_REPO" || exit 1
+  printf '%s' "$RG31_LATE_FIELD_JSON" \
+    | READABILITY_MAX_BASE64=50 bash "$CHECK_READABILITY_SCRIPT" >/dev/null 2>&1
+)
+RG31_LATE_FIELD_EXIT=$?
+assert_exit_code "1行目にfile_pathが無い複数行JSONでも検出できる" 2 "$RG31_LATE_FIELD_EXIT"
+
+# --- 上記と同じ複数行JSONで、クリーンなファイルならexit 0（誤検出しないことの確認） ---
+RG31_CLEAN_FILE="clean-multiline.txt"
+(
+  cd "$RG31_TMP_REPO" || exit 1
+  printf 'clean file\n' > "$RG31_CLEAN_FILE"
+) >/dev/null 2>&1
+
+RG31_CLEAN_MULTILINE_JSON=$(cat <<EOF
+{
+  "session_id": "abc123",
+  "tool_input": {
+    "file_path": "${RG31_CLEAN_FILE}"
+  }
+}
+EOF
+)
+
+RG31_CLEAN_MULTILINE_EXIT=0
+(
+  cd "$RG31_TMP_REPO" || exit 1
+  printf '%s' "$RG31_CLEAN_MULTILINE_JSON" | bash "$CHECK_READABILITY_SCRIPT" >/dev/null 2>&1
+)
+RG31_CLEAN_MULTILINE_EXIT=$?
+assert_exit_code "複数行JSONでもクリーンなファイルはexit 0（誤検出しない）" 0 "$RG31_CLEAN_MULTILINE_EXIT"
+
+# --- Task #10 の性質を壊していないことの再確認: stdinを開いたまま --git を叩いても即座に返る ---
+# RG31_TMP_REPO には未追跡の違反ファイル（violation.txt等）があるため、
+# --git で検査すれば違反検出（exit 2）になり得る。ここで確認したいのは
+# 「ハングしないこと」だけなので、違反ファイルの無いクリーンな一時リポジトリを別途使う。
+RG31_HANG_REPO="$(make_temp_repo)"
+RG31_GIT_HANG_EXIT=0
+(
+  cd "$RG31_HANG_REPO" || exit 1
+  timeout 8 bash "$CHECK_READABILITY_SCRIPT" --git < <(sleep 30) >/dev/null 2>&1
+)
+RG31_GIT_HANG_EXIT=$?
+assert_exit_code "stdinを開いたまま--gitを叩いても即座に返る（ハング再発なし）" 0 "$RG31_GIT_HANG_EXIT"
+
+# --- 引数なし・非ttyで入力が来ない場合も、複数行読み取りに変えた後で引き続きタイムアウトする ---
+RG31_TIMEOUT_EXIT=0
+(
+  cd "$RG31_HANG_REPO" || exit 1
+  timeout 8 env READABILITY_STDIN_TIMEOUT=1 bash "$CHECK_READABILITY_SCRIPT" \
+    < <(sleep 30) >/dev/null 2>&1
+)
+RG31_TIMEOUT_EXIT=$?
+assert_exit_code "複数行読み取りに変えた後も、入力が来ない場合はタイムアウトしてexit 0で素通りする" 0 "$RG31_TIMEOUT_EXIT"
+
+# ---------------------------------------------------------------------------
 # 結果集計
 # ---------------------------------------------------------------------------
 
