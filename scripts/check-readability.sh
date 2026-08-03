@@ -57,19 +57,39 @@ HOOK_INPUT=""
 # フック入力は整形された（複数行の）JSONで来ることがあり、1行しか読まないと
 # 1行目に file_path が無い場合に検査対象を取りこぼして黙って素通りしてしまう
 # （可読性ガードが最優先で守るべきルールを、入力形式の差で無効化してはならない）。
-# `timeout` にstdin読み取り（`cat`）を丸ごと委譲し、既定秒数以内にEOFが来なければ
-# `timeout` が `cat` を強制終了する。強制終了時の終了コードは実装依存で、
-# GNU coreutils は 124 を返すが、Alpine(BusyBox) 等の timeout はシグナルによる
-# 終了コード（例: SIGTERMで143）を返す。両方を区別せず「非0なら入力が来なかった」
-# として扱う（正常にEOFへ到達した cat は常に 0 を返すため、これで安全に判定できる）。
+#
+# 以前は `timeout "$secs" cat` に読み取りを丸ごと委譲していたが、`timeout` は
+# GNU coreutils / BusyBox のコマンドで macOS の既定環境には存在しない
+# （`gtimeout` のみ）。command not found（status 127）を「入力が来なかった」と
+# 誤判定し、macOS では可読性ガードが常時無効化されてしまっていた。
+# 外部コマンドに依存せず、bash 組み込みの `read -t` だけで複数行を読み切る。
+#
+# 注意: `while read -t ...; do ...; done` の直後の `$?` はループの終了ステータスに
+# なり、POSIX仕様上「ループ本体が一度も実行されなければ0」になる。つまり読み取り
+# 自体がタイムアウトで失敗しても、その失敗ステータスはループの外に伝播しない。
+# そのため read の戻り値はループ内で都度チェックし、専用フラグに記録する。
+#   - status > 128: シグナルによる強制終了＝タイムアウト（bashは128+シグナル番号を返す）
+#   - status != 0 かつ <= 128: EOF。ただし改行で終端されていない最終行が
+#     `line` に残ったままループを抜けることがあるため、ループ後に明示的に追加する
+#     （末尾に改行の無い入力でも最終行を取りこぼさない）。
 read_stdin_with_timeout() {
   local timeout_secs="${READABILITY_STDIN_TIMEOUT:-5}"
-  local content
-  content="$(timeout "$timeout_secs" cat 2>/dev/null)"
-  local status=$?
-  if [ "$status" -ne 0 ]; then
+  local line="" content="" rc timed_out=0
+  while :; do
+    IFS= read -r -t "$timeout_secs" line
+    rc=$?
+    if [ "$rc" -gt 128 ]; then
+      timed_out=1
+      break
+    elif [ "$rc" -ne 0 ]; then
+      break
+    fi
+    content+="${line}"$'\n'
+  done
+  if [ "$timed_out" -eq 1 ]; then
     return 1
   fi
+  [ -n "$line" ] && content+="$line"
   printf '%s' "$content"
   return 0
 }

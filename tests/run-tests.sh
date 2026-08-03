@@ -2475,6 +2475,154 @@ assert_exit_code "compose: docker ps の列挙に失敗しても --ls 自体は�
   0 "$COMPOSE_PS_FAIL_EXIT"
 
 # ---------------------------------------------------------------------------
+# check-readability.sh: 外部 `timeout` コマンドへの非依存化（回帰防止 #35・レビュー2巡目）
+#
+# #31 の修正で stdin 読み取りを `timeout "$secs" cat` に丸ごと委譲するようになったが、
+# `timeout` は GNU coreutils / BusyBox のコマンドで macOS の既定環境には無い
+# （`gtimeout` のみ）。command not found（status 127）を「入力が来なかった」と
+# 誤判定し、macOS では可読性ガードの PostToolUse フック経路が常時無効化されて
+# いた（#31 が問題視した「入力形式の差でガードが黙って無効化される」のと
+# 同じ事故が環境の差で再現していた）。
+#
+# 修正後は bash 組み込みの `read -t` だけで複数行を読み切り、外部コマンドに
+# 依存しない。ここでは
+#   1) 末尾に改行の無い入力でも最終行（file_path）を取りこぼさないこと
+#   2) PATH から timeout/gtimeout を完全に排除した環境でも、複数行JSONの
+#      違反検出・クリーン判定・タイムアウト・--gitのハング防止が
+#      引き続き機能すること
+# を確認する。
+# ---------------------------------------------------------------------------
+
+echo "== check-readability.sh（外部timeoutコマンドへの非依存化・回帰防止 #35） =="
+
+RG35_TMP_REPO="$(make_temp_repo)"
+RG35_VIOLATION_FILE="violation.txt"
+(
+  cd "$RG35_TMP_REPO" || exit 1
+  head -c 3000 /dev/zero | tr '\0' 'A' > "$RG35_VIOLATION_FILE"
+) >/dev/null 2>&1
+
+# --- 末尾に改行の無いフックJSONでも最終行(file_path)を取りこぼさず違反を検出する ---
+RG35_NO_TRAILING_NEWLINE_JSON="$(printf '{\n  "tool_input": {\n    "file_path": "%s"\n  }\n}' "$RG35_VIOLATION_FILE")"
+
+# 検証用入力の末尾に改行が無いこと自体を前提として固定しておく
+case "$RG35_NO_TRAILING_NEWLINE_JSON" in
+  *$'\n') fail "検証用入力の末尾に改行が無い（前提）" "末尾に改行がありました" ;;
+  *) pass "検証用入力の末尾に改行が無い（前提）" ;;
+esac
+
+RG35_NO_TRAILING_NEWLINE_EXIT=0
+(
+  cd "$RG35_TMP_REPO" || exit 1
+  printf '%s' "$RG35_NO_TRAILING_NEWLINE_JSON" \
+    | READABILITY_MAX_BASE64=50 bash "$CHECK_READABILITY_SCRIPT" >/dev/null 2>&1
+)
+RG35_NO_TRAILING_NEWLINE_EXIT=$?
+assert_exit_code "末尾に改行の無いフックJSONでも最終行(file_path)を取りこぼさず違反を検出する" 2 "$RG35_NO_TRAILING_NEWLINE_EXIT"
+
+# --- PATHから timeout/gtimeout を排除した環境を構築する ---
+# 特定のディレクトリを丸ごとPATHから外すと、同じディレクトリに同居する
+# grep/sed/awk/git 等の必須コマンドまで失われてしまうため、ファイル名単位で
+# timeout/gtimeout だけを除外したシンボリックリンク集を新設のディレクトリに作る。
+build_path_without_timeout() {
+  local dest="$1"
+  local IFS=':'
+  local p f b
+  for p in $PATH; do
+    [ -n "$p" ] && [ -d "$p" ] || continue
+    for f in "$p"/*; do
+      [ -e "$f" ] || continue
+      b="$(basename "$f")"
+      case "$b" in
+        timeout|gtimeout) continue ;;
+      esac
+      [ -e "${dest}/${b}" ] || ln -sf "$f" "${dest}/${b}" 2>/dev/null
+    done
+  done
+}
+
+RG35_NOTIMEOUT_DIR="$(mktemp -d "${TMPDIR:-/tmp}/dw-test-notimeout-bin.XXXXXX")"
+build_path_without_timeout "$RG35_NOTIMEOUT_DIR"
+RG35_BASH_BIN="$(command -v bash)"
+
+# 構築したPATHに timeout/gtimeout が存在しないこと自体を前提として固定しておく
+# （この前提が崩れていたら以降のテストは無意味なので、まず単独で確認する）。
+if PATH="$RG35_NOTIMEOUT_DIR" command -v timeout >/dev/null 2>&1 \
+  || PATH="$RG35_NOTIMEOUT_DIR" command -v gtimeout >/dev/null 2>&1; then
+  fail "検証用PATHにtimeout/gtimeoutが存在しない（前提）" "timeoutまたはgtimeoutが見つかりました"
+else
+  pass "検証用PATHにtimeout/gtimeoutが存在しない（前提）"
+fi
+
+# --- timeoutコマンドがPATHに無くても、複数行に整形されたフックJSONの違反を検出できる ---
+RG35_MULTILINE_JSON=$(cat <<EOF
+{
+  "session_id": "abc123",
+  "tool_input": {
+    "file_path": "${RG35_VIOLATION_FILE}"
+  },
+  "tool_name": "Write"
+}
+EOF
+)
+
+RG35_MULTILINE_EXIT=0
+(
+  cd "$RG35_TMP_REPO" || exit 1
+  printf '%s' "$RG35_MULTILINE_JSON" \
+    | PATH="$RG35_NOTIMEOUT_DIR" READABILITY_MAX_BASE64=50 "$RG35_BASH_BIN" "$CHECK_READABILITY_SCRIPT" \
+      >/dev/null 2>&1
+)
+RG35_MULTILINE_EXIT=$?
+assert_exit_code "timeoutコマンドがPATHに無くても複数行JSONの違反を検出する" 2 "$RG35_MULTILINE_EXIT"
+
+# --- timeoutコマンドがPATHに無くても、クリーンなファイルはexit 0（誤検出しない） ---
+RG35_CLEAN_FILE="clean-notimeout.txt"
+(
+  cd "$RG35_TMP_REPO" || exit 1
+  printf 'clean file\n' > "$RG35_CLEAN_FILE"
+) >/dev/null 2>&1
+
+RG35_CLEAN_JSON=$(cat <<EOF
+{
+  "tool_input": {
+    "file_path": "${RG35_CLEAN_FILE}"
+  }
+}
+EOF
+)
+
+RG35_CLEAN_EXIT=0
+(
+  cd "$RG35_TMP_REPO" || exit 1
+  printf '%s' "$RG35_CLEAN_JSON" \
+    | PATH="$RG35_NOTIMEOUT_DIR" "$RG35_BASH_BIN" "$CHECK_READABILITY_SCRIPT" >/dev/null 2>&1
+)
+RG35_CLEAN_EXIT=$?
+assert_exit_code "timeoutコマンドがPATHに無くてもクリーンなファイルはexit 0（誤検出しない）" 0 "$RG35_CLEAN_EXIT"
+
+# --- timeoutコマンドがPATHに無くても、入力が来ない場合はハングせずタイムアウトしてexit 0 ---
+RG35_NOINPUT_EXIT=0
+(
+  cd "$RG35_TMP_REPO" || exit 1
+  timeout 8 env READABILITY_STDIN_TIMEOUT=1 PATH="$RG35_NOTIMEOUT_DIR" "$RG35_BASH_BIN" \
+    "$CHECK_READABILITY_SCRIPT" < <(sleep 30) >/dev/null 2>&1
+)
+RG35_NOINPUT_EXIT=$?
+assert_exit_code "timeoutコマンドがPATHに無くても、入力が来ない場合はハングせずタイムアウトしてexit 0で素通りする" \
+  0 "$RG35_NOINPUT_EXIT"
+
+# --- timeoutコマンドがPATHに無くても、stdinを開いたまま--gitを叩けば即座に返る（ハング再発なし） ---
+RG35_GIT_HANG_EXIT=0
+(
+  cd "$RG35_TMP_REPO" || exit 1
+  timeout 8 env PATH="$RG35_NOTIMEOUT_DIR" "$RG35_BASH_BIN" "$CHECK_READABILITY_SCRIPT" --git \
+    < <(sleep 30) >/dev/null 2>&1
+)
+RG35_GIT_HANG_EXIT=$?
+assert_exit_code "timeoutコマンドがPATHに無くても、stdinを開いたまま--gitを叩けば即座に返る" 0 "$RG35_GIT_HANG_EXIT"
+
+# ---------------------------------------------------------------------------
 # 結果集計
 # ---------------------------------------------------------------------------
 
