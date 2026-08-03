@@ -50,7 +50,11 @@ gh issue view "$TASK_NUMBER"
 
 ### 2. 関連コードの調査
 
-- 親Epic issueから仕様書・計画書を読む: `gh issue view [epic番号]`
+- **親Epic issueの本文（仕様書・計画書）は、Task issue の記載だけでは実装に着手できない場合に
+  限って読む**（`gh issue view [epic番号]`）。planner はタスクを自己完結させる責務を負っているため、
+  通常は Task issue 本文だけで実装できるはずである。Epic 本文を読んだ場合は、Task issue の
+  どの情報が不足していたかを完了報告に含める（自己完結化が足りていない箇所を planner に
+  フィードバックするため）
 - プロジェクトの指示ファイルを読んでルール・アーキテクチャ規約を把握する
 - 関連する既存コードを把握する
 
@@ -164,6 +168,9 @@ $ git log --oneline -1 $(git merge-base [WAVE_BASE] HEAD)
 
 ### 変更ファイル
 - [ファイル一覧]
+
+### Epic本文の参照（読んだ場合のみ）
+- 不足していた情報: [Task issueに無かった情報]
 
 ### テスト結果（サンドボックス内）
 実行したコマンドの全文:
