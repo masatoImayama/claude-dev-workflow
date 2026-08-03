@@ -97,6 +97,7 @@ copy_sandbox_scripts() {
   mkdir -p "${dest}/scripts/lib"
   cp "${REPO_ROOT}/scripts/sandbox-exec.sh"    "${dest}/scripts/sandbox-exec.sh"
   cp "${REPO_ROOT}/scripts/resolve-sandbox.sh" "${dest}/scripts/resolve-sandbox.sh"
+  cp "${REPO_ROOT}/scripts/lib/mount-path.sh"           "${dest}/scripts/lib/mount-path.sh"
   cp "${REPO_ROOT}/scripts/lib/container-membership.sh" "${dest}/scripts/lib/container-membership.sh"
   cp "${REPO_ROOT}/scripts/lib/compose-conflicts.sh"    "${dest}/scripts/lib/compose-conflicts.sh"
   cp "${REPO_ROOT}/Dockerfile.dev"             "${dest}/Dockerfile.dev"
@@ -115,6 +116,7 @@ copy_sandbox_scripts_no_dockerfile() {
   mkdir -p "${dest}/scripts/lib"
   cp "${REPO_ROOT}/scripts/sandbox-exec.sh"    "${dest}/scripts/sandbox-exec.sh"
   cp "${REPO_ROOT}/scripts/resolve-sandbox.sh" "${dest}/scripts/resolve-sandbox.sh"
+  cp "${REPO_ROOT}/scripts/lib/mount-path.sh"           "${dest}/scripts/lib/mount-path.sh"
   cp "${REPO_ROOT}/scripts/lib/container-membership.sh" "${dest}/scripts/lib/container-membership.sh"
   cp "${REPO_ROOT}/scripts/lib/compose-conflicts.sh"    "${dest}/scripts/lib/compose-conflicts.sh"
   (
@@ -273,6 +275,32 @@ else
   pass "--epic 付き --print-plan も docker を起動しない"
 fi
 
+# --- --epic に値が無いまま渡された場合は無限ループせず明快なエラーで停止する ---
+# shift 2 が失敗して $# が減らないまま while ループが回り続ける不具合があった
+# （実測: timeout 8 bash scripts/sandbox-exec.sh --epic は exit 124 だった）。
+if command -v timeout >/dev/null 2>&1; then
+  EPIC_NO_VALUE_STDERR="$(
+    cd "$PRINT_PLAN_REPO" || exit 1
+    PATH="${FAKE_BIN_DIR}:${PATH}" timeout 8 bash scripts/sandbox-exec.sh --epic 2>&1 1>/dev/null
+  )"
+  EPIC_NO_VALUE_EXIT=$?
+
+  if [ "$EPIC_NO_VALUE_EXIT" -eq 124 ]; then
+    fail "--epic に値が無い場合は無限ループしない" "timeout（exit 124）で停止しました"
+  elif [ "$EPIC_NO_VALUE_EXIT" -eq 0 ]; then
+    fail "--epic に値が無い場合は非0で終了する" "exit=0"
+  else
+    pass "--epic に値が無い場合は無限ループせず非0で終了する"
+  fi
+
+  case "$EPIC_NO_VALUE_STDERR" in
+    *"--epic"*) pass "--epic に値が無い場合のエラーに --epic の記載がある" ;;
+    *) fail "--epic に値が無い場合のエラーに --epic の記載がある" "stderr=[${EPIC_NO_VALUE_STDERR}]" ;;
+  esac
+else
+  skip "--epic に値が無い場合は無限ループせず明快なエラーで停止する" "timeout コマンドが利用できません"
+fi
+
 # ---------------------------------------------------------------------------
 # ケース1〜6: パス解決とコンテナ名の一致（Epic #3 仕様書「5. 検証方針」のケース1〜6、Task #5）
 #
@@ -366,10 +394,51 @@ CASE3_CACHE="$(plan_value cache_volume "$CASE3_OUTPUT")"
 assert_eq "ケース6: cache_volume はリポジトリ単位（worktree から叩いても同じ）" "$CASE1_CACHE" "$CASE3_CACHE"
 
 # ---------------------------------------------------------------------------
-# ケース7: container_belongs_to_repo（Docker 非依存の所属判定関数、Task #6）
+# ケース7a: normalize_mount_source（Docker 非依存の純粋関数、issue #25）
 #
-# label あり／label なしの旧命名残骸／他リポジトリの3パターンを、docker を一切
+# Windows + Docker Desktop の bind mount .Source（/run/desktop/mnt/host/<drive>/...）と
+# pwd -W によるホスト側パス（<DRIVE>:/...）を、大小文字・区切りを揃えた同一表現に
+# 正規化できることを、docker を一切起動せずに直接検証する。
+# ---------------------------------------------------------------------------
+
+echo "== normalize_mount_source（マウント元の正規化・Docker 非依存・issue #25） =="
+
+# shellcheck source=../scripts/lib/mount-path.sh
+. "${REPO_ROOT}/scripts/lib/mount-path.sh"
+
+assert_eq "normalize_mount_source: Docker Desktop 形式 (/run/desktop/mnt/host/<drive>/...) を <DRIVE>:/... へ変換する" \
+  "C:/users/mimay/documents/github/dev-workflow" \
+  "$(normalize_mount_source "/run/desktop/mnt/host/c/Users/mimay/Documents/github/dev-workflow")"
+
+assert_eq "normalize_mount_source: pwd -W 形式（既に <DRIVE>:/...）も同じ表現に正規化する" \
+  "C:/users/mimay/documents/github/dev-workflow" \
+  "$(normalize_mount_source "C:/Users/mimay/Documents/github/dev-workflow")"
+
+assert_eq "normalize_mount_source: /mnt/<drive>/...（WSL）も同じ表現に正規化する" \
+  "C:/users/mimay/documents/github/dev-workflow" \
+  "$(normalize_mount_source "/mnt/c/Users/mimay/Documents/github/dev-workflow")"
+
+assert_eq "normalize_mount_source: //<drive>/...（Git Bash 等）も同じ表現に正規化する" \
+  "C:/users/mimay/documents/github/dev-workflow" \
+  "$(normalize_mount_source "//c/Users/mimay/Documents/github/dev-workflow")"
+
+assert_eq "normalize_mount_source: バックスラッシュ区切りもスラッシュへ統一する" \
+  "C:/users/mimay/repo" \
+  "$(normalize_mount_source 'C:\Users\mimay\repo')"
+
+assert_eq "normalize_mount_source: ドライブ形式でない通常の Unix パスは大小文字を変えずそのまま返す" \
+  "/home/User/Repo" \
+  "$(normalize_mount_source "/home/User/Repo")"
+
+# ---------------------------------------------------------------------------
+# ケース7b: container_belongs_to_repo（Docker 非依存の所属判定関数、Task #6 / issue #29）
+#
+# label あり／label なしの旧命名残骸／他リポジトリの各パターンに加え、
+# dev-workflow.root label による同名 basename・別 root の判別（issue #29）と、
+# Docker Desktop 形式マウント元の正規化済み比較（issue #25）を、docker を一切
 # 起動せずに純粋関数として直接検証する。
+#
+# シグネチャ: container_belongs_to_repo <label_repo> <label_root> <mount_source> <host_root> <project>
 # ---------------------------------------------------------------------------
 
 echo "== container_belongs_to_repo（所属判定・Docker 非依存） =="
@@ -379,46 +448,87 @@ echo "== container_belongs_to_repo（所属判定・Docker 非依存） =="
 
 HOST_ROOT_SAMPLE="/home/user/repo"
 
-if container_belongs_to_repo "myrepo" "" "$HOST_ROOT_SAMPLE" "myrepo"; then
-  pass "label の repo が一致すれば対象に含まれる"
+if container_belongs_to_repo "myrepo" "$HOST_ROOT_SAMPLE" "" "$HOST_ROOT_SAMPLE" "myrepo"; then
+  pass "label の repo と root label が一致すれば対象に含まれる"
 else
-  fail "label の repo が一致すれば対象に含まれる"
+  fail "label の repo と root label が一致すれば対象に含まれる"
 fi
 
-if container_belongs_to_repo "otherrepo" "${HOST_ROOT_SAMPLE}/anything" "$HOST_ROOT_SAMPLE" "myrepo"; then
+if container_belongs_to_repo "myrepo" "/home/user2/repo" "" "$HOST_ROOT_SAMPLE" "myrepo"; then
+  fail "同名 basename でも root label が不一致なら対象に含まれない（issue #29）" "含まれてしまいました"
+else
+  pass "同名 basename でも root label が不一致なら対象に含まれない（issue #29）"
+fi
+
+if container_belongs_to_repo "otherrepo" "" "${HOST_ROOT_SAMPLE}/anything" "$HOST_ROOT_SAMPLE" "myrepo"; then
   fail "label の repo が不一致なら対象に含まれない" "含まれてしまいました（マウント元が一致していても label 不一致を優先すべき）"
 else
   pass "label の repo が不一致なら対象に含まれない"
 fi
 
-if container_belongs_to_repo "" "${HOST_ROOT_SAMPLE}/.claude/worktrees/agent-old" "$HOST_ROOT_SAMPLE" "myrepo"; then
+if container_belongs_to_repo "myrepo" "" "${HOST_ROOT_SAMPLE}/anything" "$HOST_ROOT_SAMPLE" "myrepo"; then
+  pass "root label が空（旧コンテナ）の場合はマウント元判定にフォールバックする"
+else
+  fail "root label が空（旧コンテナ）の場合はマウント元判定にフォールバックする"
+fi
+
+if container_belongs_to_repo "myrepo" "" "/home/user/other-repo/subdir" "$HOST_ROOT_SAMPLE" "myrepo"; then
+  fail "root label が空でもマウント元が別リポジトリなら対象に含まれない" "含まれてしまいました"
+else
+  pass "root label が空でもマウント元が別リポジトリなら対象に含まれない"
+fi
+
+if container_belongs_to_repo "" "" "${HOST_ROOT_SAMPLE}/.claude/worktrees/agent-old" "$HOST_ROOT_SAMPLE" "myrepo"; then
   pass "label なし・マウント元がリポジトリルート配下なら対象に含まれる（旧命名の残骸回収）"
 else
   fail "label なし・マウント元がリポジトリルート配下なら対象に含まれる"
 fi
 
-if container_belongs_to_repo "" "$HOST_ROOT_SAMPLE" "$HOST_ROOT_SAMPLE" "myrepo"; then
+if container_belongs_to_repo "" "" "$HOST_ROOT_SAMPLE" "$HOST_ROOT_SAMPLE" "myrepo"; then
   pass "label なし・マウント元がリポジトリルート自身でも対象に含まれる"
 else
   fail "label なし・マウント元がリポジトリルート自身でも対象に含まれる"
 fi
 
-if container_belongs_to_repo "" "/home/user/other-repo/subdir" "$HOST_ROOT_SAMPLE" "myrepo"; then
+if container_belongs_to_repo "" "" "/home/user/other-repo/subdir" "$HOST_ROOT_SAMPLE" "myrepo"; then
   fail "label なし・マウント元が別リポジトリなら対象に含まれない" "含まれてしまいました"
 else
   pass "label なし・マウント元が別リポジトリなら対象に含まれない"
 fi
 
-if container_belongs_to_repo "" "" "$HOST_ROOT_SAMPLE" "myrepo"; then
+if container_belongs_to_repo "" "" "" "$HOST_ROOT_SAMPLE" "myrepo"; then
   fail "label もマウント元も無ければ対象に含まれない" "含まれてしまいました"
 else
   pass "label もマウント元も無ければ対象に含まれない"
 fi
 
+# --- issue #25: label なし・Docker Desktop 形式のマウント元でも正規化して同一ツリーと判定する ---
+if container_belongs_to_repo "" "" "/run/desktop/mnt/host/c/Users/mimay/Documents/github/dev-workflow" \
+    "C:/Users/mimay/Documents/github/dev-workflow" "dev-workflow"; then
+  pass "label なし・Docker Desktop 形式のマウント元でも正規化して同一ツリーと判定する（issue #25）"
+else
+  fail "label なし・Docker Desktop 形式のマウント元でも正規化して同一ツリーと判定する（issue #25）"
+fi
+
+if container_belongs_to_repo "" "" "/run/desktop/mnt/host/c/Users/mimay/Documents/github/other-repo" \
+    "C:/Users/mimay/Documents/github/dev-workflow" "dev-workflow"; then
+  fail "Docker Desktop 形式でも別ツリーなら対象に含まれない" "含まれてしまいました"
+else
+  pass "Docker Desktop 形式でも別ツリーなら対象に含まれない"
+fi
+
+# --- issue #29: root label が Docker Desktop 形式・pwd -W 形式など異なる表現でも正規化して一致する ---
+if container_belongs_to_repo "myrepo" "/run/desktop/mnt/host/c/Users/mimay/repo" "" \
+    "C:/Users/mimay/repo" "myrepo"; then
+  pass "root label が別表現（Docker Desktop 形式）でも正規化して一致すれば対象に含まれる（issue #29）"
+else
+  fail "root label が別表現（Docker Desktop 形式）でも正規化して一致すれば対象に含まれる（issue #29）"
+fi
+
 # ---------------------------------------------------------------------------
 # ケース8: --ls / --down --all（偽 docker で label・マウント元を注入し、実際の docker を起動せず検証する）
 #
-# 偽 docker は DW_TEST_MANIFEST（name|managed|repo|epic|image|status|created|mount_source
+# 偽 docker は DW_TEST_MANIFEST（name|managed|repo|epic|image|status|created|mount_source|root_label
 # の '|' 区切り行）を読み、docker ps / docker container inspect / docker rm を模擬する。
 # `docker rm` は本物を一切呼ばず、DW_TEST_RM_LOG に対象名を追記するだけにする。
 # ---------------------------------------------------------------------------
@@ -439,15 +549,18 @@ DW_TEST_MANIFEST="$(mktemp "${TMPDIR:-/tmp}/dw-test-manifest.XXXXXX")"
 DW_TEST_RM_LOG="$(mktemp "${TMPDIR:-/tmp}/dw-test-rmlog.XXXXXX")"
 : > "$DW_TEST_RM_LOG"
 
-# 1) label ありで現リポジトリに属するコンテナ（現行の起動中コンテナを模す）
+# 1) label ありで現リポジトリに属するコンテナ（現行の起動中コンテナを模す。root label も一致）
 # 2) label なしの旧命名残骸で、マウント元が現リポジトリのルート配下（回収されるべき）
 # 3) label ありで他リポジトリに属するコンテナ（--down --all の対象に含まれてはいけない）
 # 4) label なしで、マウント元が他リポジトリ配下（対象に含まれてはいけない）
+# 5) label ありで repo（basename）は一致するが root label が異なる（別クローン。issue #29。
+#    --down --all の対象に含まれてはいけない）
 cat > "$DW_TEST_MANIFEST" <<MANIFEST
-dw-sandbox-${LS_REPO_BASENAME}|1|${LS_REPO_BASENAME}||dev-sandbox:${LS_REPO_BASENAME}|running|2024-01-01T00:00:00Z|${LS_HOST_ROOT}
-dw-sandbox-${LS_REPO_BASENAME}-legacy|||||exited|2023-01-01T00:00:00Z|${LS_HOST_ROOT}/.claude/worktrees/agent-old
-dw-sandbox-otherrepo|1|otherrepo||dev-sandbox:otherrepo|running|2024-02-02T00:00:00Z|/home/user/otherrepo
-dw-sandbox-otherrepo-legacy|||||exited|2023-03-03T00:00:00Z|/home/user/otherrepo/subdir
+dw-sandbox-${LS_REPO_BASENAME}|1|${LS_REPO_BASENAME}||dev-sandbox:${LS_REPO_BASENAME}|running|2024-01-01T00:00:00Z|${LS_HOST_ROOT}|${LS_HOST_ROOT}
+dw-sandbox-${LS_REPO_BASENAME}-legacy|||||exited|2023-01-01T00:00:00Z|${LS_HOST_ROOT}/.claude/worktrees/agent-old|
+dw-sandbox-otherrepo|1|otherrepo||dev-sandbox:otherrepo|running|2024-02-02T00:00:00Z|/home/user/otherrepo|/home/user/otherrepo
+dw-sandbox-otherrepo-legacy|||||exited|2023-03-03T00:00:00Z|/home/user/otherrepo/subdir|
+dw-sandbox-${LS_REPO_BASENAME}-otherclone|1|${LS_REPO_BASENAME}||dev-sandbox:${LS_REPO_BASENAME}|running|2024-03-03T00:00:00Z|/home/otheruser/${LS_REPO_BASENAME}|/home/otheruser/${LS_REPO_BASENAME}
 MANIFEST
 
 FAKE_DOCKER_MANIFEST_DIR="$(mktemp -d "${TMPDIR:-/tmp}/dw-test-fakebin-manifest.XXXXXX")"
@@ -496,8 +609,9 @@ case "${1:-}" in
     done
     line="$(manifest_line "$name")"
     [ -n "$line" ] || exit 1
-    IFS='|' read -r f_name f_managed f_repo f_epic f_image f_status f_created f_mount <<< "$line"
+    IFS='|' read -r f_name f_managed f_repo f_epic f_image f_status f_created f_mount f_root <<< "$line"
     case "$tmpl" in
+      *'dev-workflow.root'*) printf '%s\n' "$f_root" ;;
       *'dev-workflow.repo'*) printf '%s\n' "$f_repo" ;;
       *'dev-workflow.epic'*) printf '%s\n' "$f_epic" ;;
       *'Mounts'*)            printf '%s\n' "$f_mount" ;;
@@ -588,6 +702,12 @@ else
   pass "--down --all は他リポジトリのコンテナを列挙しない"
 fi
 
+if printf '%s\n' "$DOWN_ALL_OUTPUT" | grep -q "otherclone"; then
+  fail "--down --all は repo(basename) が同じでも root label が異なるコンテナを列挙しない（issue #29）" "output=[${DOWN_ALL_OUTPUT}]"
+else
+  pass "--down --all は repo(basename) が同じでも root label が異なるコンテナを列挙しない（issue #29）"
+fi
+
 RM_LOG_CONTENT="$(cat "$DW_TEST_RM_LOG")"
 RM_LOG_COUNT="$(printf '%s\n' "$RM_LOG_CONTENT" | grep -c . || true)"
 assert_eq "--down --all は自リポジトリ分の2件だけを docker rm する" "2" "$RM_LOG_COUNT"
@@ -597,6 +717,34 @@ if printf '%s\n' "$RM_LOG_CONTENT" | grep -q "otherrepo"; then
 else
   pass "--down --all は他リポジトリのコンテナを削除しない"
 fi
+
+if printf '%s\n' "$RM_LOG_CONTENT" | grep -q "otherclone"; then
+  fail "--down --all は repo(basename) が同じでも root label が異なるコンテナを削除しない（issue #29）" "rm_log=[${RM_LOG_CONTENT}]"
+else
+  pass "--down --all は repo(basename) が同じでも root label が異なるコンテナを削除しない（issue #29）"
+fi
+
+# --- --down（単体）: 削除対象名を表示し、現在の repo+epic のコンテナ1個だけを rm する（issue #30） ---
+: > "$DW_TEST_RM_LOG"
+DOWN_SINGLE_OUTPUT="$(
+  cd "$LS_REPO" || exit 1
+  DW_TEST_MANIFEST="$DW_TEST_MANIFEST" DW_TEST_RM_LOG="$DW_TEST_RM_LOG" \
+    PATH="${FAKE_DOCKER_MANIFEST_DIR}:${PATH}" \
+    bash scripts/sandbox-exec.sh --down
+)"
+
+case "$DOWN_SINGLE_OUTPUT" in
+  *"削除対象のコンテナ: dw-sandbox-${LS_REPO_BASENAME}"*)
+    pass "--down（単体）は削除対象名を表示する（issue #30）" ;;
+  *)
+    fail "--down（単体）は削除対象名を表示する（issue #30）" "output=[${DOWN_SINGLE_OUTPUT}]" ;;
+esac
+
+DOWN_SINGLE_RM_CONTENT="$(cat "$DW_TEST_RM_LOG")"
+DOWN_SINGLE_RM_COUNT="$(printf '%s\n' "$DOWN_SINGLE_RM_CONTENT" | grep -c . || true)"
+assert_eq "--down（単体）は当該コンテナ1件だけを docker rm する（issue #30）" "1" "$DOWN_SINGLE_RM_COUNT"
+assert_eq "--down（単体）は現在の repo+epic のコンテナ名を rm する（issue #30）" \
+  "dw-sandbox-${LS_REPO_BASENAME}" "$DOWN_SINGLE_RM_CONTENT"
 
 # ---------------------------------------------------------------------------
 # ケース9: --reset-cache のガード（列挙・running 検出・--force。Task #7、Epic #3 仕様書 4.6）
@@ -770,6 +918,9 @@ IMG_DOCKERFILE="$(plan_value dockerfile "$IMG_PLAN_AFTER_CHANGE")"
 IMG_BUILD_CONTEXT="$(plan_value build_context "$IMG_PLAN_AFTER_CHANGE")"
 IMG_CONTAINER="$(plan_value container "$IMG_PLAN_AFTER_CHANGE")"
 IMG_MOUNT_SOURCE="$(plan_value mount_source "$IMG_PLAN_AFTER_CHANGE")"
+IMG_WORKDIR="$(plan_value workdir "$IMG_PLAN_AFTER_CHANGE")"
+IMG_REPO_NAME="$(plan_value repo "$IMG_PLAN_AFTER_CHANGE")"
+IMG_HOST_ROOT="$(plan_value repo_root "$IMG_PLAN_AFTER_CHANGE")"
 
 # --- 内容が同じなら別リポジトリ（worktree 相当）でも hash が変わらない ---
 IMG_REPO2="$(make_temp_repo)"
@@ -875,14 +1026,16 @@ case "${1:-}" in
   exec)
     shift
     cmd=""
+    workdir=""
     while [ $# -gt 0 ]; do
       case "$1" in
-        -w) shift 2 ;;
+        -w) workdir="$2"; shift 2 ;;
         sh) shift ;;
         -c) cmd="$2"; shift 2 ;;
         *)  shift ;;
       esac
     done
+    printf '%s\n' "$workdir" >> "${DW_IMG_EXEC_LOG:?DW_IMG_EXEC_LOG is required}"
     sh -c "$cmd"
     exit $?
     ;;
@@ -896,6 +1049,7 @@ chmod +x "${FAKE_DOCKER_IMAGE_DIR}/docker"
 IMG_TEST_LOG="$(mktemp "${TMPDIR:-/tmp}/dw-test-imglog.XXXXXX")"
 IMG_TEST_RM_LOG="$(mktemp "${TMPDIR:-/tmp}/dw-test-imgrmlog.XXXXXX")"
 IMG_TEST_RUN_LOG="$(mktemp "${TMPDIR:-/tmp}/dw-test-imgrunlog.XXXXXX")"
+IMG_TEST_EXEC_LOG="$(mktemp "${TMPDIR:-/tmp}/dw-test-imgexeclog.XXXXXX")"
 IMG_TEST_STATE_FILE="$(mktemp "${TMPDIR:-/tmp}/dw-test-imgstate.XXXXXX")"
 IMG_TEST_RUNNING_FILE="$(mktemp "${TMPDIR:-/tmp}/dw-test-imgrunning.XXXXXX")"
 
@@ -909,6 +1063,7 @@ run_img_case() {
   : > "$IMG_TEST_LOG"
   : > "$IMG_TEST_RM_LOG"
   : > "$IMG_TEST_RUN_LOG"
+  : > "$IMG_TEST_EXEC_LOG"
   printf '%s' "$container_exists" > "$IMG_TEST_STATE_FILE"
   printf '%s\n' "$container_running" > "$IMG_TEST_RUNNING_FILE"
 
@@ -917,6 +1072,7 @@ run_img_case() {
     DW_IMG_LOG="$IMG_TEST_LOG" \
       DW_IMG_RM_LOG="$IMG_TEST_RM_LOG" \
       DW_IMG_RUN_LOG="$IMG_TEST_RUN_LOG" \
+      DW_IMG_EXEC_LOG="$IMG_TEST_EXEC_LOG" \
       DW_IMG_CONTAINER_STATE="$IMG_TEST_STATE_FILE" \
       DW_IMG_CONTAINER_RUNNING_STATE="$IMG_TEST_RUNNING_FILE" \
       DW_IMG_CONTAINER_IMAGE_ID="$container_image_id" \
@@ -936,6 +1092,50 @@ assert_exit_code "イメージ未存在時: 実行全体が成功する" 0 "$IMG
 IMG_A_BUILD_LINE="$(grep '^build ' "$IMG_TEST_LOG" | head -n1)"
 assert_eq "イメージ未存在時: docker build が正しい引数で呼ばれる" \
   "build -f ${IMG_DOCKERFILE} -t ${IMG_IMAGE} ${IMG_BUILD_CONTEXT}" "$IMG_A_BUILD_LINE"
+
+# --- コンテナが無い場合の docker run に label / マウント / workdir が正しく渡る（issue #30） ---
+# これまで DW_IMG_RUN_LOG は記録するだけで一度もアサートしていなかった
+# （label ベースの後片付け全体がこの配線に依存しているにもかかわらず）。
+IMG_A_RUN_LINE="$(head -n1 "$IMG_TEST_RUN_LOG")"
+
+case "$IMG_A_RUN_LINE" in
+  *"--label dev-workflow.managed=1"*)
+    pass "イメージ未存在時: docker run に --label dev-workflow.managed=1 が渡る（issue #30）" ;;
+  *)
+    fail "イメージ未存在時: docker run に --label dev-workflow.managed=1 が渡る（issue #30）" "run_line=[${IMG_A_RUN_LINE}]" ;;
+esac
+
+case "$IMG_A_RUN_LINE" in
+  *"--label dev-workflow.repo=${IMG_REPO_NAME}"*)
+    pass "イメージ未存在時: docker run に --label dev-workflow.repo=<repo> が渡る（issue #30）" ;;
+  *)
+    fail "イメージ未存在時: docker run に --label dev-workflow.repo=<repo> が渡る（issue #30）" "run_line=[${IMG_A_RUN_LINE}]" ;;
+esac
+
+case "$IMG_A_RUN_LINE" in
+  *"--label dev-workflow.epic="*)
+    pass "イメージ未存在時: docker run に --label dev-workflow.epic=<epic> が渡る（issue #30）" ;;
+  *)
+    fail "イメージ未存在時: docker run に --label dev-workflow.epic=<epic> が渡る（issue #30）" "run_line=[${IMG_A_RUN_LINE}]" ;;
+esac
+
+case "$IMG_A_RUN_LINE" in
+  *"--label dev-workflow.root=${IMG_HOST_ROOT}"*)
+    pass "イメージ未存在時: docker run に --label dev-workflow.root=<host_root> が渡る（issue #30）" ;;
+  *)
+    fail "イメージ未存在時: docker run に --label dev-workflow.root=<host_root> が渡る（issue #30）" "run_line=[${IMG_A_RUN_LINE}]" ;;
+esac
+
+case "$IMG_A_RUN_LINE" in
+  *"-v ${IMG_MOUNT_SOURCE}:/workspace"*)
+    pass "イメージ未存在時: docker run に -v <mount_source>:/workspace が渡る（issue #30）" ;;
+  *)
+    fail "イメージ未存在時: docker run に -v <mount_source>:/workspace が渡る（issue #30）" "run_line=[${IMG_A_RUN_LINE}]" ;;
+esac
+
+IMG_A_EXEC_WORKDIR="$(head -n1 "$IMG_TEST_EXEC_LOG")"
+assert_eq "イメージ未存在時: docker exec に解決済み workdir が -w で渡る（issue #30）" \
+  "$IMG_WORKDIR" "$IMG_A_EXEC_WORKDIR"
 
 # --- イメージが存在する場合はビルドしない ---
 IMG_B_EXIT=0
@@ -1011,6 +1211,70 @@ assert_eq "イメージID同一時: 既存コンテナを削除しない" "0" "$
 
 IMG_F_RUN_COUNT="$(grep -c '^run ' "$IMG_TEST_LOG" || true)"
 assert_eq "イメージID同一時: コンテナを作り直さない" "0" "$IMG_F_RUN_COUNT"
+
+# ---------------------------------------------------------------------------
+# マウント元不一致による再作成の検証（issue #30）
+#
+# これまでの既存コンテナありケース（E・F）はどちらも container_mount に
+# $IMG_MOUNT_SOURCE をそのまま渡しており、マウント元が期待値と異なる場合に
+# 再作成される分岐（仕様書 4.3 の2。この Epic の「静かに間違ったツリーを
+# 実行しない」ための本体）を検証するケースが存在しなかった。
+#
+# docker_desktop_equivalent は、実際の IMG_MOUNT_SOURCE の形式（Windows の
+# pwd -W 形式か、Linux 等の素のパスか）に応じて「同一ツリーを指す別表現」を
+# 作る。ドライブレター形式なら Docker Desktop の変換済みパス
+# （/run/desktop/mnt/host/<drive>/...）へ、そうでなければバックスラッシュ区切りへ
+# 変換する。どちらの実行環境でも normalize_mount_source が同一表現へ正規化する
+# ことを、実際の sandbox-exec.sh（docker はモック）経由で確認するため。
+# ---------------------------------------------------------------------------
+
+docker_desktop_equivalent() {
+  # docker_desktop_equivalent <mount_source>
+  local src="$1" drive rest
+  case "$src" in
+    [A-Za-z]:/*|[A-Za-z]:)
+      drive="${src%%:*}"
+      rest="${src#*:}"
+      drive="$(printf '%s' "$drive" | tr '[:upper:]' '[:lower:]')"
+      printf '/run/desktop/mnt/host/%s%s' "$drive" "$rest"
+      ;;
+    *)
+      printf '%s' "${src//\//\\}"
+      ;;
+  esac
+}
+
+IMG_MOUNT_EQUIVALENT="$(docker_desktop_equivalent "$IMG_MOUNT_SOURCE")"
+IMG_G_STDERR_FILE="$(mktemp "${TMPDIR:-/tmp}/dw-test-imgg-stderr.XXXXXX")"
+
+# --- (a) container_mount が MOUNT_SOURCE と異なる場合は削除して作り直す ---
+IMG_G_EXIT=0
+run_img_case 1 true "sha256:same" "${IMG_MOUNT_SOURCE}/different-tree" 1 "sha256:same" 'true' \
+  2>"$IMG_G_STDERR_FILE" >/dev/null || IMG_G_EXIT=$?
+assert_exit_code "マウント元不一致時: 実行全体が成功する（issue #30）" 0 "$IMG_G_EXIT"
+
+IMG_G_RM_COUNT="$(grep -c . "$IMG_TEST_RM_LOG" || true)"
+assert_eq "マウント元不一致時: 既存コンテナが削除される（issue #30）" "1" "$IMG_G_RM_COUNT"
+
+IMG_G_RUN_COUNT="$(grep -c '^run ' "$IMG_TEST_LOG" || true)"
+assert_eq "マウント元不一致時: コンテナが作り直される（issue #30）" "1" "$IMG_G_RUN_COUNT"
+
+IMG_G_STDERR="$(cat "$IMG_G_STDERR_FILE")"
+case "$IMG_G_STDERR" in
+  *"別ツリー実行の防止"*) pass "マウント元不一致時: 別ツリー実行の防止の警告が出る（issue #30）" ;;
+  *) fail "マウント元不一致時: 別ツリー実行の防止の警告が出る（issue #30）" "stderr=[${IMG_G_STDERR}]" ;;
+esac
+
+# --- (b) Docker Desktop 形式（等）でも同一ツリーと判定され再作成されない ---
+IMG_H_EXIT=0
+run_img_case 1 true "sha256:same" "$IMG_MOUNT_EQUIVALENT" 1 "sha256:same" 'true' >/dev/null 2>&1 || IMG_H_EXIT=$?
+assert_exit_code "マウント元が別表現でも同一ツリー時: 実行全体が成功する（issue #30）" 0 "$IMG_H_EXIT"
+
+IMG_H_RM_COUNT="$(grep -c . "$IMG_TEST_RM_LOG" || true)"
+assert_eq "マウント元が別表現（Docker Desktop 形式等）でも同一ツリーなら削除しない（issue #25 / #30）" "0" "$IMG_H_RM_COUNT"
+
+IMG_H_RUN_COUNT="$(grep -c '^run ' "$IMG_TEST_LOG" || true)"
+assert_eq "マウント元が別表現（Docker Desktop 形式等）でも同一ツリーなら作り直さない（issue #25 / #30）" "0" "$IMG_H_RUN_COUNT"
 
 # ---------------------------------------------------------------------------
 # ケース10: compose_conflict_warnings（Docker 非依存の衝突検出関数、Task #9）

@@ -57,6 +57,8 @@ set -u
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
+# shellcheck source=lib/mount-path.sh
+. "${SCRIPT_DIR}/lib/mount-path.sh"
 # shellcheck source=lib/container-membership.sh
 . "${SCRIPT_DIR}/lib/container-membership.sh"
 # shellcheck source=lib/compose-conflicts.sh
@@ -77,7 +79,15 @@ ACTION="exec"
 
 while [ $# -gt 0 ]; do
   case "$1" in
-    --epic)        EPIC="${2:-}"; shift 2 ;;
+    --epic)
+      # 値が無いまま渡された場合、shift 2 は失敗して $# が減らず無限ループになる
+      # （実測: 残り引数が1個の状態で --epic を渡すと停止しない）。
+      # 引数個数を検査し、無ければ明快なエラーで停止する。
+      if [ $# -lt 2 ]; then
+        echo "ERROR: --epic には値が必要です" >&2
+        exit 2
+      fi
+      EPIC="$2"; shift 2 ;;
     --warm)        WARM=1; shift ;;
     --down)        ACTION="down"; shift ;;
     --all)         ALL=1; shift ;;
@@ -248,6 +258,7 @@ list_managed_candidate_names() {
 }
 
 MOUNT_SOURCE_TEMPLATE='{{ range .Mounts }}{{ if eq .Destination "/workspace" }}{{ .Source }}{{ end }}{{ end }}'
+LABEL_ROOT_TEMPLATE='{{ index .Config.Labels "dev-workflow.root" }}'
 
 list_managed() {
   local name label_repo label_epic image status created found=0
@@ -270,14 +281,15 @@ list_managed() {
 }
 
 down_all() {
-  local name label_repo mount_source
+  local name label_repo label_root mount_source
   local -a targets=()
 
   while IFS= read -r name; do
     [ -n "$name" ] || continue
     label_repo="$(container_field "$name" '{{ index .Config.Labels "dev-workflow.repo" }}')"
+    label_root="$(container_field "$name" "$LABEL_ROOT_TEMPLATE")"
     mount_source="$(container_field "$name" "$MOUNT_SOURCE_TEMPLATE")"
-    if container_belongs_to_repo "$label_repo" "$mount_source" "$HOST_ROOT" "$PROJECT"; then
+    if container_belongs_to_repo "$label_repo" "$label_root" "$mount_source" "$HOST_ROOT" "$PROJECT"; then
       targets+=("$name")
     fi
   done < <(list_managed_candidate_names)
@@ -305,13 +317,14 @@ down_all() {
 # （他 epic のものも含む）を対象にする。所属判定は down_all と同じ
 # container_belongs_to_repo を再利用し、重複実装しない。
 list_running_containers_in_repo() {
-  local name label_repo mount_source running
+  local name label_repo label_root mount_source running
 
   while IFS= read -r name; do
     [ -n "$name" ] || continue
     label_repo="$(container_field "$name" '{{ index .Config.Labels "dev-workflow.repo" }}')"
+    label_root="$(container_field "$name" "$LABEL_ROOT_TEMPLATE")"
     mount_source="$(container_field "$name" "$MOUNT_SOURCE_TEMPLATE")"
-    container_belongs_to_repo "$label_repo" "$mount_source" "$HOST_ROOT" "$PROJECT" || continue
+    container_belongs_to_repo "$label_repo" "$label_root" "$mount_source" "$HOST_ROOT" "$PROJECT" || continue
     running="$(container_field "$name" '{{.State.Running}}')"
     [ "$running" = "true" ] && printf '%s\n' "$name"
   done < <(list_managed_candidate_names)
@@ -486,8 +499,11 @@ case "$DEV_WORKFLOW_SANDBOX_MODE" in
     if docker container inspect "$CONTAINER" >/dev/null 2>&1; then
       RECREATE=0
 
+      # マウント元の比較は正規化済み（normalize_mount_source）で行う。Windows +
+      # Docker Desktop では .Source が `/run/desktop/mnt/host/c/...` という
+      # Linux 側の変換済みパスで返るため、素の文字列比較では常に不一致になる（issue #25）。
       EXISTING_MOUNT="$(container_field "$CONTAINER" "$MOUNT_SOURCE_TEMPLATE")"
-      if [ -n "$EXISTING_MOUNT" ] && [ "$EXISTING_MOUNT" != "$MOUNT_SOURCE" ]; then
+      if [ -n "$EXISTING_MOUNT" ] && [ "$(normalize_mount_source "$EXISTING_MOUNT")" != "$(normalize_mount_source "$MOUNT_SOURCE")" ]; then
         echo "WARNING: 既存コンテナ ${CONTAINER} のマウント元 (${EXISTING_MOUNT}) が期待値 (${MOUNT_SOURCE}) と異なるため削除して作り直します（別ツリー実行の防止）" >&2
         RECREATE=1
       fi
