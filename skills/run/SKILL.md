@@ -241,6 +241,23 @@ LANES="${DEV_WORKFLOW_MAX_LANES:-3}"
 SKIPPED_CSV=""   # 3回失敗して見送ったタスク番号のカンマ区切り。ループを回すうちに積み上げる
 WAVE_NO=0        # wave ブランチ名に使う通し番号。plan-waves.sh の出力の「wave番号」とは別物
                  # （再計算のたびに wave 1 から始まり直すため、通し番号はここで自前に管理する）
+
+# --- 計測（並列化とオーバーヘッド削減の寄与を分けて読むための実測。詳細は「進捗表示」節） ---
+# 前ウェーブの内訳（次ウェーブ開始時のバナー表示に使う）。ウェーブ1の開始時点では空文字のまま。
+PREV_WAVE_IMPL_SEC=""
+PREV_WAVE_MERGE_SEC=""
+PREV_WAVE_GATE_SEC=""
+# Epic全体の累計（PR本文の集計に使う）
+TOTAL_IMPL_SEC=0
+TOTAL_MERGE_SEC=0
+TOTAL_GATE_SEC=0
+DONE_TASK_COUNT=0   # 統合ゲートを通過して取り込めたタスク数の累計
+
+# 秒数を "Nm Ss" 形式にする（例: 65 -> 1m05s）。追加の依存物（jq等）は使わず `date +%s` の差分のみで計測する
+fmt_duration() {
+  local total_sec="$1"
+  printf '%dm%02ds' "$((total_sec / 60))" "$((total_sec % 60))"
+}
 ```
 
 ### Step 1: ウェーブ計画を取得する
@@ -268,6 +285,10 @@ echo "$PLAN"
 - 処理対象のウェーブが決まったら `WAVE_NO=$((WAVE_NO + 1))` する（wave ブランチ名
   `wave/${EPIC_NUM}/${WAVE_NO}` に使う通し番号。plan-waves.sh の出力の「wave番号」とは別物）
 
+今回のウェーブの内容が決まったら、Step 2 に進む前に進捗バナーを表示する（形式は
+「進捗表示」節を参照。`PREV_WAVE_*` はウェーブ1の実行前は空文字なので「前ウェーブ: (初回のため計測なし)」
+と表示する）。
+
 ### Step 2: WAVE_BASE を記録する
 
 ```bash
@@ -276,6 +297,7 @@ git fetch origin
 git checkout "${EPIC_BRANCH}"
 git pull origin "${EPIC_BRANCH}"
 WAVE_BASE=$(git rev-parse HEAD)
+IMPL_START_SEC=$(date +%s)   # 「実装」フェーズ（Step 3〜4）の計測開始
 ```
 
 **同期はここ（ウェーブの先頭）でだけ行う。** タスクごとには行わない。この `WAVE_BASE` が、
@@ -309,8 +331,11 @@ Task #[番号A] を実装してください（レーン A）。
 - Task issueの記載だけで着手できない場合に限り、親Epic issueの本文を参照すること
 - テストファーストで実装
 - 変更をコミット
+- 作業開始直後に `date +%s` で開始時刻を記録し、報告直前にも `date +%s` で終了時刻を記録すること
 - 報告には「実際に叩いたテストコマンドの全文」「ベース検証の実出力」「レーン記号（A）」
-  「最終的な作業ブランチ名」を含めること（作業ブランチ名は Step 5 の merge-lane.sh で使う）
+  「最終的な作業ブランチ名」「開始時刻・終了時刻（`date +%s` の値、または `HH:MM` 表記でよい）」
+  を含めること（作業ブランチ名は Step 5 の merge-lane.sh で使う。開始・終了時刻は Step 4 の
+  進捗表示で使う）
 
 @generator
 Task #[番号B] を実装してください（レーン B）。
@@ -332,6 +357,22 @@ Claude Code のサブエージェントは**バッチ全員が終わるまで結
 
 品質・設計・セキュリティの観点はここでは見ない。**それらはEpic完了後の一括レビューで見る。**
 
+全サブバッチの完了直後に、実装フェーズの計測を締める:
+
+```bash
+IMPL_END_SEC=$(date +%s)
+IMPL_SEC=$((IMPL_END_SEC - IMPL_START_SEC))
+```
+
+`IMPL_SEC` は「並列化の寄与」を表す実測値（サブバッチの所要時間は最長レーンで決まるバリア同期の
+実測を含む）。各generatorが報告した開始・終了時刻をもとに、レーンごとの結果行を表示する:
+
+```
+レーン結果: A=#5(12:03-12:11 8m00s) B=#10(12:03-12:09 6m00s) C=#11(12:03-12:07 4m12s)
+```
+
+（レーン内ゲートに失敗したレーンは末尾に `失敗` を添える。例: `C=#11(12:03-12:05 失敗)`）
+
 ### Step 5: wave ブランチへレーンを取り込む
 
 全サブバッチ完了後、Epic worktreeでwaveブランチを作成し、（レーン内ゲートに通った）レーンを
@@ -339,6 +380,7 @@ issue番号順に取り込む。
 
 ```bash
 cd "$EPIC_WT"
+MERGE_START_SEC=$(date +%s)   # 「統合」フェーズ（merge-lane.sh群）の計測開始
 
 # 1本目: --create でwaveブランチをWAVE_BASEから作成する
 bash "${CLAUDE_PLUGIN_ROOT}/scripts/merge-lane.sh" \
@@ -349,6 +391,9 @@ bash "${CLAUDE_PLUGIN_ROOT}/scripts/merge-lane.sh" \
 bash "${CLAUDE_PLUGIN_ROOT}/scripts/merge-lane.sh" \
   --wave-branch "wave/${EPIC_NUM}/${WAVE_NO}" --expected-base "$WAVE_BASE" \
   --lane-branch "[レーンBの作業ブランチ]" --task <番号B>
+
+MERGE_END_SEC=$(date +%s)
+MERGE_SEC=$((MERGE_END_SEC - MERGE_START_SEC))
 ```
 
 終了コードで扱いを分岐する:
@@ -371,12 +416,16 @@ bash "${CLAUDE_PLUGIN_ROOT}/scripts/merge-lane.sh" \
 ```bash
 cd "$EPIC_WT"
 git checkout "wave/${EPIC_NUM}/${WAVE_NO}"
+GATE_START_SEC=$(date +%s)   # 「統合ゲート」フェーズの計測開始
 
 # 1) テスト（Docker sandbox内）— 1回にまとめる。落ちたら不合格
 bash "${CLAUDE_PLUGIN_ROOT}/scripts/sandbox-exec.sh" --epic "$EPIC_NUM" '[全テストを走らせるコマンド]'
 
 # 2) 可読性ガード — waveブランチの差分に対して実行（PostToolUseフックと同じ判定）
 bash "${CLAUDE_PLUGIN_ROOT}/scripts/check-readability.sh" --git
+
+GATE_END_SEC=$(date +%s)
+GATE_SEC=$((GATE_END_SEC - GATE_START_SEC))
 ```
 
 内容の要件は従来と同じ（プロジェクトの全テストを1コマンドで／対象の選択をgeneratorに委ねない／
@@ -433,9 +482,30 @@ git push origin "${EPIC_BRANCH}"
 
 1. 取り込めたレーンに対応するTask issueをクローズする: `gh issue close [番号]`
 2. Epic issueの進捗を更新する
-3. → Step 1 に戻る（次のウェーブへ）
+3. このウェーブの計測を確定し、次ウェーブのバナー表示・PR本文の集計に使う値を更新する:
+
+```bash
+WAVE_TOTAL_SEC=$((IMPL_SEC + MERGE_SEC + GATE_SEC))
+echo "前ウェーブ: 実装 $(fmt_duration "$IMPL_SEC") + 統合 $(fmt_duration "$MERGE_SEC") + 統合ゲート $(fmt_duration "$GATE_SEC") = $(fmt_duration "$WAVE_TOTAL_SEC")"
+
+PREV_WAVE_IMPL_SEC="$IMPL_SEC"
+PREV_WAVE_MERGE_SEC="$MERGE_SEC"
+PREV_WAVE_GATE_SEC="$GATE_SEC"
+
+TOTAL_IMPL_SEC=$((TOTAL_IMPL_SEC + IMPL_SEC))
+TOTAL_MERGE_SEC=$((TOTAL_MERGE_SEC + MERGE_SEC))
+TOTAL_GATE_SEC=$((TOTAL_GATE_SEC + GATE_SEC))
+DONE_TASK_COUNT=$((DONE_TASK_COUNT + N))   # N = 直前の「取り込めたレーンに対応するTask issueをクローズする」で閉じた件数
+```
+
+4. → Step 1 に戻る（次のウェーブへ）
 
 全ウェーブが完了したら **「Epic一括レビュー」** へ進む。
+
+**統合ゲートに失敗した場合（Step 8 のリカバリを経由した場合）は、この計測更新を行わない。**
+`PREV_WAVE_*` と累計は「統合ゲートを通過して実際に取り込めたウェーブ」だけを反映する
+（失敗した試行の時間まで合算すると、並列化とオーバーヘッド削減の寄与という本来の目的が
+読み取れない数字になるため）。
 
 ### Step 8: 失敗時のリカバリ
 
@@ -505,19 +575,71 @@ bash "${CLAUDE_PLUGIN_ROOT}/scripts/sandbox-exec.sh" --down --all   # 現在の�
 
 ## 進捗表示
 
-各ウェーブの開始時に進捗を表示する:
+本Epicは並列化とオーバーヘッド削減の2つを同時に行うため、**両者の寄与を別々に読めるように**
+計測を分けて表示する（「実装」= 並列化の寄与、「統合」「統合ゲート」= 並列化が追加で持ち込むコスト・
+直列に残るコスト）。時刻の取得に追加の依存物（`jq` 等）は使わず、`date +%s` の差分だけで計測する
+（`fmt_duration` ヘルパーは「自律ループ」節冒頭で定義済み）。
+
+### Step 1 の直後（ウェーブ開始時）に表示するバナー
 
 ```
 ═══════════════════════════════════════
   Run: Epic $ARGUMENTS [YOLO / lanes=[LANES]]
-  ブランチ: epic/epicXX/[機能名]
-  Sandbox: Docker
-  進捗: [完了数] / [全タスク数] tasks（スキップ [スキップ数] 件）
-  ウェーブ: [ウェーブ番号]   レーン: A=#[番号] B=#[番号] C=#[番号]
+  ウェーブ: [ウェーブ番号] / [総ウェーブ数]   タスク: [完了数] / [全タスク数] 完了（スキップ [スキップ数]）
+  レーン: A=#[番号A] B=#[番号B] C=#[番号C]
+  前ウェーブ: [PREV_WAVE_*が空なら「(初回のため計測なし)」／それ以外は下記の内訳]
 ═══════════════════════════════════════
 ```
 
-各レーンの所要時間・統合／統合ゲートの所要時間の詳細な計測表示は別タスクで扱う。
+「前ウェーブ」の行は次の形式（Step 7 で確定させた `PREV_WAVE_*` を使う）:
+
+```bash
+if [ -n "$PREV_WAVE_IMPL_SEC" ]; then
+  PREV_TOTAL_SEC=$((PREV_WAVE_IMPL_SEC + PREV_WAVE_MERGE_SEC + PREV_WAVE_GATE_SEC))
+  echo "前ウェーブ: 実装 $(fmt_duration "$PREV_WAVE_IMPL_SEC") + 統合 $(fmt_duration "$PREV_WAVE_MERGE_SEC") + 統合ゲート $(fmt_duration "$PREV_WAVE_GATE_SEC") = $(fmt_duration "$PREV_TOTAL_SEC")"
+else
+  echo "前ウェーブ: (初回のため計測なし)"
+fi
+```
+
+「[総ウェーブ数]」は `plan-waves.sh` の出力からは得られない（残タスクからの再計算のため、既に
+完了したウェーブ数を含む総数は自明ではない）。**Epic issueの「タスク一覧」節に列挙されたウェーブ
+数を初回に数えて控えておき、以降はその値を使い回す**（スキップの伝播で後続ウェーブが減っても、
+「予定していたウェーブ数」としてそのまま使ってよい。厳密な再計算は要求しない）。
+
+### Step 4 の直後（サブバッチ完了時）に表示するレーン結果
+
+```
+レーン結果: A=#5(12:03-12:11 8m00s) B=#10(12:03-12:09 6m00s) C=#11(12:03-12:07 4m12s)
+```
+
+各generatorが報告した開始・終了時刻（Step 3 のプロンプトで要求済み）をもとに組み立てる。
+レーン内ゲートに失敗したレーンは末尾に `失敗` を添える。
+
+### Step 7 の直後（ウェーブ完了時）に表示するウェーブ合計
+
+```bash
+echo "前ウェーブ: 実装 $(fmt_duration "$IMPL_SEC") + 統合 $(fmt_duration "$MERGE_SEC") + 統合ゲート $(fmt_duration "$GATE_SEC") = $(fmt_duration "$WAVE_TOTAL_SEC")"
+```
+
+これは次ウェーブのバナーで使う文言と同じ（`PREV_WAVE_*` に格納した値をそのまま使う）。
+
+### PR本文への集計（Epic完了時）
+
+全ウェーブ完了後、PR本文（後述「PR作成」節）に次の集計を載せる。`TOTAL_IMPL_SEC` /
+`TOTAL_MERGE_SEC` / `TOTAL_GATE_SEC` は Step 7 で毎ウェーブ加算した累計、`WAVE_NO` は
+実行した総ウェーブ数、`DONE_TASK_COUNT` は取り込めたタスク数である。
+
+```
+## 実行時間
+- ウェーブ数: [WAVE_NO] / タスク数: [DONE_TASK_COUNT] / 並列度: [LANES]
+- 実装（レーン）合計: [fmt_duration TOTAL_IMPL_SEC] / 統合合計: [fmt_duration TOTAL_MERGE_SEC] / 統合ゲート合計: [fmt_duration TOTAL_GATE_SEC]
+- 総所要時間: [fmt_duration (TOTAL_IMPL_SEC + TOTAL_MERGE_SEC + TOTAL_GATE_SEC)]
+```
+
+これにより、次に何を削るべきか（LLM時間か、統合ゲートの待ち時間か、統合処理か）が実測で分かる。
+並列化タスク（#15・#16・#18・#20・#21・#22）とオーバーヘッド削減タスク（#17・#19・#23）の
+どちらの寄与が大きかったかは、複数Epicでこの集計を比較することで読み取れる。
 
 ## Epic一括レビュー（全タスク完了後・PR作成前）
 
@@ -676,6 +798,11 @@ Closes $ARGUMENTS
 
 ### レビューで挙がった軽微な指摘（issue化せず記録のみ）
 - [重要度lowの指摘]
+
+## 実行時間
+- ウェーブ数: [WAVE_NO] / タスク数: [DONE_TASK_COUNT] / 並列度: [LANES]
+- 実装（レーン）合計: [fmt_duration TOTAL_IMPL_SEC] / 統合合計: [fmt_duration TOTAL_MERGE_SEC] / 統合ゲート合計: [fmt_duration TOTAL_GATE_SEC]
+- 総所要時間: [fmt_duration (TOTAL_IMPL_SEC + TOTAL_MERGE_SEC + TOTAL_GATE_SEC)]
 
 ## Test plan
 - [ ] 全テスト通過確認済み（Docker sandbox内）
