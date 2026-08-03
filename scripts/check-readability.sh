@@ -178,8 +178,7 @@ fi
 report=""
 violated=0
 for f in "${files[@]}"; do
-  out=$(check_one "$f")
-  if [ $? -ne 0 ]; then
+  if ! out=$(check_one "$f"); then
     report="${report}${out}\n"
     violated=1
   fi

@@ -83,7 +83,9 @@ if [ -n "$GIT_COMMON" ]; then
     /*|[A-Za-z]:*) ;;                       # 絶対パスならそのまま
     *) GIT_COMMON="$CWD/$GIT_COMMON" ;;     # 相対パスならcwd基準で解決
   esac
-  MAIN_ROOT="$(cd "$GIT_COMMON/.." 2>/dev/null && pwd || true)"
+  if ! MAIN_ROOT="$(cd "$GIT_COMMON/.." 2>/dev/null && pwd)"; then
+    MAIN_ROOT=""
+  fi
   [ -n "$MAIN_ROOT" ] && MARKER_ROOT="$MAIN_ROOT"
 fi
 RUN_MARKER="$MARKER_ROOT/.claude/.dev-workflow-run"

@@ -20,8 +20,7 @@ if command -v gh &> /dev/null && gh auth status &> /dev/null; then
   # gh がgitのcredential helperとして設定されているか確認
   if ! git config --global credential.helper 2>/dev/null | grep -q "gh"; then
     echo "[dev-workflow] git認証をgh CLIに委任します（ポップアップ防止）..." >&2
-    gh auth setup-git 2>/dev/null
-    if [ $? -eq 0 ]; then
+    if gh auth setup-git 2>/dev/null; then
       echo "[dev-workflow] gh auth setup-git 完了。git操作はgh CLIのトークンを使用します。" >&2
     else
       errors+=("'gh auth setup-git' に失敗しました。手動で実行してください。")
