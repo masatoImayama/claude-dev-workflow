@@ -411,7 +411,7 @@ MANIFEST
 FAKE_DOCKER_MANIFEST_DIR="$(mktemp -d "${TMPDIR:-/tmp}/dw-test-fakebin-manifest.XXXXXX")"
 cat > "${FAKE_DOCKER_MANIFEST_DIR}/docker" <<'FAKE_DOCKER_MANIFEST'
 #!/bin/bash
-# tests/run-tests.sh 用の偽 docker（マニフェスト駆動）。ps / container inspect / rm のみ対応する。
+# tests/run-tests.sh 用の偽 docker（マニフェスト駆動）。ps / container inspect / rm / volume rm に対応する。
 set -u
 MANIFEST="${DW_TEST_MANIFEST:?DW_TEST_MANIFEST is required}"
 
@@ -461,6 +461,9 @@ case "${1:-}" in
       *'Mounts'*)            printf '%s\n' "$f_mount" ;;
       *'Config.Image'*)      printf '%s\n' "$f_image" ;;
       *'State.Status'*)      printf '%s\n' "$f_status" ;;
+      *'State.Running'*)
+        if [ "$f_status" = "running" ]; then printf 'true\n'; else printf 'false\n'; fi
+        ;;
       *'Created'*)           printf '%s\n' "$f_created" ;;
       *)                     printf '\n' ;;
     esac
@@ -476,6 +479,15 @@ case "${1:-}" in
       esac
     done
     echo "$target" >> "${DW_TEST_RM_LOG:?DW_TEST_RM_LOG is required}"
+    exit 0
+    ;;
+  volume)
+    shift
+    [ "${1:-}" = "rm" ] || exit 1
+    shift
+    for a in "$@"; do
+      echo "$a" >> "${DW_TEST_VOLUME_RM_LOG:?DW_TEST_VOLUME_RM_LOG is required}"
+    done
     exit 0
     ;;
   *)
@@ -543,6 +555,126 @@ if printf '%s\n' "$RM_LOG_CONTENT" | grep -q "otherrepo"; then
 else
   pass "--down --all は他リポジトリのコンテナを削除しない"
 fi
+
+# ---------------------------------------------------------------------------
+# ケース9: --reset-cache のガード（列挙・running 検出・--force。Task #7、Epic #3 仕様書 4.6）
+#
+# キャッシュ volume はリポジトリ単位で共有するため、running 判定は現在の epic だけでなく
+# 同一リポジトリの管理コンテナ全体（他 epic のものも含む）を対象にする。--ls / --down --all
+# と同じ偽 docker（マニフェスト駆動、State.Running / volume rm に対応済み）を再利用する。
+# ---------------------------------------------------------------------------
+
+echo "== --reset-cache（列挙・running 検出・--force。Task #7） =="
+
+RESET_REPO="$(make_temp_repo)"
+copy_sandbox_scripts "$RESET_REPO"
+
+RESET_PLAN_OUTPUT="$(
+  cd "$RESET_REPO" || exit 1
+  PATH="${FAKE_BIN_DIR}:${PATH}" bash scripts/sandbox-exec.sh --print-plan
+)"
+RESET_REPO_BASENAME="$(basename "$RESET_REPO")"
+RESET_HOST_ROOT="$(plan_value repo_root "$RESET_PLAN_OUTPUT")"
+RESET_CACHE_VOLUME_COUNT="$(printf '%s\n' "$RESET_PLAN_OUTPUT" | grep -c '^cache_volume=')"
+
+DW_TEST_VOLUME_RM_LOG="$(mktemp "${TMPDIR:-/tmp}/dw-test-volrmlog.XXXXXX")"
+: > "$DW_TEST_VOLUME_RM_LOG"
+
+run_reset_cache() {
+  # run_reset_cache <manifest内容> [追加の引数...]
+  local manifest_body="$1"
+  shift
+  printf '%s\n' "$manifest_body" > "$DW_TEST_MANIFEST"
+  : > "$DW_TEST_RM_LOG"
+  : > "$DW_TEST_VOLUME_RM_LOG"
+  (
+    cd "$RESET_REPO" || exit 1
+    DW_TEST_MANIFEST="$DW_TEST_MANIFEST" DW_TEST_RM_LOG="$DW_TEST_RM_LOG" \
+      DW_TEST_VOLUME_RM_LOG="$DW_TEST_VOLUME_RM_LOG" \
+      PATH="${FAKE_DOCKER_MANIFEST_DIR}:${PATH}" \
+      bash scripts/sandbox-exec.sh --reset-cache "$@"
+  )
+}
+
+# --- 常に: 削除対象 volume がすべて列挙表示される（実行結果の成否によらない） ---
+NOT_RUNNING_MANIFEST="dw-sandbox-${RESET_REPO_BASENAME}-epicA|1|${RESET_REPO_BASENAME}|epicA|dev-sandbox:${RESET_REPO_BASENAME}|exited|2024-01-01T00:00:00Z|${RESET_HOST_ROOT}"
+
+RESET_ENUM_OUTPUT="$(run_reset_cache "$NOT_RUNNING_MANIFEST" 2>&1)"
+NOT_RUNNING_EXIT=$?
+RESET_ENUM_LISTED_COUNT="$(printf '%s\n' "$RESET_ENUM_OUTPUT" | grep -c '^  - dw-cache-')"
+assert_eq "--reset-cache は削除対象 volume をすべて列挙表示する" "$RESET_CACHE_VOLUME_COUNT" "$RESET_ENUM_LISTED_COUNT"
+
+# --- 同一リポジトリのコンテナが running でないときは --force なしでも実行される ---
+if [ "$NOT_RUNNING_EXIT" -eq 0 ]; then
+  pass "同一リポジトリのコンテナが running でないとき --force なしでも成功する"
+else
+  fail "同一リポジトリのコンテナが running でないとき --force なしでも成功する" "exit=${NOT_RUNNING_EXIT}"
+fi
+
+VOL_RM_COUNT="$(grep -c . "$DW_TEST_VOLUME_RM_LOG" || true)"
+assert_eq "running でないとき docker volume rm が volume 数だけ呼ばれる" "$RESET_CACHE_VOLUME_COUNT" "$VOL_RM_COUNT"
+
+# --- 同一リポジトリの管理コンテナ（他 epic）が running なら --force なしでは中断する ---
+RUNNING_OWN_REPO_MANIFEST="dw-sandbox-${RESET_REPO_BASENAME}-epicA|1|${RESET_REPO_BASENAME}|epicA|dev-sandbox:${RESET_REPO_BASENAME}|running|2024-01-01T00:00:00Z|${RESET_HOST_ROOT}"
+
+RESET_BLOCK_STDERR="$(run_reset_cache "$RUNNING_OWN_REPO_MANIFEST" 2>&1 1>/dev/null)"
+RESET_BLOCK_EXIT=$?
+
+if [ "$RESET_BLOCK_EXIT" -ne 0 ]; then
+  pass "同一リポジトリの他 epic コンテナが running なら --force なしでは非0で終了する"
+else
+  fail "同一リポジトリの他 epic コンテナが running なら --force なしでは非0で終了する" "exit=0"
+fi
+
+VOL_RM_COUNT_BLOCKED="$(grep -c . "$DW_TEST_VOLUME_RM_LOG" || true)"
+assert_eq "running のとき --force なしでは docker volume rm を呼ばない" "0" "$VOL_RM_COUNT_BLOCKED"
+
+case "$RESET_BLOCK_STDERR" in
+  *"dw-sandbox-${RESET_REPO_BASENAME}-epicA"*) pass "中断メッセージに running なコンテナ名が含まれる" ;;
+  *) fail "中断メッセージに running なコンテナ名が含まれる" "stderr=[${RESET_BLOCK_STDERR}]" ;;
+esac
+
+case "$RESET_BLOCK_STDERR" in
+  *"--force"*) pass "中断メッセージに --force の案内が含まれる" ;;
+  *) fail "中断メッセージに --force の案内が含まれる" "stderr=[${RESET_BLOCK_STDERR}]" ;;
+esac
+
+# --- --force 指定時は running でも実行される ---
+RESET_FORCE_EXIT_OUTPUT="$(run_reset_cache "$RUNNING_OWN_REPO_MANIFEST" --force 2>&1)"
+RESET_FORCE_EXIT=$?
+
+if [ "$RESET_FORCE_EXIT" -eq 0 ]; then
+  pass "--force 指定時は running でも成功する"
+else
+  fail "--force 指定時は running でも成功する" "exit=${RESET_FORCE_EXIT} output=[${RESET_FORCE_EXIT_OUTPUT}]"
+fi
+
+VOL_RM_COUNT_FORCED="$(grep -c . "$DW_TEST_VOLUME_RM_LOG" || true)"
+assert_eq "--force 指定時は docker volume rm が volume 数だけ呼ばれる" "$RESET_CACHE_VOLUME_COUNT" "$VOL_RM_COUNT_FORCED"
+
+# --- 別リポジトリのコンテナが running でも中断しない（誤って巻き込まない） ---
+OTHER_REPO_RUNNING_MANIFEST="dw-sandbox-otherrepo|1|otherrepo||dev-sandbox:otherrepo|running|2024-02-02T00:00:00Z|/home/user/otherrepo"
+
+RESET_OTHER_REPO_OUTPUT="$(run_reset_cache "$OTHER_REPO_RUNNING_MANIFEST" 2>&1)"
+RESET_OTHER_REPO_EXIT=$?
+
+if [ "$RESET_OTHER_REPO_EXIT" -eq 0 ]; then
+  pass "別リポジトリのコンテナが running でも中断しない"
+else
+  fail "別リポジトリのコンテナが running でも中断しない" "exit=${RESET_OTHER_REPO_EXIT} output=[${RESET_OTHER_REPO_OUTPUT}]"
+fi
+
+# --- ヘルプに作用範囲（リポジトリ全体）の記載がある ---
+SANDBOX_EXEC_HEADER="$(sed -n '1,25p' "${REPO_ROOT}/scripts/sandbox-exec.sh")"
+case "$SANDBOX_EXEC_HEADER" in
+  *"リポジトリ全体"*) pass "ヘッダコメントに --reset-cache の作用範囲（リポジトリ全体）の記載がある" ;;
+  *) fail "ヘッダコメントに --reset-cache の作用範囲（リポジトリ全体）の記載がある" "header=[${SANDBOX_EXEC_HEADER}]" ;;
+esac
+
+case "$RESET_BLOCK_STDERR" in
+  *"リポジトリ全体"*) pass "中断メッセージにも作用範囲（リポジトリ全体）の記載がある" ;;
+  *) fail "中断メッセージにも作用範囲（リポジトリ全体）の記載がある" "stderr=[${RESET_BLOCK_STDERR}]" ;;
+esac
 
 # ---------------------------------------------------------------------------
 # 結果集計

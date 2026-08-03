@@ -15,7 +15,11 @@
 #   bash scripts/sandbox-exec.sh --down                              # 現在の repo+epic のコンテナを削除（キャッシュは残す）
 #   bash scripts/sandbox-exec.sh --down --all                        # 現在のリポジトリに属する管理コンテナを全て削除
 #   bash scripts/sandbox-exec.sh --ls                                # 管理コンテナを一覧表示（他リポジトリ分も含む）
-#   bash scripts/sandbox-exec.sh --reset-cache                       # キャッシュ volume も削除
+#   bash scripts/sandbox-exec.sh --reset-cache                       # キャッシュ volume を削除
+#                                                                     # 【作用範囲はepicではなくリポジトリ全体】
+#                                                                     # 同一リポジトリの管理コンテナが1つでも running
+#                                                                     # なら中断し、--force の指定を促す
+#   bash scripts/sandbox-exec.sh --reset-cache --force                # running でも強制的に削除する
 #   bash scripts/sandbox-exec.sh --print-plan                        # docker に触れず解決結果を表示（ドライラン）
 #
 # 終了コードは実行したコマンドのものをそのまま返す（機械的ゲートの判定に使える）。
@@ -41,6 +45,7 @@ COMPOSE_SERVICE="${DEV_WORKFLOW_COMPOSE_SERVICE:-app}"
 EPIC=""
 WARM=0
 ALL=0
+FORCE=0
 ACTION="exec"
 
 while [ $# -gt 0 ]; do
@@ -51,6 +56,7 @@ while [ $# -gt 0 ]; do
     --all)         ALL=1; shift ;;
     --ls)          ACTION="ls"; shift ;;
     --reset-cache) ACTION="reset-cache"; shift ;;
+    --force)       FORCE=1; shift ;;
     --print-plan)  ACTION="print-plan"; shift ;;
     --)            shift; break ;;
     -*)            echo "ERROR: 未知のオプション: $1" >&2; exit 2 ;;
@@ -244,6 +250,24 @@ down_all() {
   echo "削除しました: ${#targets[@]}件"
 }
 
+# --reset-cache のガード（仕様書 4.6）。
+# キャッシュ volume はリポジトリ単位で共有する（epic 単位にはしない）ため、
+# running 判定は現在の epic だけでなく、同一リポジトリに属する管理コンテナ全体
+# （他 epic のものも含む）を対象にする。所属判定は down_all と同じ
+# container_belongs_to_repo を再利用し、重複実装しない。
+list_running_containers_in_repo() {
+  local name label_repo mount_source running
+
+  while IFS= read -r name; do
+    [ -n "$name" ] || continue
+    label_repo="$(container_field "$name" '{{ index .Config.Labels "dev-workflow.repo" }}')"
+    mount_source="$(container_field "$name" "$MOUNT_SOURCE_TEMPLATE")"
+    container_belongs_to_repo "$label_repo" "$mount_source" "$HOST_ROOT" "$PROJECT" || continue
+    running="$(container_field "$name" '{{.State.Running}}')"
+    [ "$running" = "true" ] && printf '%s\n' "$name"
+  done < <(list_managed_candidate_names)
+}
+
 eval "$(bash "${SCRIPT_DIR}/resolve-sandbox.sh")"
 
 case "$ACTION" in
@@ -262,6 +286,27 @@ case "$ACTION" in
     exit 0
     ;;
   reset-cache)
+    # 1. 削除対象の volume 名をすべて列挙して表示する（成否によらず必ず表示する）。
+    echo "削除対象のキャッシュ volume（repo=${PROJECT}。作用範囲はepicではなくリポジトリ全体です）:"
+    for path in $CACHE_PATHS; do
+      echo "  - $(cache_volume_name "$path")"
+    done
+
+    # 2. 同一リポジトリの管理コンテナが1つでも running なら中断し、--force を促す。
+    #    --force 指定時のみ running でも実行する。
+    if [ "$FORCE" -ne 1 ]; then
+      RUNNING_NAMES="$(list_running_containers_in_repo)"
+      if [ -n "$RUNNING_NAMES" ]; then
+        echo "ERROR: 同一リポジトリの管理コンテナが running のため中断しました。--reset-cache の作用範囲はepicではなくリポジトリ全体のため、他 epic の実行中コンテナのキャッシュも壊れます:" >&2
+        printf '%s\n' "$RUNNING_NAMES" | while IFS= read -r name; do
+          echo "  - ${name}" >&2
+        done
+        echo "続行するには --force を指定してください: bash scripts/sandbox-exec.sh --reset-cache --force" >&2
+        exit 1
+      fi
+    fi
+
+    # 5. 削除するのは volume と当該（現在の repo+epic の）コンテナのみで、他 epic のコンテナは削除しない。
     docker rm -f "$CONTAINER" >/dev/null 2>&1 || true
     for path in $CACHE_PATHS; do
       docker volume rm "$(cache_volume_name "$path")" >/dev/null 2>&1 || true
