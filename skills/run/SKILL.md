@@ -86,25 +86,28 @@ worktree内から実行してもマーカーはメインリポのルートに置
 
 ### Docker sandbox の準備
 
-**まず作業 worktree に移動してから**、実装・テスト用のDockerコンテナを起動する（以降 `pwd` は
-`$EPIC_WT`。マウント・ビルドはこの worktree を基点に行う）:
+**まず作業 worktree に移動してから**、`sandbox-exec.sh` でサンドボックスを準備する（以降 `pwd` は
+`$EPIC_WT`。マウント・イメージ解決はこの worktree を基点に行う）。
+
+**`docker build` / `docker compose up` を直接叩いてはならない。** イメージのビルド・
+コンテナの起動・compose サービスの起動はすべて `sandbox-exec.sh` に集約されている（後述）。
+スキル側がやることは、`--print-plan` で解決結果を確認し、`--warm` を1回流すことだけである。
 
 ```bash
 cd "$EPIC_WT"   # 以降の作業ディレクトリを Epic 専用 worktree に固定
 
-# Dockerfile.dev / docker-compose.dev.yml は worktree にも存在する（フルチェックアウトのため）
-# プロジェクトルートに Dockerfile.dev があればビルド、なければ設定されたイメージを使用
-if [ -f Dockerfile.dev ]; then
-  docker build -f Dockerfile.dev -t dev-sandbox:$(basename $(pwd)) .
-  SANDBOX_IMAGE="dev-sandbox:$(basename $(pwd))"
-elif [ -f docker-compose.dev.yml ]; then
-  docker compose -f docker-compose.dev.yml up -d
-  SANDBOX_IMAGE="" # docker compose経由で実行
-else
+# docker に一切触れず、解決結果（mode / container / image / compose_* 等）を表示する
+PLAN="$(bash "${CLAUDE_PLUGIN_ROOT}/scripts/sandbox-exec.sh" --epic "$EPIC_NUM" --print-plan)"
+echo "$PLAN"
+
+if printf '%s\n' "$PLAN" | grep -q '^mode=none$'; then
   echo "ERROR: Dockerfile.dev または docker-compose.dev.yml が見つかりません"
-  echo "プロジェクトルートに開発用Dockerfileを配置してください"
+  echo "プロジェクトルートに開発用Dockerfileまたはcomposeファイルを配置してください"
   exit 1
 fi
+
+# キャッシュを温める（イメージが無ければここで自動ビルドされる。最初のタスクにビルドコストを負担させない）
+bash "${CLAUDE_PLUGIN_ROOT}/scripts/sandbox-exec.sh" --epic "$EPIC_NUM" --warm '[build-command]'
 ```
 
 コンテナ内でコードをマウントし、全ての実装・テスト・ビルドコマンドをコンテナ内で実行する。
@@ -114,26 +117,55 @@ Gitオペレーション（commit, push等）はホスト側で実行する。
 
 **`docker run` を直接組み立ててはならない。** 以下をすべて `scripts/sandbox-exec.sh` が引き受ける:
 
+- **イメージの解決とビルド** — `Dockerfile.dev` があれば内容の hash でタグ付けして自動ビルドする
+  （`DEV_WORKFLOW_DOCKER_IMAGE` を指定すれば既存イメージをそのまま使い、ビルドはしない）
 - **ビルドキャッシュの永続化** — `docker run --rm` はコンテナ層を毎回捨てるため、`GOCACHE` 等に
   貯まったコンパイル結果が次回に残らない。言語ごとのキャッシュディレクトリを named volume 化する
-- **コンテナの再利用** — Epic 単位で常駐させ `docker exec` で叩き、起動オーバーヘッドを消す
+  （対象パスは `DEV_WORKFLOW_CACHE_PATHS` で上書きできる）
+- **コンテナの再利用** — Epic 単位で常駐させ `docker exec` で叩き、起動オーバーヘッドを消す。
+  `--epic` を渡し忘れても環境変数 `DEV_WORKFLOW_EPIC` が設定されていれば同じコンテナに載る
 - **Windows のパス変換対策** — Git Bash（MSYS）は `-w /workspace` を
   `C:/Program Files/Git/workspace` に変換してしまい、`docker run` がそのまま失敗する。
   `MSYS_NO_PATHCONV=1` と `pwd -W` で回避する
-- **イメージタグの安定化** — タグをリポジトリ名基準にし、worktree ごとに別イメージを
-  ビルドし直す事故を防ぐ
+- **イメージタグの安定化** — タグをリポジトリ名基準（+ Dockerfile の内容 hash）にし、worktree
+  ごとに別イメージをビルドし直す事故を防ぐ。COPY 対象だけを変更した場合は hash が変わらないため、
+  その場合は `--rebuild` で強制的に再ビルド・コンテナ作り直しを行う
 
 ```bash
 # 実行（複数コマンドは1回にまとめる。後述）
 bash "${CLAUDE_PLUGIN_ROOT}/scripts/sandbox-exec.sh" --epic "$EPIC_NUM" 'make test'
-
-# キャッシュを温める（最初のタスクにキャッシュ構築コストを負担させない）
-bash "${CLAUDE_PLUGIN_ROOT}/scripts/sandbox-exec.sh" --epic "$EPIC_NUM" --warm '[build-command]'
 ```
 
 終了コードは実行したコマンドのものがそのまま返るので、機械的ゲートの判定に使える。
 
-Docker sandbox の準備が終わったら、続けて `--warm` を1回流しておく。
+### compose を使う場合の要求仕様
+
+`docker-compose.dev.yml` を使う場合、素直に「ビルド・テストを実行する compose ファイル」を
+書くと常駐サービスが存在せず `sandbox-exec.sh` が `exec` できない。次の要求仕様を満たすこと:
+
+- **常駐サービス名**: 既定 `app`（`DEV_WORKFLOW_COMPOSE_SERVICE` で変更可）
+- **マウント**: 当該サービスが `.:/workspace` をマウントすること
+  （異なるマウント先にする場合は `DEV_WORKFLOW_COMPOSE_WORKDIR` で上書きする）
+- **長時間常駐**: `sleep infinity` 等でプロセスが終了しないこと（サービスが running であり
+  続けないと `sandbox-exec.sh` は `up -d` を試みた上で、原因の分かるエラーを出して停止する）
+- **`container_name:` と固定ホストポート（例: `- "8080:8080"`）を使わないこと** —
+  `sandbox-exec.sh` は `-p <project>` でプロジェクト名を epic 単位に分離するが、これらは
+  `-p` では解決できない衝突であり、epic の並行実行ができなくなる。`sandbox-exec.sh` は
+  検出時に stderr へ警告するが、自動では直せない
+
+サンプル（そのまま貼り付けて使える最小構成）:
+
+```yaml
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile.dev
+    volumes:
+      - .:/workspace
+    working_dir: /workspace
+    command: ["sleep", "infinity"]
+```
 
 ## 2エージェント体制
 
@@ -219,6 +251,11 @@ Task #[番号] を実装してください。
   でベースを検証すること。偽なら実装を始めず、実出力を添えて報告し停止すること
 - サンドボックスへのコマンド投入は `${CLAUDE_PLUGIN_ROOT}/scripts/sandbox-exec.sh` 経由で行い、
   ビルド・テストは1回の呼び出しにまとめること（分けると待ち時間が倍増する）
+- `sandbox-exec.sh` を呼ぶ際は必ず `--epic "$EPIC_NUM"` を渡すこと（例: `--epic "$EPIC_NUM" 'make test'`）。
+  省略すると環境変数 `DEV_WORKFLOW_EPIC` が参照されるので、渡し忘れた場合は
+  `export DEV_WORKFLOW_EPIC="$EPIC_NUM"` してから叩くこと。あなたは isolation worktree
+  （`.claude/worktrees/agent-*`）で動くため、これを怠ると Epic 単位のコンテナに載らず
+  タスクごとに別コンテナが生まれる
 - 回帰確認はプロジェクトの全テストで行うこと。`-run` で絞った結果を「回帰なし」と報告しないこと
 - SKIP されたテストがあれば件数と内容を報告に含めること
 - issueの要件を確認
@@ -304,6 +341,33 @@ git cherry-pick "${EPIC_BRANCH}..[作業ブランチ]"
 4. → Step 1 に戻る（次のタスクへ）
 
 全タスクが完了したら **「Epic一括レビュー」** へ進む。
+
+## サンドボックスの後片付け（正常終了・異常終了を問わず必ず実行）
+
+自律ループが終わる経路は複数ある（全タスク完了 → Epic一括レビュー → PR作成、機械的ゲートの
+失敗が続いてタスクをスキップし続けた末の停止、予期しないエラーによる中断）。
+**どの経路で run が終わる場合も、後続処理（PR作成や中断報告）に進む前に、必ず次のクリーンアップを
+実行すること。** 完了通知の後ろに置いて成功時にしか実行されない、ということがあってはならない。
+
+```bash
+# 常駐コンテナの削除（epic 単位。キャッシュ volume は次の Epic のために残す）
+bash "${CLAUDE_PLUGIN_ROOT}/scripts/sandbox-exec.sh" --epic "$EPIC_NUM" --down
+```
+
+**キャッシュ volume は削除しない。** 次の Epic でそのまま効くのが利点であり、消すと
+毎回キャッシュ構築コストを払い直すことになる。明示的に消したい場合のみ `--reset-cache` を使う。
+`--reset-cache` の**作用範囲は epic ではなくリポジトリ全体**であることに注意し、
+同一リポジトリの他 epic のコンテナが running なら中断される（続けるには `--force`。
+他 epic の実行中コンテナのキャッシュも壊れるため、本当に必要な場合のみ使うこと）。
+
+### 人間向けの手動クリーンアップ
+
+自律実行の外で、残存コンテナの棚卸しをしたい場合は次を使う:
+
+```bash
+bash "${CLAUDE_PLUGIN_ROOT}/scripts/sandbox-exec.sh" --ls          # 管理コンテナを一覧表示（他リポジトリ分も含む）
+bash "${CLAUDE_PLUGIN_ROOT}/scripts/sandbox-exec.sh" --down --all   # 現在のリポジトリに属する管理コンテナを全て削除
+```
 
 ## 進捗表示
 
@@ -507,21 +571,9 @@ fi
 git worktree prune
 ```
 
-## Docker sandbox クリーンアップ
-
-全タスク完了後またはエラー終了時にDockerリソースを停止・削除する:
-
-```bash
-# docker compose使用時
-docker compose -f docker-compose.dev.yml down 2>/dev/null || true
-
-# 常駐コンテナの削除（キャッシュ volume は次の Epic のために残す）
-bash "${CLAUDE_PLUGIN_ROOT}/scripts/sandbox-exec.sh" --epic "$EPIC_NUM" --down 2>/dev/null || true
-```
-
-**キャッシュ volume は削除しない。** 次の Epic でそのまま効くのが利点であり、消すと
-毎回キャッシュ構築コストを払い直すことになる。ディスクを空けたい等の理由で明示的に
-消したい場合のみ `--reset-cache` を使う。
+サンドボックスの後片付け（常駐コンテナの `--down`）は「Epicブランチに取り込んで次のタスクへ」の
+直後の節で**既に実行済み**である（正常終了・異常終了を問わず必ず実行する節）。ここで重複して
+実行する必要はない。
 
 ## 自律動作ポリシー（YOLOモード）
 

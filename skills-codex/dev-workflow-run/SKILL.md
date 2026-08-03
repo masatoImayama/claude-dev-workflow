@@ -52,31 +52,60 @@ cd "$EPIC_WT"
 
 ## サンドボックスの準備
 
+**`docker build` / `docker compose up` を直接叩いてはならない。** イメージのビルド・
+コンテナの起動・compose サービスの起動はすべて `sandbox-exec.sh` に集約されている。
+やることは `--print-plan` で解決結果を確認し、`--warm` を1回流すことだけである。
+
 ```bash
-eval "$(bash "${CLAUDE_PLUGIN_ROOT}/scripts/resolve-sandbox.sh")"
-bash "${CLAUDE_PLUGIN_ROOT}/scripts/resolve-sandbox.sh" --print
+# docker に一切触れず、解決結果（mode / container / image / compose_* 等）を表示する
+PLAN="$(bash "${CLAUDE_PLUGIN_ROOT}/scripts/sandbox-exec.sh" --epic "$EPIC_NUM" --print-plan)"
+echo "$PLAN"
 
-case "$DEV_WORKFLOW_SANDBOX_MODE" in
-  dockerfile)
-    [ -n "$DEV_WORKFLOW_SANDBOX_DOCKERFILE" ] && \
-      docker build -f "$DEV_WORKFLOW_SANDBOX_DOCKERFILE" -t "$DEV_WORKFLOW_SANDBOX_IMAGE" .
-    ;;
-  compose)
-    docker compose -f "$DEV_WORKFLOW_SANDBOX_COMPOSE" up -d
-    ;;
-  none)
-    echo "サンドボックス未設定。ホスト側のコマンドで検証する（テストが環境を汚す可能性を意識すること）"
-    ;;
-esac
+if printf '%s\n' "$PLAN" | grep -q '^mode=none$'; then
+  echo "ERROR: Dockerfile.dev または docker-compose.dev.yml が見つかりません"
+  echo "プロジェクトルートに開発用Dockerfileまたはcomposeファイルを配置してください"
+  exit 1
+fi
 
-# キャッシュを温めておく（最初のタスクにキャッシュ構築コストを負担させない）
+# キャッシュを温めておく（イメージが無ければここで自動ビルドされる。最初のタスクにキャッシュ構築コストを負担させない）
 bash "${CLAUDE_PLUGIN_ROOT}/scripts/sandbox-exec.sh" --epic "$EPIC_NUM" --warm '<build-command>'
 ```
 
 **サンドボックスへのコマンド投入は `sandbox-exec.sh` 経由に統一する。** `docker run` を直接
-組み立ててはならない。キャッシュの永続化（`docker run --rm` はコンテナ層ごとビルドキャッシュを
-毎回捨てる）・コンテナの再利用・Windows のパス変換対策（Git Bash は `-w /workspace` を
+組み立ててはならない。イメージの解決とビルド（`Dockerfile.dev` の内容 hash でタグ付けし自動
+ビルドする。COPY 対象だけの変更を拾いたい場合は `--rebuild`）・キャッシュの永続化
+（`docker run --rm` はコンテナ層ごとビルドキャッシュを毎回捨てる。対象パスは
+`DEV_WORKFLOW_CACHE_PATHS` で上書き可）・コンテナの再利用（`--epic` 未指定時は
+`DEV_WORKFLOW_EPIC` を参照する）・Windows のパス変換対策（Git Bash は `-w /workspace` を
 `C:/Program Files/Git/workspace` に変換して失敗させる）をこのスクリプトが引き受ける。
+
+### compose を使う場合の要求仕様
+
+`docker-compose.dev.yml` を使う場合、常駐サービスが存在しないと `sandbox-exec.sh` が
+`exec` できない。次の要求仕様を満たすこと:
+
+- **常駐サービス名**: 既定 `app`（`DEV_WORKFLOW_COMPOSE_SERVICE` で変更可）
+- **マウント**: 当該サービスが `.:/workspace` をマウントすること
+  （異なるマウント先にする場合は `DEV_WORKFLOW_COMPOSE_WORKDIR` で上書きする）
+- **長時間常駐**: `sleep infinity` 等でプロセスが終了しないこと（running でなければ
+  `sandbox-exec.sh` は `up -d` を試みた上で、原因の分かるエラーを出して停止する）
+- **`container_name:` と固定ホストポート（例: `- "8080:8080"`）を使わないこと** —
+  `-p` では解決できない衝突であり、epic の並行実行ができなくなる。`sandbox-exec.sh` は
+  検出時に stderr へ警告するが、自動では直せない
+
+サンプル（そのまま貼り付けて使える最小構成）:
+
+```yaml
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile.dev
+    volumes:
+      - .:/workspace
+    working_dir: /workspace
+    command: ["sleep", "infinity"]
+```
 
 ## 自律実行の開始を記録
 
@@ -114,6 +143,9 @@ Task #<番号> を実装してください。
 - 作業ディレクトリ: <EPIC_WT>（ここから移動しないこと）
 - サンドボックスへのコマンド投入は `${CLAUDE_PLUGIN_ROOT}/scripts/sandbox-exec.sh` 経由で行い、
   ビルド・テストは1回の呼び出しにまとめること（分けると待ち時間が倍増する）
+- `sandbox-exec.sh` を呼ぶ際は必ず `--epic "$EPIC_NUM"` を渡すこと。省略すると環境変数
+  `DEV_WORKFLOW_EPIC` が参照されるので、渡し忘れた場合は `export DEV_WORKFLOW_EPIC="$EPIC_NUM"`
+  してから叩くこと。渡し忘れると Epic 単位のコンテナに載らずタスクごとに別コンテナが生まれる
 - 回帰確認はプロジェクトの全テストで行うこと。`-run` で絞った結果を「回帰なし」と報告しないこと
 - SKIP されたテストがあれば件数と内容を報告に含めること
 - issueの要件と、親Epic issue本文の仕様書・計画書を確認すること
@@ -171,6 +203,29 @@ gh issue close <番号>
 ```
 
 Epic issue の進捗チェックリストを更新し、Step 1 に戻る。
+
+## サンドボックスの後片付け（正常終了・異常終了を問わず必ず実行）
+
+自律ループが終わる経路は複数ある（全タスク完了 → Epic一括レビュー → PR作成、機械的ゲートの
+失敗が続いてタスクをスキップし続けた末の停止、予期しないエラーによる中断）。
+**どの経路で終わる場合も、後続処理（PR作成や中断報告）に進む前に、必ず次のクリーンアップを
+実行すること。** 完了通知の後ろに置いて成功時にしか実行されない、ということがあってはならない。
+
+```bash
+# 常駐コンテナの削除（epic 単位。キャッシュ volume は次の Epic のために残す）
+bash "${CLAUDE_PLUGIN_ROOT}/scripts/sandbox-exec.sh" --epic "$EPIC_NUM" --down
+```
+
+**キャッシュ volume は削除しない。** 次の Epic でそのまま効くのが利点である。明示的に消したい
+場合のみ `--reset-cache` を使う（**作用範囲は epic ではなくリポジトリ全体**。同一リポジトリの
+他 epic のコンテナが running なら中断され、続けるには `--force` が必要）。
+
+自律実行の外で残存コンテナを棚卸ししたい場合は次を使う:
+
+```bash
+bash "${CLAUDE_PLUGIN_ROOT}/scripts/sandbox-exec.sh" --ls          # 管理コンテナを一覧表示（他リポジトリ分も含む）
+bash "${CLAUDE_PLUGIN_ROOT}/scripts/sandbox-exec.sh" --down --all   # 現在のリポジトリに属する管理コンテナを全て削除
+```
 
 ## Epic一括レビュー（全タスク完了後・PR作成前）
 
@@ -268,7 +323,11 @@ PR: <PRのURL>"
 
 到達せず終了した場合は Stop フックが「自律実行が停止」として自動通知する。
 
-## クリーンアップ
+## クリーンアップ（worktree）
+
+サンドボックスの後片付け（常駐コンテナの `--down`）は「Step 5: 取り込んで次へ」の直後の節で
+**既に実行済み**である（正常終了・異常終了を問わず必ず実行する節）。ここでは worktree のみを
+片付ける。
 
 ```bash
 # worktree の削除前に node_modules 等の symlink を解除する
@@ -277,15 +336,7 @@ cd "$(git rev-parse --show-toplevel)"
 find ".codex/worktrees/${EPIC_NUM}" -maxdepth 2 -type l -name node_modules -exec unlink {} \; 2>/dev/null || true
 git worktree remove ".codex/worktrees/${EPIC_NUM}" --force 2>/dev/null || true
 git worktree prune
-
-docker compose -f "$DEV_WORKFLOW_SANDBOX_COMPOSE" down 2>/dev/null || true
-
-# 常駐コンテナの削除（キャッシュ volume は次の Epic のために残す）
-bash "${CLAUDE_PLUGIN_ROOT}/scripts/sandbox-exec.sh" --epic "$EPIC_NUM" --down 2>/dev/null || true
 ```
-
-**キャッシュ volume は削除しない。** 次の Epic でそのまま効くのが利点である。
-明示的に消したい場合のみ `--reset-cache` を使う。
 
 ## 自律動作ポリシー
 
