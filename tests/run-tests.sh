@@ -90,13 +90,14 @@ make_worktree() {
 
 copy_sandbox_scripts() {
   # copy_sandbox_scripts <dest_repo_dir>
-  # sandbox-exec.sh / resolve-sandbox.sh / Dockerfile.dev を検証対象の一時リポジトリへ複製する。
+  # sandbox-exec.sh / resolve-sandbox.sh / lib / Dockerfile.dev を検証対象の一時リポジトリへ複製する。
   # worktree はコミット済みの内容しか見えないため、複製後にコミットまで済ませる
   # （worktree からもスクリプトを実行できるようにするため）。
   local dest="$1"
-  mkdir -p "${dest}/scripts"
-  cp "${REPO_ROOT}/scripts/sandbox-exec.sh"   "${dest}/scripts/sandbox-exec.sh"
+  mkdir -p "${dest}/scripts/lib"
+  cp "${REPO_ROOT}/scripts/sandbox-exec.sh"    "${dest}/scripts/sandbox-exec.sh"
   cp "${REPO_ROOT}/scripts/resolve-sandbox.sh" "${dest}/scripts/resolve-sandbox.sh"
+  cp "${REPO_ROOT}/scripts/lib/container-membership.sh" "${dest}/scripts/lib/container-membership.sh"
   cp "${REPO_ROOT}/Dockerfile.dev"             "${dest}/Dockerfile.dev"
   (
     cd "$dest" || exit 1
@@ -111,7 +112,7 @@ copy_sandbox_scripts() {
 
 echo "== bash -n（構文チェック） =="
 
-for script in "${REPO_ROOT}"/scripts/*.sh; do
+for script in "${REPO_ROOT}"/scripts/*.sh "${REPO_ROOT}"/scripts/lib/*.sh; do
   name="$(basename "$script")"
   bashn_out="$(bash -n "$script" 2>&1)"
   if [ $? -eq 0 ]; then
@@ -128,9 +129,12 @@ done
 echo "== shellcheck（利用可能な場合のみ） =="
 
 if command -v shellcheck >/dev/null 2>&1; then
-  for script in "${REPO_ROOT}"/scripts/*.sh; do
+  # -x: sandbox-exec.sh は変数（${SCRIPT_DIR}）経由で scripts/lib/*.sh を source する。
+  # shellcheck はデフォルトでは変数経由の source 先を検証しない（SC1091）ため、
+  # severity を下げるのではなく -x で実際に解決させて検証の穴を作らないようにする。
+  for script in "${REPO_ROOT}"/scripts/*.sh "${REPO_ROOT}"/scripts/lib/*.sh; do
     name="$(basename "$script")"
-    shellcheck_out="$(shellcheck "$script" 2>&1)"
+    shellcheck_out="$(cd "$(dirname "$script")" && shellcheck -x "$(basename "$script")" 2>&1)"
     if [ $? -eq 0 ]; then
       pass "shellcheck: ${name}"
     else
@@ -318,6 +322,227 @@ fi
 CASE1_CACHE="$(plan_value cache_volume "$CASE1_OUTPUT")"
 CASE3_CACHE="$(plan_value cache_volume "$CASE3_OUTPUT")"
 assert_eq "ケース6: cache_volume はリポジトリ単位（worktree から叩いても同じ）" "$CASE1_CACHE" "$CASE3_CACHE"
+
+# ---------------------------------------------------------------------------
+# ケース7: container_belongs_to_repo（Docker 非依存の所属判定関数、Task #6）
+#
+# label あり／label なしの旧命名残骸／他リポジトリの3パターンを、docker を一切
+# 起動せずに純粋関数として直接検証する。
+# ---------------------------------------------------------------------------
+
+echo "== container_belongs_to_repo（所属判定・Docker 非依存） =="
+
+# shellcheck source=../scripts/lib/container-membership.sh
+. "${REPO_ROOT}/scripts/lib/container-membership.sh"
+
+HOST_ROOT_SAMPLE="/home/user/repo"
+
+if container_belongs_to_repo "myrepo" "" "$HOST_ROOT_SAMPLE" "myrepo"; then
+  pass "label の repo が一致すれば対象に含まれる"
+else
+  fail "label の repo が一致すれば対象に含まれる"
+fi
+
+if container_belongs_to_repo "otherrepo" "${HOST_ROOT_SAMPLE}/anything" "$HOST_ROOT_SAMPLE" "myrepo"; then
+  fail "label の repo が不一致なら対象に含まれない" "含まれてしまいました（マウント元が一致していても label 不一致を優先すべき）"
+else
+  pass "label の repo が不一致なら対象に含まれない"
+fi
+
+if container_belongs_to_repo "" "${HOST_ROOT_SAMPLE}/.claude/worktrees/agent-old" "$HOST_ROOT_SAMPLE" "myrepo"; then
+  pass "label なし・マウント元がリポジトリルート配下なら対象に含まれる（旧命名の残骸回収）"
+else
+  fail "label なし・マウント元がリポジトリルート配下なら対象に含まれる"
+fi
+
+if container_belongs_to_repo "" "$HOST_ROOT_SAMPLE" "$HOST_ROOT_SAMPLE" "myrepo"; then
+  pass "label なし・マウント元がリポジトリルート自身でも対象に含まれる"
+else
+  fail "label なし・マウント元がリポジトリルート自身でも対象に含まれる"
+fi
+
+if container_belongs_to_repo "" "/home/user/other-repo/subdir" "$HOST_ROOT_SAMPLE" "myrepo"; then
+  fail "label なし・マウント元が別リポジトリなら対象に含まれない" "含まれてしまいました"
+else
+  pass "label なし・マウント元が別リポジトリなら対象に含まれない"
+fi
+
+if container_belongs_to_repo "" "" "$HOST_ROOT_SAMPLE" "myrepo"; then
+  fail "label もマウント元も無ければ対象に含まれない" "含まれてしまいました"
+else
+  pass "label もマウント元も無ければ対象に含まれない"
+fi
+
+# ---------------------------------------------------------------------------
+# ケース8: --ls / --down --all（偽 docker で label・マウント元を注入し、実際の docker を起動せず検証する）
+#
+# 偽 docker は DW_TEST_MANIFEST（name|managed|repo|epic|image|status|created|mount_source
+# の '|' 区切り行）を読み、docker ps / docker container inspect / docker rm を模擬する。
+# `docker rm` は本物を一切呼ばず、DW_TEST_RM_LOG に対象名を追記するだけにする。
+# ---------------------------------------------------------------------------
+
+echo "== --ls / --down --all（偽 docker） =="
+
+LS_REPO="$(make_temp_repo)"
+copy_sandbox_scripts "$LS_REPO"
+
+LS_PLAN_OUTPUT="$(
+  cd "$LS_REPO" || exit 1
+  PATH="${FAKE_BIN_DIR}:${PATH}" bash scripts/sandbox-exec.sh --print-plan
+)"
+LS_REPO_BASENAME="$(basename "$LS_REPO")"
+LS_HOST_ROOT="$(plan_value repo_root "$LS_PLAN_OUTPUT")"
+
+DW_TEST_MANIFEST="$(mktemp "${TMPDIR:-/tmp}/dw-test-manifest.XXXXXX")"
+DW_TEST_RM_LOG="$(mktemp "${TMPDIR:-/tmp}/dw-test-rmlog.XXXXXX")"
+: > "$DW_TEST_RM_LOG"
+
+# 1) label ありで現リポジトリに属するコンテナ（現行の起動中コンテナを模す）
+# 2) label なしの旧命名残骸で、マウント元が現リポジトリのルート配下（回収されるべき）
+# 3) label ありで他リポジトリに属するコンテナ（--down --all の対象に含まれてはいけない）
+# 4) label なしで、マウント元が他リポジトリ配下（対象に含まれてはいけない）
+cat > "$DW_TEST_MANIFEST" <<MANIFEST
+dw-sandbox-${LS_REPO_BASENAME}|1|${LS_REPO_BASENAME}||dev-sandbox:${LS_REPO_BASENAME}|running|2024-01-01T00:00:00Z|${LS_HOST_ROOT}
+dw-sandbox-${LS_REPO_BASENAME}-legacy|||||exited|2023-01-01T00:00:00Z|${LS_HOST_ROOT}/.claude/worktrees/agent-old
+dw-sandbox-otherrepo|1|otherrepo||dev-sandbox:otherrepo|running|2024-02-02T00:00:00Z|/home/user/otherrepo
+dw-sandbox-otherrepo-legacy|||||exited|2023-03-03T00:00:00Z|/home/user/otherrepo/subdir
+MANIFEST
+
+FAKE_DOCKER_MANIFEST_DIR="$(mktemp -d "${TMPDIR:-/tmp}/dw-test-fakebin-manifest.XXXXXX")"
+cat > "${FAKE_DOCKER_MANIFEST_DIR}/docker" <<'FAKE_DOCKER_MANIFEST'
+#!/bin/bash
+# tests/run-tests.sh 用の偽 docker（マニフェスト駆動）。ps / container inspect / rm のみ対応する。
+set -u
+MANIFEST="${DW_TEST_MANIFEST:?DW_TEST_MANIFEST is required}"
+
+manifest_line() {
+  awk -F'|' -v n="$1" '$1==n{print; exit}' "$MANIFEST"
+}
+
+case "${1:-}" in
+  ps)
+    shift
+    filter=""
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        --filter) filter="$2"; shift 2 ;;
+        --format) shift 2 ;;
+        *) shift ;;
+      esac
+    done
+    case "$filter" in
+      "label=dev-workflow.managed=1")
+        awk -F'|' '$2=="1"{print $1}' "$MANIFEST"
+        ;;
+      "name=dw-sandbox-")
+        awk -F'|' '$1 ~ /dw-sandbox-/{print $1}' "$MANIFEST"
+        ;;
+    esac
+    exit 0
+    ;;
+  container)
+    shift
+    [ "${1:-}" = "inspect" ] || exit 1
+    shift
+    tmpl=""
+    name=""
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        -f) tmpl="$2"; shift 2 ;;
+        *) name="$1"; shift ;;
+      esac
+    done
+    line="$(manifest_line "$name")"
+    [ -n "$line" ] || exit 1
+    IFS='|' read -r f_name f_managed f_repo f_epic f_image f_status f_created f_mount <<< "$line"
+    case "$tmpl" in
+      *'dev-workflow.repo'*) printf '%s\n' "$f_repo" ;;
+      *'dev-workflow.epic'*) printf '%s\n' "$f_epic" ;;
+      *'Mounts'*)            printf '%s\n' "$f_mount" ;;
+      *'Config.Image'*)      printf '%s\n' "$f_image" ;;
+      *'State.Status'*)      printf '%s\n' "$f_status" ;;
+      *'Created'*)           printf '%s\n' "$f_created" ;;
+      *)                     printf '\n' ;;
+    esac
+    exit 0
+    ;;
+  rm)
+    shift
+    target=""
+    for a in "$@"; do
+      case "$a" in
+        -f) ;;
+        *) target="$a" ;;
+      esac
+    done
+    echo "$target" >> "${DW_TEST_RM_LOG:?DW_TEST_RM_LOG is required}"
+    exit 0
+    ;;
+  *)
+    exit 1
+    ;;
+esac
+FAKE_DOCKER_MANIFEST
+chmod +x "${FAKE_DOCKER_MANIFEST_DIR}/docker"
+
+# --- --ls: 他リポジトリの管理コンテナも含めて一覧表示する ---
+LS_OUTPUT="$(
+  cd "$LS_REPO" || exit 1
+  DW_TEST_MANIFEST="$DW_TEST_MANIFEST" PATH="${FAKE_DOCKER_MANIFEST_DIR}:${PATH}" \
+    bash scripts/sandbox-exec.sh --ls
+)"
+
+case "$LS_OUTPUT" in
+  *"dw-sandbox-${LS_REPO_BASENAME}"*"dw-sandbox-otherrepo"*|*"dw-sandbox-otherrepo"*"dw-sandbox-${LS_REPO_BASENAME}"*)
+    pass "--ls は自リポジトリと他リポジトリの管理コンテナを両方表示する"
+    ;;
+  *)
+    fail "--ls は自リポジトリと他リポジトリの管理コンテナを両方表示する" "output=[${LS_OUTPUT}]"
+    ;;
+esac
+
+if printf '%s\n' "$LS_OUTPUT" | grep -q "dw-sandbox-${LS_REPO_BASENAME}-legacy"; then
+  pass "--ls は label なしの旧命名残骸も表示する"
+else
+  fail "--ls は label なしの旧命名残骸も表示する" "output=[${LS_OUTPUT}]"
+fi
+
+# --- --down --all: 削除前に対象名を列挙し、自リポジトリ分のみ削除する ---
+: > "$DW_TEST_RM_LOG"
+DOWN_ALL_OUTPUT="$(
+  cd "$LS_REPO" || exit 1
+  DW_TEST_MANIFEST="$DW_TEST_MANIFEST" DW_TEST_RM_LOG="$DW_TEST_RM_LOG" \
+    PATH="${FAKE_DOCKER_MANIFEST_DIR}:${PATH}" \
+    bash scripts/sandbox-exec.sh --down --all
+)"
+
+if printf '%s\n' "$DOWN_ALL_OUTPUT" | grep -q "dw-sandbox-${LS_REPO_BASENAME}$"; then
+  pass "--down --all は削除前に label ありの自リポジトリコンテナ名を列挙する"
+else
+  fail "--down --all は削除前に label ありの自リポジトリコンテナ名を列挙する" "output=[${DOWN_ALL_OUTPUT}]"
+fi
+
+if printf '%s\n' "$DOWN_ALL_OUTPUT" | grep -q "dw-sandbox-${LS_REPO_BASENAME}-legacy"; then
+  pass "--down --all は削除前に label なしの旧命名残骸（マウント元一致）も列挙する"
+else
+  fail "--down --all は削除前に label なしの旧命名残骸（マウント元一致）も列挙する" "output=[${DOWN_ALL_OUTPUT}]"
+fi
+
+if printf '%s\n' "$DOWN_ALL_OUTPUT" | grep -q "otherrepo"; then
+  fail "--down --all は他リポジトリのコンテナを列挙しない" "output=[${DOWN_ALL_OUTPUT}]"
+else
+  pass "--down --all は他リポジトリのコンテナを列挙しない"
+fi
+
+RM_LOG_CONTENT="$(cat "$DW_TEST_RM_LOG")"
+RM_LOG_COUNT="$(printf '%s\n' "$RM_LOG_CONTENT" | grep -c . || true)"
+assert_eq "--down --all は自リポジトリ分の2件だけを docker rm する" "2" "$RM_LOG_COUNT"
+
+if printf '%s\n' "$RM_LOG_CONTENT" | grep -q "otherrepo"; then
+  fail "--down --all は他リポジトリのコンテナを削除しない" "rm_log=[${RM_LOG_CONTENT}]"
+else
+  pass "--down --all は他リポジトリのコンテナを削除しない"
+fi
 
 # ---------------------------------------------------------------------------
 # 結果集計

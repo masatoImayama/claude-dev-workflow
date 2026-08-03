@@ -12,7 +12,9 @@
 #   bash scripts/sandbox-exec.sh 'go build ./... && go test ./...'   # 実行（複数コマンドは1回にまとめる）
 #   bash scripts/sandbox-exec.sh --epic epic259 'make test'          # Epic単位でコンテナを分ける
 #   bash scripts/sandbox-exec.sh --warm 'go build ./...'             # キャッシュを温める（失敗しても成功扱い）
-#   bash scripts/sandbox-exec.sh --down                              # 常駐コンテナを削除（キャッシュは残す）
+#   bash scripts/sandbox-exec.sh --down                              # 現在の repo+epic のコンテナを削除（キャッシュは残す）
+#   bash scripts/sandbox-exec.sh --down --all                        # 現在のリポジトリに属する管理コンテナを全て削除
+#   bash scripts/sandbox-exec.sh --ls                                # 管理コンテナを一覧表示（他リポジトリ分も含む）
 #   bash scripts/sandbox-exec.sh --reset-cache                       # キャッシュ volume も削除
 #   bash scripts/sandbox-exec.sh --print-plan                        # docker に触れず解決結果を表示（ドライラン）
 #
@@ -27,6 +29,9 @@ set -u
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
+# shellcheck source=lib/container-membership.sh
+. "${SCRIPT_DIR}/lib/container-membership.sh"
+
 # 言語ごとのキャッシュ置き場。存在しないパスを指定しても docker が作るだけなので無害。
 # イメージが root 以外のユーザーで動く場合は DEV_WORKFLOW_CACHE_PATHS で上書きする。
 DEFAULT_CACHE_PATHS="/root/.cache/go-build /go/pkg/mod /root/.npm /root/.cache/yarn /root/.cargo/registry /root/.cache/pip"
@@ -35,6 +40,7 @@ COMPOSE_SERVICE="${DEV_WORKFLOW_COMPOSE_SERVICE:-app}"
 
 EPIC=""
 WARM=0
+ALL=0
 ACTION="exec"
 
 while [ $# -gt 0 ]; do
@@ -42,6 +48,8 @@ while [ $# -gt 0 ]; do
     --epic)        EPIC="${2:-}"; shift 2 ;;
     --warm)        WARM=1; shift ;;
     --down)        ACTION="down"; shift ;;
+    --all)         ALL=1; shift ;;
+    --ls)          ACTION="ls"; shift ;;
     --reset-cache) ACTION="reset-cache"; shift ;;
     --print-plan)  ACTION="print-plan"; shift ;;
     --)            shift; break ;;
@@ -166,12 +174,91 @@ print_plan() {
   done
 }
 
+# 管理コンテナの列挙・後片付け（仕様書 4.2 / 4.5）。
+# 「管理コンテナ」の候補は次の2系統の和集合とする（重複は名前で除去する）:
+#   1. label（dev-workflow.managed=1）を持つコンテナ
+#   2. label を持たない旧命名の残骸（名前が dw-sandbox- で始まるコンテナ）
+# 1 は他リポジトリ・他 epic のものも含む。2 は所属判定（container_belongs_to_repo）で
+# マウント元を見て絞り込む必要があるため、ここでは名前だけを集める。
+container_field() {
+  # container_field <container名> <goテンプレート>
+  docker container inspect -f "$2" "$1" 2>/dev/null || true
+}
+
+list_managed_candidate_names() {
+  {
+    docker ps -a --filter "label=dev-workflow.managed=1" --format '{{.Names}}' 2>/dev/null
+    docker ps -a --filter "name=dw-sandbox-" --format '{{.Names}}' 2>/dev/null
+  } | sort -u
+}
+
+MOUNT_SOURCE_TEMPLATE='{{ range .Mounts }}{{ if eq .Destination "/workspace" }}{{ .Source }}{{ end }}{{ end }}'
+
+list_managed() {
+  local name label_repo label_epic image status created found=0
+
+  printf '%-40s %-20s %-15s %-30s %-12s %s\n' "NAME" "REPO" "EPIC" "IMAGE" "STATUS" "CREATED"
+
+  while IFS= read -r name; do
+    [ -n "$name" ] || continue
+    found=1
+    label_repo="$(container_field "$name" '{{ index .Config.Labels "dev-workflow.repo" }}')"
+    label_epic="$(container_field "$name" '{{ index .Config.Labels "dev-workflow.epic" }}')"
+    image="$(container_field "$name" '{{ .Config.Image }}')"
+    status="$(container_field "$name" '{{ .State.Status }}')"
+    created="$(container_field "$name" '{{ .Created }}')"
+    printf '%-40s %-20s %-15s %-30s %-12s %s\n' \
+      "$name" "${label_repo:--}" "${label_epic:--}" "${image:--}" "${status:--}" "${created:--}"
+  done < <(list_managed_candidate_names)
+
+  [ "$found" -eq 1 ] || echo "管理コンテナはありません"
+}
+
+down_all() {
+  local name label_repo mount_source
+  local -a targets=()
+
+  while IFS= read -r name; do
+    [ -n "$name" ] || continue
+    label_repo="$(container_field "$name" '{{ index .Config.Labels "dev-workflow.repo" }}')"
+    mount_source="$(container_field "$name" "$MOUNT_SOURCE_TEMPLATE")"
+    if container_belongs_to_repo "$label_repo" "$mount_source" "$HOST_ROOT" "$PROJECT"; then
+      targets+=("$name")
+    fi
+  done < <(list_managed_candidate_names)
+
+  if [ "${#targets[@]}" -eq 0 ]; then
+    echo "削除対象の管理コンテナはありません（repo=${PROJECT}）"
+    return 0
+  fi
+
+  echo "削除対象のコンテナ（repo=${PROJECT}）:"
+  for name in "${targets[@]}"; do
+    echo "  - ${name}"
+  done
+
+  for name in "${targets[@]}"; do
+    docker rm -f "$name" >/dev/null 2>&1 || true
+  done
+
+  echo "削除しました: ${#targets[@]}件"
+}
+
 eval "$(bash "${SCRIPT_DIR}/resolve-sandbox.sh")"
 
 case "$ACTION" in
   down)
+    if [ "$ALL" -eq 1 ]; then
+      down_all
+      exit 0
+    fi
+    echo "削除対象のコンテナ: ${CONTAINER}"
     docker rm -f "$CONTAINER" >/dev/null 2>&1 || true
     echo "常駐コンテナを削除しました: ${CONTAINER}（キャッシュ volume は残しています）"
+    exit 0
+    ;;
+  ls)
+    list_managed
     exit 0
     ;;
   reset-cache)
@@ -221,9 +308,7 @@ case "$DEV_WORKFLOW_SANDBOX_MODE" in
     # 実行してしまう経路になるため削除して作り直す（仕様書 4.3 の 2）。
     # イメージID差分による再作成は #8 で追加する。
     if docker container inspect "$CONTAINER" >/dev/null 2>&1; then
-      EXISTING_MOUNT="$(docker container inspect \
-        -f '{{ range .Mounts }}{{ if eq .Destination "/workspace" }}{{ .Source }}{{ end }}{{ end }}' \
-        "$CONTAINER" 2>/dev/null || true)"
+      EXISTING_MOUNT="$(container_field "$CONTAINER" "$MOUNT_SOURCE_TEMPLATE")"
       if [ -n "$EXISTING_MOUNT" ] && [ "$EXISTING_MOUNT" != "$MOUNT_SOURCE" ]; then
         echo "WARNING: 既存コンテナ ${CONTAINER} のマウント元 (${EXISTING_MOUNT}) が期待値 (${MOUNT_SOURCE}) と異なるため削除して作り直します（別ツリー実行の防止）" >&2
         docker rm -f "$CONTAINER" >/dev/null 2>&1 || true
@@ -234,6 +319,10 @@ case "$DEV_WORKFLOW_SANDBOX_MODE" in
     if ! docker container inspect "$CONTAINER" >/dev/null 2>&1; then
       # shellcheck disable=SC2046  # マウント引数は意図的に単語分割する
       docker run -d --name "$CONTAINER" \
+        --label "dev-workflow.managed=1" \
+        --label "dev-workflow.repo=${PROJECT}" \
+        --label "dev-workflow.epic=${EPIC}" \
+        --label "dev-workflow.root=${HOST_ROOT}" \
         -v "${MOUNT_SOURCE}:/workspace" $(cache_mount_args) \
         -w /workspace "$DEV_WORKFLOW_SANDBOX_IMAGE" sleep infinity >/dev/null || {
           echo "ERROR: サンドボックスコンテナを起動できません: ${CONTAINER}" >&2
