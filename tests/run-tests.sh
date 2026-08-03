@@ -91,11 +91,18 @@ make_worktree() {
 copy_sandbox_scripts() {
   # copy_sandbox_scripts <dest_repo_dir>
   # sandbox-exec.sh / resolve-sandbox.sh / Dockerfile.dev を検証対象の一時リポジトリへ複製する。
+  # worktree はコミット済みの内容しか見えないため、複製後にコミットまで済ませる
+  # （worktree からもスクリプトを実行できるようにするため）。
   local dest="$1"
   mkdir -p "${dest}/scripts"
   cp "${REPO_ROOT}/scripts/sandbox-exec.sh"   "${dest}/scripts/sandbox-exec.sh"
   cp "${REPO_ROOT}/scripts/resolve-sandbox.sh" "${dest}/scripts/resolve-sandbox.sh"
   cp "${REPO_ROOT}/Dockerfile.dev"             "${dest}/Dockerfile.dev"
+  (
+    cd "$dest" || exit 1
+    git add scripts Dockerfile.dev
+    git commit -q -m "add sandbox scripts"
+  ) >/dev/null 2>&1
 }
 
 # ---------------------------------------------------------------------------
@@ -219,6 +226,98 @@ if [ -f "$DOCKER_CALLED_MARKER" ]; then
 else
   pass "--epic 付き --print-plan も docker を起動しない"
 fi
+
+# ---------------------------------------------------------------------------
+# ケース1〜6: パス解決とコンテナ名の一致（Epic #3 仕様書「5. 検証方針」のケース1〜6、Task #5）
+#
+# バインドマウント先をリポジトリルートに固定し、コンテナを epic 単位にする変更の検証。
+# リポジトリルート / epic worktree / agent worktree のいずれから叩いても
+# container が完全に一致し、workdir だけが相対パス分だけ変わることを確認する。
+# ---------------------------------------------------------------------------
+
+echo "== パス解決とコンテナ名（ケース1〜6） =="
+
+plan_value() {
+  # plan_value <key> <output>  出力から key=value の value 部分（先頭一致1件）を取り出す
+  printf '%s\n' "$2" | grep "^${1}=" | head -n1 | cut -d'=' -f2-
+}
+
+print_plan_in() {
+  # print_plan_in <dir> [追加の引数...]  <dir> で --print-plan を実行し出力全体を返す
+  local dir="$1"
+  shift
+  (
+    cd "$dir" || exit 1
+    PATH="${FAKE_BIN_DIR}:${PATH}" bash scripts/sandbox-exec.sh --print-plan "$@"
+  )
+}
+
+# --- ケース1: リポジトリルートから ---
+CASE1_OUTPUT="$(print_plan_in "$PRINT_PLAN_REPO")"
+
+assert_eq "ケース1: rel_path は空" "" "$(plan_value rel_path "$CASE1_OUTPUT")"
+assert_eq "ケース1: fallback は0" "0" "$(plan_value fallback "$CASE1_OUTPUT")"
+assert_eq "ケース1: workdir は /workspace" "/workspace" "$(plan_value workdir "$CASE1_OUTPUT")"
+
+CASE1_CONTAINER="$(plan_value container "$CASE1_OUTPUT")"
+
+# --- ケース2: epic worktree（.claude/worktrees/epicN）から ---
+EPIC_WORKTREE_DIR="${PRINT_PLAN_REPO}/.claude/worktrees/epic5"
+make_worktree "$PRINT_PLAN_REPO" "$EPIC_WORKTREE_DIR" "epic-worktree-branch"
+
+CASE2_OUTPUT="$(print_plan_in "$EPIC_WORKTREE_DIR")"
+
+assert_eq "ケース2: rel_path は .claude/worktrees/epic5" ".claude/worktrees/epic5" "$(plan_value rel_path "$CASE2_OUTPUT")"
+assert_eq "ケース2: workdir は相対パス" "/workspace/.claude/worktrees/epic5" "$(plan_value workdir "$CASE2_OUTPUT")"
+assert_eq "ケース2: container はルート実行時と同一" "$CASE1_CONTAINER" "$(plan_value container "$CASE2_OUTPUT")"
+
+# --- ケース3: agent worktree（.claude/worktrees/agent-x）から ---
+AGENT_WORKTREE_DIR="${PRINT_PLAN_REPO}/.claude/worktrees/agent-x"
+make_worktree "$PRINT_PLAN_REPO" "$AGENT_WORKTREE_DIR" "agent-worktree-branch"
+
+CASE3_OUTPUT="$(print_plan_in "$AGENT_WORKTREE_DIR")"
+
+assert_eq "ケース3: rel_path は .claude/worktrees/agent-x" ".claude/worktrees/agent-x" "$(plan_value rel_path "$CASE3_OUTPUT")"
+assert_eq "ケース3: workdir は相対パス" "/workspace/.claude/worktrees/agent-x" "$(plan_value workdir "$CASE3_OUTPUT")"
+assert_eq "ケース3: container はケース1・2と同一" "$CASE1_CONTAINER" "$(plan_value container "$CASE3_OUTPUT")"
+
+# --- ケース4: --epic 無し + DEV_WORKFLOW_EPIC あり ---
+CASE4_OUTPUT="$(
+  cd "$PRINT_PLAN_REPO" || exit 1
+  DEV_WORKFLOW_EPIC=epic777 PATH="${FAKE_BIN_DIR}:${PATH}" bash scripts/sandbox-exec.sh --print-plan
+)"
+assert_eq "ケース4: DEV_WORKFLOW_EPIC がコンテナ名に反映される" "${CASE1_CONTAINER}-epic777" "$(plan_value container "$CASE4_OUTPUT")"
+assert_eq "ケース4: epic の値も DEV_WORKFLOW_EPIC になる" "epic777" "$(plan_value epic "$CASE4_OUTPUT")"
+
+# --- ケース5: リポジトリ外の worktree（フォールバック） ---
+OUTSIDE_WORKTREE_DIR="$(mktemp -d "${TMPDIR:-/tmp}/dw-test-outside.XXXXXX")"
+make_worktree "$PRINT_PLAN_REPO" "$OUTSIDE_WORKTREE_DIR" "outside-worktree-branch"
+
+CASE5_STDERR="$(mktemp "${TMPDIR:-/tmp}/dw-test-case5-stderr.XXXXXX")"
+CASE5_OUTPUT="$(
+  cd "$OUTSIDE_WORKTREE_DIR" || exit 1
+  PATH="${FAKE_BIN_DIR}:${PATH}" bash scripts/sandbox-exec.sh --print-plan 2>"$CASE5_STDERR"
+)"
+
+assert_eq "ケース5: fallback は1" "1" "$(plan_value fallback "$CASE5_OUTPUT")"
+
+CASE5_CONTAINER="$(plan_value container "$CASE5_OUTPUT")"
+if [ "$CASE5_CONTAINER" != "$CASE1_CONTAINER" ]; then
+  pass "ケース5: container がリポジトリ共有コンテナと分離される"
+else
+  fail "ケース5: container がリポジトリ共有コンテナと分離される" "container=[${CASE5_CONTAINER}]（共有コンテナと同一でした）"
+fi
+
+if [ -s "$CASE5_STDERR" ]; then
+  pass "ケース5: フォールバック時に stderr へ警告する"
+else
+  fail "ケース5: フォールバック時に stderr へ警告する" "stderr が空でした"
+fi
+
+# --- ケース6: キャッシュ volume 名がリポジトリ単位である（worktree から叩いても変わらない） ---
+CASE1_CACHE="$(plan_value cache_volume "$CASE1_OUTPUT")"
+CASE3_CACHE="$(plan_value cache_volume "$CASE3_OUTPUT")"
+assert_eq "ケース6: cache_volume はリポジトリ単位（worktree から叩いても同じ）" "$CASE1_CACHE" "$CASE3_CACHE"
 
 # ---------------------------------------------------------------------------
 # 結果集計

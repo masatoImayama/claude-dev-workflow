@@ -58,20 +58,65 @@ sanitize() { printf '%s' "$1" | tr -c 'A-Za-z0-9_.-' '-'; }
 # 勝手に変換してしまう。MSYS_NO_PATHCONV=1 で変換を止めた上で、マウント元だけは
 # `pwd -W` で Windows 形式の絶対パスを明示する。Linux/macOS では pwd -W が無いので pwd を使う。
 export MSYS_NO_PATHCONV=1
-HOST_PWD="$(pwd -W 2>/dev/null || pwd)"
+CUR="$(pwd -W 2>/dev/null || pwd)"
+
+# パス解決（仕様書 4.1）。
+# バインドマウント先はリポジトリルート（worktree ではない）に固定する。これにより
+# generator の isolation worktree（agent-<id>）や epic worktree が何個増えても
+# コンテナは増えない。コンテナ内の作業ディレクトリはリポジトリルートからの相対パスで切り替える。
+GIT_COMMON="$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null || true)"
+
+FALLBACK=0
+REL=""
+
+if [ -n "$GIT_COMMON" ]; then
+  REPO_ROOT="$(dirname "$GIT_COMMON")"
+  HOST_ROOT="$(cd "$REPO_ROOT" && { pwd -W 2>/dev/null || pwd; })"
+  case "$CUR" in
+    "$HOST_ROOT")
+      REL=""
+      ;;
+    "$HOST_ROOT"/*)
+      REL="${CUR#"$HOST_ROOT"/}"
+      ;;
+    *)
+      # 現在のディレクトリがリポジトリルート配下にない（リポジトリ外に作られた
+      # 兄弟 worktree 等）。従来どおり現在のディレクトリをマウントし、
+      # epic 共有コンテナと混ざらないようコンテナ名を分離する。
+      FALLBACK=1
+      ;;
+  esac
+else
+  # git リポジトリでない場合は従来どおり現在のディレクトリを使う。
+  REPO_ROOT="$CUR"
+  HOST_ROOT="$CUR"
+fi
+
+if [ "$FALLBACK" -eq 1 ]; then
+  MOUNT_SOURCE="$CUR"
+  echo "WARNING: 現在のディレクトリ (${CUR}) はリポジトリルート (${HOST_ROOT}) の外にあります。フォールバックとして現在のディレクトリをマウントし、コンテナは epic 共有コンテナとは分離します。" >&2
+else
+  MOUNT_SOURCE="$HOST_ROOT"
+fi
+
+WORKDIR="/workspace"
+[ -n "$REL" ] && WORKDIR="/workspace/${REL}"
 
 # キャッシュはリポジトリ単位で共有する。worktree の basename（agent-xxxx 等）を使うと
 # generator の isolation worktree ごとに別キャッシュになり、キャッシュが効かなくなる。
-GIT_COMMON="$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null || true)"
-if [ -n "$GIT_COMMON" ]; then
-  PROJECT="$(basename "$(dirname "$GIT_COMMON")")"
-else
-  PROJECT="$(basename "$(pwd)")"
-fi
+# フォールバック時も PROJECT はリポジトリルート基準のまま変えない（キャッシュは常にリポジトリ単位）。
+PROJECT="$(basename "$REPO_ROOT")"
 
-# コンテナはバインドマウント先が異なるため worktree 単位で分ける。
-SLUG="$(sanitize "$(basename "$(pwd)")")"
+# コンテナ名（仕様書 4.2）。repo は REPO_ROOT の basename（worktree の basename は使わない）。
+# --epic 未指定時は環境変数 DEV_WORKFLOW_EPIC を参照する
+# （generator が --epic を渡し忘れても同じコンテナに載るようにするため）。
+[ -z "$EPIC" ] && EPIC="${DEV_WORKFLOW_EPIC:-}"
+
+SLUG="$(sanitize "$PROJECT")"
 [ -n "$EPIC" ] && SLUG="${SLUG}-$(sanitize "$EPIC")"
+
+# フォールバック時は当該ディレクトリ名をコンテナ名に含め、epic 共有コンテナと混ざらないようにする。
+[ "$FALLBACK" -eq 1 ] && SLUG="${SLUG}-$(sanitize "$(basename "$CUR")")"
 
 CONTAINER="dw-sandbox-${SLUG}"
 
@@ -90,18 +135,20 @@ cache_mount_args() {
 
 # --print-plan: docker に一切触れず、解決結果を key=value 形式で出力するドライラン。
 # 「コンテナ名・イメージタグ・マウント元」を外から観測できる形にし、テストで固定するために用意する。
-# この時点では現行の解決結果をそのまま出す（挙動は変えない）。
-# repo_root / rel_path / fallback / build_context / compose_* は後続タスクで追加する。
+# build_context / compose_* は後続タスク（#8, #9）で追加する。
 print_plan() {
   printf 'mode=%s\n' "${DEV_WORKFLOW_SANDBOX_MODE:-}"
   printf 'repo=%s\n'  "$PROJECT"
   printf 'epic=%s\n'  "$EPIC"
+  printf 'repo_root=%s\n' "$HOST_ROOT"
+  printf 'rel_path=%s\n'  "$REL"
+  printf 'fallback=%s\n'  "$FALLBACK"
 
   case "${DEV_WORKFLOW_SANDBOX_MODE:-}" in
     dockerfile)
-      printf 'mount_source=%s\n' "$HOST_PWD"
+      printf 'mount_source=%s\n' "$MOUNT_SOURCE"
       printf 'mount_target=%s\n' "/workspace"
-      printf 'workdir=%s\n'      "/workspace"
+      printf 'workdir=%s\n'      "$WORKDIR"
       ;;
     *)
       printf 'mount_source=\n'
@@ -170,11 +217,24 @@ case "$DEV_WORKFLOW_SANDBOX_MODE" in
     ;;
 
   dockerfile)
+    # 既存コンテナのマウント元が期待値（MOUNT_SOURCE）と異なる場合は、別ツリーを
+    # 実行してしまう経路になるため削除して作り直す（仕様書 4.3 の 2）。
+    # イメージID差分による再作成は #8 で追加する。
+    if docker container inspect "$CONTAINER" >/dev/null 2>&1; then
+      EXISTING_MOUNT="$(docker container inspect \
+        -f '{{ range .Mounts }}{{ if eq .Destination "/workspace" }}{{ .Source }}{{ end }}{{ end }}' \
+        "$CONTAINER" 2>/dev/null || true)"
+      if [ -n "$EXISTING_MOUNT" ] && [ "$EXISTING_MOUNT" != "$MOUNT_SOURCE" ]; then
+        echo "WARNING: 既存コンテナ ${CONTAINER} のマウント元 (${EXISTING_MOUNT}) が期待値 (${MOUNT_SOURCE}) と異なるため削除して作り直します（別ツリー実行の防止）" >&2
+        docker rm -f "$CONTAINER" >/dev/null 2>&1 || true
+      fi
+    fi
+
     # 常駐コンテナが無ければ起動する。sleep infinity で待機させ、以降は exec で叩く。
     if ! docker container inspect "$CONTAINER" >/dev/null 2>&1; then
       # shellcheck disable=SC2046  # マウント引数は意図的に単語分割する
       docker run -d --name "$CONTAINER" \
-        -v "${HOST_PWD}:/workspace" $(cache_mount_args) \
+        -v "${MOUNT_SOURCE}:/workspace" $(cache_mount_args) \
         -w /workspace "$DEV_WORKFLOW_SANDBOX_IMAGE" sleep infinity >/dev/null || {
           echo "ERROR: サンドボックスコンテナを起動できません: ${CONTAINER}" >&2
           exit 1
@@ -186,7 +246,7 @@ case "$DEV_WORKFLOW_SANDBOX_MODE" in
       }
     fi
 
-    run_and_report docker exec -w /workspace "$CONTAINER" sh -c "$CMD"
+    run_and_report docker exec -w "$WORKDIR" "$CONTAINER" sh -c "$CMD"
     exit $?
     ;;
 
