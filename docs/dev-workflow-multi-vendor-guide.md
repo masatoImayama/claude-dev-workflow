@@ -171,6 +171,26 @@ worktree 作成、スケジュールタスクの worktree 実行、Local ↔ Wor
 Epic ごとに1 worktree を割り当てて**逐次実行**するか、シェルループ側が worktree を割り当てて
 `codex exec -C` で起動する方式のいずれかを採る（4.4.3参照）。
 
+#### 3.3.5. レーンの並列起動（Epic #14）
+
+`dev-workflow:run` のタスク実行を、Task issue が宣言した依存関係（`- 前提: #N`）から組む
+依存グラフに基づく**ウェーブ単位の並列実行**に切り替えた（Epic #14）。このうち Claude/Codex で
+対応が分かれるのは「レーンの並列起動」だけであり、それ以外は**共通仕様として `core/instructions.md`
+に規定し、両アダプタに同一の規約として適用する。**
+
+| 項目 | Claude Code | Codex |
+| --- | --- | --- |
+| `- 前提: #N` 記法・ウェーブの概念 | 適用 | 適用 |
+| merge-base 検証・`--ff-only` 廃止・cherry-pick 廃止 | 適用 | 適用 |
+| wave ブランチ経由の統合＋統合ゲート | 適用 | 適用（1レーンのウェーブとして） |
+| **レーンの並列起動（`--lanes` > 1）** | **実装（既定 `--lanes 3`）** | **非対応。`lanes=1` 固定** |
+
+Codex が非対応なのは 3.3.3 の worktree 隔離の粒度による制約（サブエージェント単位の隔離が無い
+ため generator を並行実行できない）が理由であり、「仕様が違う」のではなく「設定値が固定されている
+だけ」という位置づけである。Claude 版の `--lanes 1` と Codex 版はどちらも「1レーンのウェーブ」
+として同じコードパスを通るため、両 run スキル（`skills/run/SKILL.md` /
+`skills-codex/dev-workflow-run/SKILL.md`）の記述は一致する。
+
 #### 3.3.4. ターン上限の相当物はない
 
 `maxTurns: 200` / `120` に相当する設定は Codex に存在しない。最も近いのは
@@ -988,6 +1008,35 @@ v0.10.0 実運用で、期待（epic単位で分離）と実装（worktree単位
 - [x] README.md のサンドボックス節を全面更新（分離単位の表、`--print-plan`、ライフサイクル操作、
       `--reset-cache` の作用範囲、`--rebuild` の使いどころ、compose の既知の限界、CRLF注意）
 - [x] `plugin.json`（両CLI）を v0.11.0 に更新
+
+### Phase G: タスク並列化（Epic #14, 完了）
+
+`--ff-only` が兼ねていた「ベース逸脱の検出」と「履歴の直線性の強制」を分離し、
+Task issue の `- 前提: #N` が作る依存グラフに基づくウェーブ単位の並列実行に切り替えた。
+あわせて generator 1タスクあたりの固定オーバーヘッド（同じ情報を毎タスク読み直す冗長性）を削った。
+
+- [x] `scripts/plan-waves.sh` の新規実装（依存グラフとウェーブ分解・サブバッチ割当・
+      宣言漏れ／循環依存／Epic外参照／スキップ伝播の検出・`--print` ドライラン・`--from-file`）
+- [x] `scripts/merge-lane.sh` の新規実装（merge-base 完全一致検証・`git merge --no-edit`・
+      競合時 `--abort`・成功／ベース逸脱／競合を終了コードで区別）
+- [x] `core/roles/generator.md` の同期手順を是正
+      （`fetch`/`checkout`/`pull` を廃止し、渡された `WAVE_BASE` への検証1回に一本化）
+- [x] `core/instructions.md` に並列実行の共通仕様を規定
+      （`- 前提:` の必須化、ウェーブの概念、merge-base 検証、`--ff-only` 廃止、スキップの伝播、
+      Codex は `lanes=1` 固定であること）
+- [x] `core/roles/planner.md` に依存宣言の必須化と Task issue の自己完結化を規定
+- [x] `skills/run/SKILL.md` をウェーブ実行の本体に書き換え
+      （`--lanes` とサブバッチ、WAVE_BASE の記録、レーンの並列起動、wave ブランチ経由の統合、
+      統合ゲート、リカバリ、ウェーブ所要時間の計測表示）
+- [x] `skills-codex/dev-workflow-run/SKILL.md` / `adapters/codex/run-loop.sh` を
+      `lanes=1` 固定の縮退版として同じ統合手順に合わせる
+- [x] プロジェクト固有準備の Epic 開始時集約（Epic issue 本文の `## 準備コマンド` 節を
+      run が Epic 開始時の `--warm` に1回だけ渡す。generator はタスクごとに再実行しない）
+- [x] `tests/run-tests.sh` に新規2スクリプトのケースを追加し決定論を固定
+- [x] README.md / 本ドキュメントに並列実行の節・対応表を追加、両 `plugin.json` を `v0.12.0` に更新
+
+**完了条件に含めなかったもの**: 実 Epic の並列完走（Tessera 等での実機検証は PR マージ後に
+人間が行う）。
 
 ### 調査済みの事項（初版の未確認リスト）
 
