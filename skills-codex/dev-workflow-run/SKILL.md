@@ -93,7 +93,24 @@ fi
 
 # キャッシュを温めておく（イメージが無ければここで自動ビルドされる。最初のタスクにキャッシュ構築コストを負担させない）
 bash "${CLAUDE_PLUGIN_ROOT}/scripts/sandbox-exec.sh" --epic "$EPIC_NUM" --warm '<build-command>'
+
+# Epic本文に「## 準備コマンド」節があれば、プロジェクト固有の準備（wasm配置等）もここで1回だけ実行する
+PREP_CMD="$(gh issue view <epic番号> --json body -q '.body' \
+  | awk '/^## 準備コマンド/{f=1; next} /^## /{f=0} f' \
+  | sed -n '/^```/,/^```/p' | sed '1d;$d')"
+if [ -n "$PREP_CMD" ]; then
+  echo "Epic本文の準備コマンドを実行します:"
+  echo "$PREP_CMD"
+  bash "${CLAUDE_PLUGIN_ROOT}/scripts/sandbox-exec.sh" --epic "$EPIC_NUM" --warm "$PREP_CMD"
+fi
 ```
+
+**節が無ければ何もしない。** 既存の Epic（`## 準備コマンド` 節が無いもの）は上記の
+`<build-command>` による `--warm` だけが従来どおり走り、この追加ステップの影響を受けない。
+`--warm` は失敗してもループを止めない（`sandbox-exec.sh` の既存挙動）ので、準備コマンドが
+失敗した場合も表示だけしてそのまま先へ進む。コンテナは Epic 単位で常駐するため、この1回の
+準備が以降の全タスクに効く。generator には「タスクごとに再実行しない」旨を明記済み
+（`core/roles/generator.md`）。
 
 **サンドボックスへのコマンド投入は `sandbox-exec.sh` 経由に統一する。** `docker run` を直接
 組み立ててはならない。イメージの解決とビルド（`Dockerfile.dev` の内容 hash でタグ付けし自動
@@ -200,6 +217,8 @@ Task #<番号> を実装してください。
 - `sandbox-exec.sh` を呼ぶ際は必ず `--epic "$EPIC_NUM"` を渡すこと。省略すると環境変数
   `DEV_WORKFLOW_EPIC` が参照されるので、渡し忘れた場合は `export DEV_WORKFLOW_EPIC="$EPIC_NUM"`
   してから叩くこと。渡し忘れると Epic 単位のコンテナに載らずタスクごとに別コンテナが生まれる
+- プロジェクト固有の準備（wasm配置等）は Epic 開始時に run が1回実行済み。**タスクごとに
+  再実行しないこと**。効いていないと判断した場合も自前で再実行せず、その事実を報告すること
 - 回帰確認はプロジェクトの全テストで行うこと。`-run` で絞った結果を「回帰なし」と報告しないこと
 - SKIP されたテストがあれば件数と内容を報告に含めること
 - issueの要件を確認すること。Task issueの記載だけで着手できない場合に限り、

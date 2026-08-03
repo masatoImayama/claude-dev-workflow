@@ -113,6 +113,31 @@ bash "${CLAUDE_PLUGIN_ROOT}/scripts/sandbox-exec.sh" --epic "$EPIC_NUM" --warm '
 コンテナ内でコードをマウントし、全ての実装・テスト・ビルドコマンドをコンテナ内で実行する。
 Gitオペレーション（commit, push等）はホスト側で実行する。
 
+#### プロジェクト固有の準備コマンド（Epic 本文の `## 準備コマンド` 節）
+
+生成物の配置（wasm 等）のような**タスクに依らず同じ結果になる**プロジェクト固有の準備は、
+タスクごとに generator へ繰り返させず、ここ（Epic 開始時）で1回だけ実行する。
+
+```bash
+# Epic本文に「## 準備コマンド」節があれば、その中身（フェンスコードブロックの内容）を取り出す
+PREP_CMD="$(gh issue view $ARGUMENTS --json body -q '.body' \
+  | awk '/^## 準備コマンド/{f=1; next} /^## /{f=0} f' \
+  | sed -n '/^```/,/^```/p' | sed '1d;$d')"
+
+if [ -n "$PREP_CMD" ]; then
+  echo "Epic本文の準備コマンドを実行します:"
+  echo "$PREP_CMD"
+  bash "${CLAUDE_PLUGIN_ROOT}/scripts/sandbox-exec.sh" --epic "$EPIC_NUM" --warm "$PREP_CMD"
+fi
+```
+
+- **節が無ければ何もしない**（上記の `[build-command]` による `--warm` だけが従来どおり走る）。
+  既存の Epic（`## 準備コマンド` 節が無いもの）はこの追加ステップの影響を受けない
+- `--warm` は失敗してもループを止めない（`sandbox-exec.sh` の既存挙動）。準備コマンドが失敗しても
+  表示だけしてそのまま先へ進む
+- コンテナは Epic 単位で常駐するため、この1回の準備が以降の全ウェーブ・全レーンに効く。
+  generator 側には「タスクごとに再実行しない」旨を明記済み（`core/roles/generator.md`）
+
 ### サンドボックスへのコマンド投入は sandbox-exec.sh 経由に統一する
 
 **`docker run` を直接組み立ててはならない。** 以下をすべて `scripts/sandbox-exec.sh` が引き受ける:
@@ -325,6 +350,8 @@ Task #[番号A] を実装してください（レーン A）。
 - サンドボックスへのコマンド投入は `${CLAUDE_PLUGIN_ROOT}/scripts/sandbox-exec.sh` 経由で行い、
   ビルド・テストは1回の呼び出しにまとめること（分けると待ち時間が倍増する）
 - `sandbox-exec.sh` を呼ぶ際は必ず `--epic "$EPIC_NUM"` を渡すこと（例: `--epic "$EPIC_NUM" 'make test'`）
+- プロジェクト固有の準備（wasm配置等）は Epic 開始時に run が1回実行済み。**タスクごとに
+  再実行しないこと**。効いていないと判断した場合も自前で再実行せず、その事実を報告すること
 - 回帰確認はプロジェクトの全テストで行うこと。`-run` で絞った結果を「回帰なし」と報告しないこと
 - SKIP されたテストがあれば件数と内容を報告に含めること
 - issueの要件を確認

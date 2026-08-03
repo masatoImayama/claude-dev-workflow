@@ -87,6 +87,20 @@ else
   git worktree add "$EPIC_WT" "${EPIC_BRANCH}" || exit 1
 fi
 
+# ── プロジェクト固有の準備コマンド（Epic本文の「## 準備コマンド」節。Epic開始時に1回だけ）──
+# 生成物の配置（wasm等）のようなタスクに依らず同じ結果になる準備は、タスクごとに generator へ
+# 繰り返させず、ここで1回だけ実行する。節が無ければ何もしない（既存Epicへの影響なし）。
+# shellcheck disable=SC2016  # フェンス記号はリテラル一致が目的で、展開させない
+PREP_CMD="$(gh issue view "$EPIC_NUMBER" --json body -q '.body' \
+  | awk '/^## 準備コマンド/{f=1; next} /^## /{f=0} f' \
+  | sed -n '/^```/,/^```/p' \
+  | sed '1d;$d')"
+if [ -n "$PREP_CMD" ]; then
+  echo "Epic本文の準備コマンドを実行します:"
+  echo "$PREP_CMD"
+  bash "${PLUGIN_ROOT_DIR}/scripts/sandbox-exec.sh" --epic "$EPIC_NUM" --warm "$PREP_CMD" || true
+fi
+
 # ── codex exec のラッパー ─────────────────────────────────────────────
 # $1: 役割名（.codex/agents/<役割>.toml の name）  $2: プロンプト  $3: 追加引数...
 run_agent() {
