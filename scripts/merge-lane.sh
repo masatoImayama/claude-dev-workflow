@@ -29,9 +29,11 @@
 # 終了コード:
 #   0  取り込み成功
 #   10 merge-base ≠ EXPECTED_BASE（ベース逸脱）。実際の merge-base とそのコミットログを stdout に出す
-#   11 マージ競合（git merge --abort 済み）。競合ファイル一覧を stdout に出す
+#   11 マージ競合（未マージパスが存在し、git merge --abort 済み）。競合ファイル一覧を stdout に出す
 #   2  引数エラー
-#   1  その他の失敗
+#   1  その他の失敗（git merge が非0で終わったが未マージパスが無いケースを含む。
+#      例: ローカル未コミット変更による上書き拒否、unrelated histories 等。
+#      この場合 MERGE_HEAD が存在しないため git merge --abort は試みない）
 #
 # exit 10 のとき cherry-pick による載せ替えは行わない（検証されていないツリーを作る経路を
 # 残さないため）。救済は呼び出し側が「次ウェーブで再実行」として行う（仕様書 5.6）。
@@ -166,12 +168,29 @@ MERGE_OUTPUT="$(git merge --no-edit "$LANE_BRANCH" 2>&1)"
 MERGE_EXIT=$?
 
 if [ "$MERGE_EXIT" -ne 0 ]; then
+  # git merge は競合以外の理由でも非0で終わる（例: ローカル未コミット変更による上書き拒否、
+  # unrelated histories 等）。これらは MERGE_HEAD を作らず、未マージパスも存在しないため、
+  # `git merge --abort` を呼ぶと「There is no merge to abort」で失敗し作業ツリーの汚れが残る。
+  # 未マージパスの有無（.git/MERGE_HEAD の有無と併せて判定）で「本物の競合」かどうかを分岐する。
+  UNMERGED_FILES="$(git diff --name-only --diff-filter=U)"
+  GIT_DIR_PATH="$(git rev-parse --git-dir 2>/dev/null)"
+  MERGE_HEAD_EXISTS=0
+  if [ -n "$GIT_DIR_PATH" ] && [ -f "${GIT_DIR_PATH}/MERGE_HEAD" ]; then
+    MERGE_HEAD_EXISTS=1
+  fi
+
+  if [ -n "$UNMERGED_FILES" ] || [ "$MERGE_HEAD_EXISTS" -eq 1 ]; then
+    echo "$MERGE_OUTPUT"
+    echo "ERROR: マージ競合が発生しました${TASK_LABEL}: ${LANE_BRANCH} -> ${WAVE_BRANCH}"
+    echo "競合ファイル一覧:"
+    echo "$UNMERGED_FILES"
+    git merge --abort
+    exit 11
+  fi
+
   echo "$MERGE_OUTPUT"
-  echo "ERROR: マージ競合が発生しました${TASK_LABEL}: ${LANE_BRANCH} -> ${WAVE_BRANCH}"
-  echo "競合ファイル一覧:"
-  git diff --name-only --diff-filter=U
-  git merge --abort
-  exit 11
+  echo "ERROR: マージに失敗しました（競合ではありません）${TASK_LABEL}: ${LANE_BRANCH} -> ${WAVE_BRANCH}"
+  exit 1
 fi
 
 echo "$MERGE_OUTPUT"

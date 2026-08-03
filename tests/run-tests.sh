@@ -3074,6 +3074,50 @@ ML_NOLANE_BASE="$(ml_head_of "$ML_REPO_NOLANE" HEAD)"
 run_merge_lane "$ML_REPO_NOLANE" --wave-branch "wave/epicT/1" --expected-base "$ML_NOLANE_BASE" --lane-branch no-such-lane-branch --create >/dev/null 2>&1
 assert_exit_code "存在しないレーンブランチは exit 1" 1 "$?"
 
+# --- ケース15（Review #40）: 未コミットのローカル変更でマージが「競合ではない理由」で
+#     失敗した場合、exit 1 になり（exit 11 にならず）、`git merge --abort` を試みない
+#     （呼べば「There is no merge to abort」で失敗し作業ツリーが汚れる）こと。
+#     git merge は "Your local changes to the following files would be overwritten by
+#     merge" で非0終了するが、MERGE_HEAD は作られず未マージパスも無いため、これは
+#     本物の競合と区別しなければならない。 ---
+ML_REPO15="$(make_temp_repo)"
+ml_commit_file "$ML_REPO15" "file.txt" "base\n" "wave base commit"
+ML15_BASE="$(ml_head_of "$ML_REPO15" HEAD)"
+
+(cd "$ML_REPO15" && git branch "wave/epicT/1" "$ML15_BASE") >/dev/null 2>&1
+
+ml_branch_from "$ML_REPO15" "lane-local" "$ML15_BASE"
+ml_commit_file "$ML_REPO15" "file.txt" "lane change\n" "lane local change"
+
+# wave ブランチへ切り替え、file.txt に未コミットの変更を残す（この時点でコミット済みの
+# 変更は無いので checkout 自体は成功する）。merge-lane.sh 自身も同じブランチへ checkout
+# するため（no-op）、この未コミット変更はそのまま merge 実行時まで残る。
+(cd "$ML_REPO15" && git checkout -q "wave/epicT/1") >/dev/null 2>&1
+(cd "$ML_REPO15" && printf 'uncommitted local change\n' > file.txt) >/dev/null 2>&1
+
+ML15_PORCELAIN_BEFORE="$(cd "$ML_REPO15" && git status --porcelain)"
+
+ML15_OUT="$(run_merge_lane "$ML_REPO15" --wave-branch "wave/epicT/1" --expected-base "$ML15_BASE" --lane-branch lane-local --task 16)"
+ML15_EXIT=$?
+assert_exit_code "ケース15: ローカル未コミット変更によるマージ失敗は exit 1（exit 11 にならない）" 1 "$ML15_EXIT"
+
+case "$ML15_OUT" in
+  *"マージ競合が発生しました"*) fail "ケース15: 「マージ競合が発生しました」の見出しは出ない（本物の競合ではないため）" "output=[${ML15_OUT}]" ;;
+  *) pass "ケース15: 「マージ競合が発生しました」の見出しは出ない（本物の競合ではないため）" ;;
+esac
+
+case "$ML15_OUT" in
+  *"マージに失敗しました（競合ではありません）"*) pass "ケース15: 「競合ではない失敗」の見出しが出る" ;;
+  *) fail "ケース15: 「競合ではない失敗」の見出しが出る" "output=[${ML15_OUT}]" ;;
+esac
+
+ML15_MERGE_HEAD_EXISTS="$(cd "$ML_REPO15" && [ -f .git/MERGE_HEAD ] && echo yes || echo no)"
+assert_eq "ケース15: MERGE_HEAD が存在しない（git merge --abort を呼んでいない証跡）" "no" "$ML15_MERGE_HEAD_EXISTS"
+
+ML15_PORCELAIN_AFTER="$(cd "$ML_REPO15" && git status --porcelain)"
+assert_eq "ケース15: 未コミットのローカル変更（file.txt）がそのまま残っている（abort による破棄が起きていない）" \
+  "$ML15_PORCELAIN_BEFORE" "$ML15_PORCELAIN_AFTER"
+
 # ---------------------------------------------------------------------------
 # adapters/codex/run-loop.sh: 統合ゲートが全テストを実行すること（回帰防止 #37）
 #
