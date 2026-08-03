@@ -1622,6 +1622,72 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+# .gitattributes の eol=lf カバレッジ（回帰防止）
+#
+# *.toml（adapters/*/overlays/*.toml・codex-agents/*.toml）に eol=lf 指定が無かったため、
+# core.autocrlf=true の環境でワーキングツリー上の *.toml が CRLF 化され、
+# adapters/codex/build.sh の include 展開（1行ずつの case 一致）が壊れて
+# `build.sh --check` が生成物を誤って STALE 判定する事故が実際に発生した。
+# 同じ障害クラスが *.sh / *.toml のどちらでも起きないことを検証する。
+#
+# このリポジトリ自身（REPO_ROOT）に対して直接 git check-attr を呼ばないのは、
+# generator の worktree（.claude/worktrees/agent-*）はリンク済みworktreeであり、
+# サンドボックスのバインドマウント経由では .git ファイルが指す gitdir の絶対パスが
+# 解決できず `fatal: not a git repository` になる環境依存の問題があるため。
+# 実際に使う .gitattributes の内容を、worktree に依存しない素の一時リポジトリへ
+# コピーして検証する（他のテストケースの make_temp_repo と同じ考え方）。
+# ---------------------------------------------------------------------------
+
+echo "== .gitattributes の eol=lf カバレッジ（回帰防止） =="
+
+GITATTRIBUTES_TEST_REPO="$(make_temp_repo)"
+cp "${REPO_ROOT}/.gitattributes" "${GITATTRIBUTES_TEST_REPO}/.gitattributes"
+(
+  cd "$GITATTRIBUTES_TEST_REPO" || exit 1
+  git add .gitattributes
+  git commit -q -m "add .gitattributes"
+) >/dev/null 2>&1
+
+check_eol_lf() {
+  # check_eol_lf <repo> <プローブ用パス（repo内の任意の相対パスでよい）>
+  # git check-attr eol の解決結果が lf なら true を返す（Docker 非依存）。
+  local repo="$1" probe_path="$2"
+  local eol
+  eol="$(cd "$repo" && git check-attr eol -- "$probe_path" 2>/dev/null | sed -n 's/^.*: eol: //p')"
+  [ "$eol" = "lf" ]
+}
+
+if check_eol_lf "$GITATTRIBUTES_TEST_REPO" "dev-workflow-gitattributes-probe.sh"; then
+  pass ".gitattributes: *.sh の eol 解決が lf である"
+else
+  fail ".gitattributes: *.sh の eol 解決が lf である" "check-attr の解決結果が lf ではありませんでした"
+fi
+
+if check_eol_lf "$GITATTRIBUTES_TEST_REPO" "dev-workflow-gitattributes-probe.toml"; then
+  pass ".gitattributes: *.toml の eol 解決が lf である"
+else
+  fail ".gitattributes: *.toml の eol 解決が lf である" "check-attr の解決結果が lf ではありませんでした"
+fi
+
+if check_eol_lf "$GITATTRIBUTES_TEST_REPO" "adapters/codex/overlays/dev-workflow-gitattributes-probe.toml"; then
+  pass ".gitattributes: adapters/codex/overlays/ 配下の *.toml も eol=lf が効く"
+else
+  fail ".gitattributes: adapters/codex/overlays/ 配下の *.toml も eol=lf が効く" "check-attr の解決結果が lf ではありませんでした"
+fi
+
+if check_eol_lf "$GITATTRIBUTES_TEST_REPO" "codex-agents/dev-workflow-gitattributes-probe.toml"; then
+  pass ".gitattributes: codex-agents/ 配下の *.toml も eol=lf が効く"
+else
+  fail ".gitattributes: codex-agents/ 配下の *.toml も eol=lf が効く" "check-attr の解決結果が lf ではありませんでした"
+fi
+
+if check_eol_lf "$GITATTRIBUTES_TEST_REPO" ".gitattributes"; then
+  pass ".gitattributes: .gitattributes 自身の eol 解決も lf である（自己参照ルール）"
+else
+  fail ".gitattributes: .gitattributes 自身の eol 解決も lf である（自己参照ルール）" "check-attr の解決結果が lf ではありませんでした"
+fi
+
+# ---------------------------------------------------------------------------
 # 結果集計
 # ---------------------------------------------------------------------------
 
