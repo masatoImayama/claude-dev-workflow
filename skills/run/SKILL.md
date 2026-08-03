@@ -403,13 +403,16 @@ IMPL_SEC=$((IMPL_END_SEC - IMPL_START_SEC))
 ### Step 5: wave ブランチへレーンを取り込む
 
 全サブバッチ完了後、Epic worktreeでwaveブランチを作成し、（レーン内ゲートに通った）レーンを
-issue番号順に取り込む。
+issue番号順に取り込む。**`--create` は「1本目のレーン」ではなく、最初に実際に取り込むレーンに
+付ける。** 取り込み対象はレーン内ゲートに通ったレーンに限られるため、issue番号順で先頭の
+レーン（例: レーンA）がレーン内ゲートに失敗していれば、`--create` はレーンBなど次に取り込む
+レーンに付く。
 
 ```bash
 cd "$EPIC_WT"
 MERGE_START_SEC=$(date +%s)   # 「統合」フェーズ（merge-lane.sh群）の計測開始
 
-# 1本目: --create でwaveブランチをWAVE_BASEから作成する
+# 最初に実際に取り込むレーン（レーンAとは限らない）: --create でwaveブランチをWAVE_BASEから作成する
 bash "${CLAUDE_PLUGIN_ROOT}/scripts/merge-lane.sh" \
   --wave-branch "wave/${EPIC_NUM}/${WAVE_NO}" --expected-base "$WAVE_BASE" \
   --lane-branch "[レーンAの作業ブランチ]" --task <番号A> --create
@@ -436,12 +439,23 @@ MERGE_SEC=$((MERGE_END_SEC - MERGE_START_SEC))
 取り込めなかったレーンはこの時点でwaveに含まれない。**先に取り込めたレーンの成果は活かし、
 ウェーブ全体は捨てない。**
 
+**取り込めたレーンが0本の場合**（全レーンがレーン内ゲートに失敗した、またはレーン内ゲートに
+通った全レーンが `merge-lane.sh` から exit 10/11 で拒否された）、`merge-lane.sh --create` が
+一度も成功しておらず `wave/${EPIC_NUM}/${WAVE_NO}` は存在しない。この場合は **Step 6・Step 7 を
+実行せず**、このウェーブの各タスクの試行回数を加算したうえで Step 1 に戻る（次ウェーブへ）。
+
 ### Step 6: wave ブランチで統合ゲートを1回実行する
 
 全レーンの取り込み（成功分のみ）が終わったら、waveブランチ上で**1回だけ**機械的ゲートを実行する。
+**このStepはStep 5で取り込めたレーンが1本以上ある場合のみ実行する**（0本の場合はStep 5末尾の
+分岐を参照）。念のため冒頭で wave ブランチの存在を確認してから進む:
 
 ```bash
 cd "$EPIC_WT"
+git rev-parse --verify -q "refs/heads/wave/${EPIC_NUM}/${WAVE_NO}" >/dev/null || {
+  echo "ERROR: wave/${EPIC_NUM}/${WAVE_NO} が存在しません（取り込めたレーンが0本）。Step 7を実行せずStep 1へ戻ってください"
+  exit 1
+}
 git checkout "wave/${EPIC_NUM}/${WAVE_NO}"
 GATE_START_SEC=$(date +%s)   # 「統合ゲート」フェーズの計測開始
 
@@ -553,10 +567,13 @@ DONE_TASK_COUNT=$((DONE_TASK_COUNT + N))   # N = 直前の「取り込めたレ�
 
 #### 統合ゲート失敗時の原因特定手順
 
+この時点で `wave/${EPIC_NUM}/${WAVE_NO}` は checkout 中のブランチであり、`git branch -f` は
+チェックアウト中のブランチの強制更新を拒否する。**`git checkout -B` で作り直すこと**
+（`git branch -f` の後に `git checkout` を続ける2行構成にはしない）。
+
 ```bash
 cd "$EPIC_WT"
-git branch -f "wave/${EPIC_NUM}/${WAVE_NO}" "$WAVE_BASE"
-git checkout "wave/${EPIC_NUM}/${WAVE_NO}"
+git checkout -B "wave/${EPIC_NUM}/${WAVE_NO}" "$WAVE_BASE"
 
 # レーンを1本ずつ merge-lane.sh で取り込み、そのつどゲートを実行する
 bash "${CLAUDE_PLUGIN_ROOT}/scripts/merge-lane.sh" \

@@ -3134,6 +3134,54 @@ case "$RL_WARN_LOOP_ONELINE" in
 esac
 
 # ---------------------------------------------------------------------------
+# skills/run/SKILL.md: 統合ゲート失敗時のリカバリと0レーン取り込みの分岐
+# （回帰防止 #38, #41）
+# ---------------------------------------------------------------------------
+
+echo ""
+echo "== skills/run/SKILL.md（統合ゲート失敗リカバリ・0レーン分岐の回帰防止 #38, #41） =="
+
+RUN_SKILL="${REPO_ROOT}/skills/run/SKILL.md"
+
+# #38: Step 8「統合ゲート失敗時の原因特定手順」は、この時点で checkout 中の wave ブランチに対して
+# 実行される。`git branch -f` はチェックアウト中のブランチの強制更新を拒否するため使ってはならない。
+RS_STEP8_RECOVERY="$(awk '/^#### 統合ゲート失敗時の原因特定手順/{f=1} /^#### スキップの伝播/{f=0} f' "$RUN_SKILL")"
+
+case "$RS_STEP8_RECOVERY" in
+  *'git branch -f "wave/'*)
+    fail "SKILL.md: 統合ゲート失敗時の原因特定手順がチェックアウト中のwaveブランチに git branch -f を使っていない（#38）" "$RS_STEP8_RECOVERY" ;;
+  *)
+    pass "SKILL.md: 統合ゲート失敗時の原因特定手順がチェックアウト中のwaveブランチに git branch -f を使っていない（#38）" ;;
+esac
+
+case "$RS_STEP8_RECOVERY" in
+  *'git checkout -B "wave/'*)
+    pass "SKILL.md: 統合ゲート失敗時の原因特定手順が git checkout -B でwaveブランチを作り直す（#38）" ;;
+  *)
+    fail "SKILL.md: 統合ゲート失敗時の原因特定手順が git checkout -B でwaveブランチを作り直す（#38）" "$RS_STEP8_RECOVERY" ;;
+esac
+
+# #41: 取り込めたレーンが0本ならwaveブランチは存在しない。Step 5にその分岐が明記され、
+# Step 6の冒頭にブランチ存在確認のガードがあること。
+RS_STEP5="$(awk '/^### Step 5:/{f=1} /^### Step 6:/{f=0} f' "$RUN_SKILL")"
+
+case "$RS_STEP5" in
+  *"取り込めたレーンが0本"*)
+    pass "SKILL.md: Step 5 に「取り込めたレーンが0本」の分岐が明記されている（#41）" ;;
+  *)
+    fail "SKILL.md: Step 5 に「取り込めたレーンが0本」の分岐が明記されている（#41）" "$RS_STEP5" ;;
+esac
+
+RS_STEP6="$(awk '/^### Step 6:/{f=1} /^### Step 7:/{f=0} f' "$RUN_SKILL")"
+
+case "$RS_STEP6" in
+  *'git rev-parse --verify'*)
+    pass "SKILL.md: Step 6 冒頭に wave ブランチ存在確認のガードがある（#41）" ;;
+  *)
+    fail "SKILL.md: Step 6 冒頭に wave ブランチ存在確認のガードがある（#41）" "$RS_STEP6" ;;
+esac
+
+# ---------------------------------------------------------------------------
 # skills-codex/dev-workflow-run/SKILL.md: 統合ゲートの記述が Claude 版と揃っていること
 # （回帰防止 #37）
 # ---------------------------------------------------------------------------
