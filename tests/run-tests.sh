@@ -2623,6 +2623,719 @@ RG35_GIT_HANG_EXIT=$?
 assert_exit_code "timeoutコマンドがPATHに無くても、stdinを開いたまま--gitを叩けば即座に返る" 0 "$RG35_GIT_HANG_EXIT"
 
 # ---------------------------------------------------------------------------
+# plan-waves.sh（依存グラフとウェーブ分解、Task #15、Epic #14 仕様書 5.2）
+#
+# --from-file はタブ区切り、1行1タスク: <番号>\t<state:open|closed>\t<前提行の生テキスト>。
+# 前提行が空文字列＝「- 前提:」行そのものが無い（宣言漏れ）を意味する。docker には一切触れない。
+# ---------------------------------------------------------------------------
+
+echo "== plan-waves.sh（依存グラフとウェーブ分解） =="
+
+PLAN_WAVES_SCRIPT="${REPO_ROOT}/scripts/plan-waves.sh"
+
+pw_value() {
+  # pw_value <task番号> <field> <output>
+  # 出力の "task <n> wave <W> subbatch <S> deps <deps>" 行から field の値を取り出す
+  printf '%s\n' "$3" | awk -F'\t' -v n="$1" -v f="$2" '
+    $1=="task" && $2==n {
+      for (i=1; i<=NF; i++) { if ($i==f) { print $(i+1); exit } }
+    }'
+}
+
+pw_wave_tasks() {
+  # pw_wave_tasks <wave番号> <output>
+  printf '%s\n' "$2" | awk -F'\t' -v w="$1" '$1=="wave" && $2==w {print $4}'
+}
+
+# --- ケース1: Epic #3 の実 issue データ（#4〜#13 の "- 前提:" 宣言）で6ウェーブになる ---
+# #4 は実際に「- 前提:」行が無い（宣言漏れの実例）。fail-safe は「自分より番号が小さい
+# 全タスクに依存」だが、#4 は最小番号なので依存は空になり、警告だけが出る。
+PW_EPIC3_FIXTURE="$(mktemp "${TMPDIR:-/tmp}/dw-test-pw-epic3.XXXXXX")"
+cat > "$PW_EPIC3_FIXTURE" <<'FIXTURE'
+4	open
+5	open	- 前提: #4
+6	open	- 前提: #5（label による所属判定を使う）
+7	open	- 前提: #6
+8	open	- 前提: #5
+9	open	- 前提: #5
+10	open	- 前提: #4
+11	open	- 前提: #4
+12	open	- 前提: #7, #9, #11（全実装の完了後）
+13	open	- 前提: #12
+FIXTURE
+
+PW_EPIC3_OUTPUT="$(bash "$PLAN_WAVES_SCRIPT" --from-file "$PW_EPIC3_FIXTURE")"
+PW_EPIC3_EXIT=$?
+
+assert_exit_code "Epic #3 実データ: exit 0" 0 "$PW_EPIC3_EXIT"
+assert_eq "Epic #3 実データ: 既定の lanes は3" "3" "$(printf '%s\n' "$PW_EPIC3_OUTPUT" | awk -F'\t' '$1=="lanes"{print $2}')"
+assert_eq "Epic #3 実データ: W1={4}" "4" "$(pw_wave_tasks 1 "$PW_EPIC3_OUTPUT")"
+assert_eq "Epic #3 実データ: W2={5,10,11}" "5,10,11" "$(pw_wave_tasks 2 "$PW_EPIC3_OUTPUT")"
+assert_eq "Epic #3 実データ: W3={6,8,9}" "6,8,9" "$(pw_wave_tasks 3 "$PW_EPIC3_OUTPUT")"
+assert_eq "Epic #3 実データ: W4={7}" "7" "$(pw_wave_tasks 4 "$PW_EPIC3_OUTPUT")"
+assert_eq "Epic #3 実データ: W5={12}" "12" "$(pw_wave_tasks 5 "$PW_EPIC3_OUTPUT")"
+assert_eq "Epic #3 実データ: W6={13}" "13" "$(pw_wave_tasks 6 "$PW_EPIC3_OUTPUT")"
+
+if printf '%s\n' "$PW_EPIC3_OUTPUT" | grep -q '^wave	7	'; then
+  fail "Epic #3 実データ: ウェーブは6個で打ち止め（W7が存在しない）"
+else
+  pass "Epic #3 実データ: ウェーブは6個で打ち止め（W7が存在しない）"
+fi
+
+assert_eq "Epic #3 実データ: #12 の deps は 7,9,11" "7,9,11" "$(pw_value 12 deps "$PW_EPIC3_OUTPUT")"
+assert_eq "Epic #3 実データ: #4 は実際に宣言漏れ（前提行が無い）として警告される" \
+  "1" "$(printf '%s\n' "$PW_EPIC3_OUTPUT" | grep -c '^warn	missing-deps	4$')"
+
+# --- ケース2: --lanes 2 でウェーブ2が {5,10} と {11} のサブバッチに割れる ---
+PW_LANES2_OUTPUT="$(bash "$PLAN_WAVES_SCRIPT" --from-file "$PW_EPIC3_FIXTURE" --lanes 2)"
+
+assert_eq "--lanes 2: #5 は subbatch 1" "1" "$(pw_value 5 subbatch "$PW_LANES2_OUTPUT")"
+assert_eq "--lanes 2: #10 は subbatch 1" "1" "$(pw_value 10 subbatch "$PW_LANES2_OUTPUT")"
+assert_eq "--lanes 2: #11 は subbatch 2" "2" "$(pw_value 11 subbatch "$PW_LANES2_OUTPUT")"
+
+# --- ケース3: 「- 前提:」行が無いタスクが「自分より小さい全タスクに依存」となり、
+#     全件宣言漏れなら完全逐次になる ---
+PW_SERIAL_FIXTURE="$(mktemp "${TMPDIR:-/tmp}/dw-test-pw-serial.XXXXXX")"
+cat > "$PW_SERIAL_FIXTURE" <<'FIXTURE'
+501	open
+502	open
+503	open
+FIXTURE
+
+PW_SERIAL_OUTPUT="$(bash "$PLAN_WAVES_SCRIPT" --from-file "$PW_SERIAL_FIXTURE")"
+
+assert_eq "宣言漏れの完全逐次: #501 は wave1（依存なし）" "1" "$(pw_value 501 wave "$PW_SERIAL_OUTPUT")"
+assert_eq "宣言漏れの完全逐次: #502 は wave2（#501 に依存）" "2" "$(pw_value 502 wave "$PW_SERIAL_OUTPUT")"
+assert_eq "宣言漏れの完全逐次: #503 は wave3（#501,#502 に依存）" "3" "$(pw_value 503 wave "$PW_SERIAL_OUTPUT")"
+assert_eq "宣言漏れの完全逐次: #503 の deps は 501,502" "501,502" "$(pw_value 503 deps "$PW_SERIAL_OUTPUT")"
+PW_SERIAL_MISSING_COUNT="$(printf '%s\n' "$PW_SERIAL_OUTPUT" | grep -c '^warn	missing-deps	')"
+assert_eq "宣言漏れの完全逐次: 3件すべてに missing-deps 警告が出る" "3" "$PW_SERIAL_MISSING_COUNT"
+
+# --- ケース4: 循環依存で exit 3 になり、循環に含まれるタスクが列挙される ---
+PW_CYCLE_FIXTURE="$(mktemp "${TMPDIR:-/tmp}/dw-test-pw-cycle.XXXXXX")"
+cat > "$PW_CYCLE_FIXTURE" <<'FIXTURE'
+601	open	- 前提: #602
+602	open	- 前提: #601
+FIXTURE
+
+PW_CYCLE_STDERR="$(bash "$PLAN_WAVES_SCRIPT" --from-file "$PW_CYCLE_FIXTURE" 2>&1 1>/dev/null)"
+PW_CYCLE_EXIT=$?
+
+assert_exit_code "循環依存: exit 3" 3 "$PW_CYCLE_EXIT"
+case "$PW_CYCLE_STDERR" in
+  *"601"*"602"*|*"602"*"601"*) pass "循環依存: 循環に含まれる両タスクがエラーに列挙される" ;;
+  *) fail "循環依存: 循環に含まれる両タスクがエラーに列挙される" "stderr=[${PW_CYCLE_STDERR}]" ;;
+esac
+
+# --- ケース5: Epic外・存在しない issue への依存が warn unknown-dep として報告され、無視される ---
+PW_UNKNOWN_FIXTURE="$(mktemp "${TMPDIR:-/tmp}/dw-test-pw-unknown.XXXXXX")"
+cat > "$PW_UNKNOWN_FIXTURE" <<'FIXTURE'
+701	open	- 前提: #999
+FIXTURE
+
+PW_UNKNOWN_OUTPUT="$(bash "$PLAN_WAVES_SCRIPT" --from-file "$PW_UNKNOWN_FIXTURE")"
+
+assert_eq "unknown-dep: 未知の依存は警告として報告される" "1" \
+  "$(printf '%s\n' "$PW_UNKNOWN_OUTPUT" | grep -c '^warn	unknown-dep	701	999$')"
+assert_eq "unknown-dep: 未知の依存は無視され #701 は wave1 になる" "1" "$(pw_value 701 wave "$PW_UNKNOWN_OUTPUT")"
+assert_eq "unknown-dep: #701 の deps は空（未知の依存を数えない）" "" "$(pw_value 701 deps "$PW_UNKNOWN_OUTPUT")"
+
+# --- ケース6: --skipped の伝播が推移的に効く ---
+PW_SKIP_FIXTURE="$(mktemp "${TMPDIR:-/tmp}/dw-test-pw-skip.XXXXXX")"
+cat > "$PW_SKIP_FIXTURE" <<'FIXTURE'
+801	open
+802	open	- 前提: #801
+803	open	- 前提: #802
+FIXTURE
+
+PW_SKIP_OUTPUT="$(bash "$PLAN_WAVES_SCRIPT" --from-file "$PW_SKIP_FIXTURE" --skipped 802)"
+
+if printf '%s\n' "$PW_SKIP_OUTPUT" | grep -q '^task	802	'; then
+  fail "スキップ伝播: 明示的にスキップした #802 はタスク一覧に出ない" "output=[${PW_SKIP_OUTPUT}]"
+else
+  pass "スキップ伝播: 明示的にスキップした #802 はタスク一覧に出ない"
+fi
+
+if printf '%s\n' "$PW_SKIP_OUTPUT" | grep -q '^task	803	'; then
+  fail "スキップ伝播: #802 に依存する #803 も推移的にスキップされタスク一覧に出ない" "output=[${PW_SKIP_OUTPUT}]"
+else
+  pass "スキップ伝播: #802 に依存する #803 も推移的にスキップされタスク一覧に出ない"
+fi
+
+assert_eq "スキップ伝播: #803 の skip 行に理由（依存先 #802）が出る" "1" \
+  "$(printf '%s\n' "$PW_SKIP_OUTPUT" | grep -c '^skip	803	reason	depends-on-skipped	802$')"
+
+if printf '%s\n' "$PW_SKIP_OUTPUT" | grep -q '^task	801	'; then
+  pass "スキップ伝播: スキップに依存しない #801 は影響を受けない"
+else
+  fail "スキップ伝播: スキップに依存しない #801 は影響を受けない" "output=[${PW_SKIP_OUTPUT}]"
+fi
+
+# --- ケース7: クローズ済み issue への依存が充足済みとして扱われる ---
+PW_CLOSED_FIXTURE="$(mktemp "${TMPDIR:-/tmp}/dw-test-pw-closed.XXXXXX")"
+cat > "$PW_CLOSED_FIXTURE" <<'FIXTURE'
+901	closed
+902	open	- 前提: #901
+FIXTURE
+
+PW_CLOSED_OUTPUT="$(bash "$PLAN_WAVES_SCRIPT" --from-file "$PW_CLOSED_FIXTURE")"
+
+assert_eq "closed依存: クローズ済み依存は充足済みとして扱われ #902 は wave1 になる" "1" "$(pw_value 902 wave "$PW_CLOSED_OUTPUT")"
+assert_eq "closed依存: #902 の deps は空（クローズ済みを数えない）" "" "$(pw_value 902 deps "$PW_CLOSED_OUTPUT")"
+if printf '%s\n' "$PW_CLOSED_OUTPUT" | grep -q '^task	901	'; then
+  fail "closed依存: クローズ済みタスク自体はウェーブ計画の対象に含まれない" "output=[${PW_CLOSED_OUTPUT}]"
+else
+  pass "closed依存: クローズ済みタスク自体はウェーブ計画の対象に含まれない"
+fi
+if printf '%s\n' "$PW_CLOSED_OUTPUT" | grep -q '^warn	unknown-dep	902	901$'; then
+  fail "closed依存: クローズ済み依存は unknown-dep として警告されない" "output=[${PW_CLOSED_OUTPUT}]"
+else
+  pass "closed依存: クローズ済み依存は unknown-dep として警告されない"
+fi
+
+# --- ケース8: --print が人間向けの表を出す（ドライラン） ---
+PW_PRINT_OUTPUT="$(bash "$PLAN_WAVES_SCRIPT" --from-file "$PW_EPIC3_FIXTURE" --print)"
+
+case "$PW_PRINT_OUTPUT" in
+  *"ウェーブ分解"*) pass "--print: 人間向けの見出しが出る" ;;
+  *) fail "--print: 人間向けの見出しが出る" "output=[${PW_PRINT_OUTPUT}]" ;;
+esac
+case "$PW_PRINT_OUTPUT" in
+  *"lanes"$'\t'*) fail "--print: 機械可読な TSV ではなく人間向け表示になっている" "output=[${PW_PRINT_OUTPUT}]" ;;
+  *) pass "--print: 機械可読な TSV ではなく人間向け表示になっている" ;;
+esac
+
+# --- ケース9: 引数バリデーション（引数エラーは exit 2） ---
+bash "$PLAN_WAVES_SCRIPT" >/dev/null 2>&1
+assert_exit_code "--epic も --from-file も無ければ exit 2" 2 "$?"
+
+bash "$PLAN_WAVES_SCRIPT" --epic 14 --from-file "$PW_EPIC3_FIXTURE" >/dev/null 2>&1
+assert_exit_code "--epic と --from-file の同時指定は exit 2" 2 "$?"
+
+bash "$PLAN_WAVES_SCRIPT" --from-file "$PW_EPIC3_FIXTURE" --lanes abc >/dev/null 2>&1
+assert_exit_code "--lanes に数値以外を渡すと exit 2" 2 "$?"
+
+bash "$PLAN_WAVES_SCRIPT" --from-file "${TMPDIR:-/tmp}/dw-test-pw-no-such-file" >/dev/null 2>&1
+assert_exit_code "--from-file に存在しないファイルを渡すと exit 2" 2 "$?"
+
+# --- ケース10: DEV_WORKFLOW_MAX_LANES で既定の --lanes を上書きできる ---
+PW_ENV_LANES_OUTPUT="$(DEV_WORKFLOW_MAX_LANES=5 bash "$PLAN_WAVES_SCRIPT" --from-file "$PW_EPIC3_FIXTURE")"
+assert_eq "DEV_WORKFLOW_MAX_LANES で既定の lanes を上書きできる" "5" \
+  "$(printf '%s\n' "$PW_ENV_LANES_OUTPUT" | awk -F'\t' '$1=="lanes"{print $2}')"
+
+# --- ケース11: --epic に非数値を渡すと exit 2（Task #39: sandbox-exec.sh の --epic とは
+#     別契約で、plan-waves.sh の --epic は数値のEpic issue番号でなければならない） ---
+bash "$PLAN_WAVES_SCRIPT" --epic epic14 >/dev/null 2>&1
+assert_exit_code "--epic に epic14 のような非数値を渡すと exit 2" 2 "$?"
+
+bash "$PLAN_WAVES_SCRIPT" --epic abc >/dev/null 2>&1
+assert_exit_code "--epic に abc のような非数値を渡すと exit 2" 2 "$?"
+
+# 数値の --epic 単体が拒否されないことは、ケース12（gh フェッチが exit 0 で完了すること）で確認する。
+
+# --- ケース12: gh モードで --limit 200 が付き、本文の「- Epic: #N」行でEpic外を除外し、
+#     行が無いタスクはフェイルオープンで含める（Task #39: Epic混入対策と30件上限対策） ---
+PW_GH_FAKE_DIR="$(mktemp -d "${TMPDIR:-/tmp}/dw-test-pw-ghfake.XXXXXX")"
+PW_GH_CALL_MARKER="$(mktemp "${TMPDIR:-/tmp}/dw-test-pw-ghcall.XXXXXX")"
+cat > "${PW_GH_FAKE_DIR}/gh" <<'FAKE_GH'
+#!/bin/bash
+# tests/run-tests.sh 用の偽 gh。load_from_gh が渡す引数を記録し、issue list 呼び出しには
+# 固定のレコード（<番号><US><前提行><US><Epic行>、US=0x1f）を返す。実ネットワークには
+# 一切触れない。区切り文字は load_from_gh の実装（@tsv ではなく join("")）に合わせる。
+US=$'\x1f'
+echo "$*" >> "${PW_GH_CALL_MARKER}"
+case "$*" in
+  *"issue list --label task --state open"*)
+    printf '100%s%s- Epic: #14\n' "$US" "$US"    # 指定Epicと一致 -> 含める
+    printf '200%s%s- Epic: #3\n' "$US" "$US"     # 別Epic -> 除外する
+    printf '300%s%s\n' "$US" "$US"               # Epic行が無い旧形式 -> フェイルオープンで含める
+    ;;
+esac
+FAKE_GH
+chmod +x "${PW_GH_FAKE_DIR}/gh"
+
+PW_GH_OUTPUT="$(PATH="${PW_GH_FAKE_DIR}:${PATH}" PW_GH_CALL_MARKER="$PW_GH_CALL_MARKER" bash "$PLAN_WAVES_SCRIPT" --epic 14)"
+PW_GH_EXIT=$?
+PW_GH_CALL="$(cat "$PW_GH_CALL_MARKER")"
+
+assert_exit_code "gh モード: --epic 14 は exit 0" 0 "$PW_GH_EXIT"
+
+case "$PW_GH_CALL" in
+  *"--limit 200"*) pass "gh モード: issue list に --limit 200 が付く（30件上限対策）" ;;
+  *) fail "gh モード: issue list に --limit 200 が付く（30件上限対策）" "call=[${PW_GH_CALL}]" ;;
+esac
+
+if printf '%s\n' "$PW_GH_OUTPUT" | grep -q '^task	100	'; then
+  pass "gh モード: 指定Epicと一致する #100 は対象に含まれる"
+else
+  fail "gh モード: 指定Epicと一致する #100 は対象に含まれる" "output=[${PW_GH_OUTPUT}]"
+fi
+
+if printf '%s\n' "$PW_GH_OUTPUT" | grep -q '^task	200	'; then
+  fail "gh モード: 別Epic（#3）を明記する #200 は除外される" "output=[${PW_GH_OUTPUT}]"
+else
+  pass "gh モード: 別Epic（#3）を明記する #200 は除外される"
+fi
+
+if printf '%s\n' "$PW_GH_OUTPUT" | grep -q '^task	300	'; then
+  pass "gh モード: Epic行が無い #300 はフェイルオープンで含まれる"
+else
+  fail "gh モード: Epic行が無い #300 はフェイルオープンで含まれる" "output=[${PW_GH_OUTPUT}]"
+fi
+
+# ---------------------------------------------------------------------------
+# merge-lane.sh（merge-base 検証と wave ブランチ統合。Task #16）
+#
+# 一時 git リポジトリを組み立てて検証する（Docker 非依存）。scripts/merge-lane.sh は
+# cwd のリポジトリに対して checkout / merge-base / merge / abort を行うため、
+# plan-waves.sh と違いスクリプト自体をコピーせず、cwd を一時リポジトリに変えて
+# REPO_ROOT のスクリプトを直接呼び出す。
+# ---------------------------------------------------------------------------
+
+echo "== merge-lane.sh（merge-base 検証と wave ブランチ統合） =="
+
+MERGE_LANE_SCRIPT="${REPO_ROOT}/scripts/merge-lane.sh"
+
+ml_commit_file() {
+  # ml_commit_file <repo_dir> <相対ファイル名> <内容> <コミットメッセージ>
+  local repo="$1" file="$2" content="$3" msg="$4"
+  (
+    cd "$repo" || exit 1
+    printf '%s' "$content" > "$file"
+    git add "$file"
+    git commit -q -m "$msg"
+  ) >/dev/null 2>&1
+}
+
+ml_branch_from() {
+  # ml_branch_from <repo_dir> <新ブランチ名> <開始点（コミットish）>
+  local repo="$1" branch="$2" start="$3"
+  (
+    cd "$repo" || exit 1
+    git checkout -q -b "$branch" "$start"
+  ) >/dev/null 2>&1
+}
+
+ml_head_of() {
+  # ml_head_of <repo_dir> <ref>  ref が指すコミットの完全なSHAを返す
+  (cd "$1" || exit 1; git rev-parse "$2") 2>/dev/null
+}
+
+run_merge_lane() {
+  # run_merge_lane <repo_dir> [追加の引数...]  戻り値は標準出力（呼び出し側で $? を確認する）
+  local repo="$1"
+  shift
+  (cd "$repo" || exit 1; bash "$MERGE_LANE_SCRIPT" "$@")
+}
+
+# --- ケース8: 同一ベースから分岐した2レーンが順に取り込め、2本目の merge-base が
+#     EXPECTED_BASE のままであること ---
+ML_REPO8="$(make_temp_repo)"
+ml_commit_file "$ML_REPO8" "base.txt" "wave base\n" "wave base commit"
+ML8_BASE="$(ml_head_of "$ML_REPO8" HEAD)"
+ml_branch_from "$ML_REPO8" "lane-a" "$ML8_BASE"
+ml_commit_file "$ML_REPO8" "a.txt" "lane a\n" "lane a change"
+ml_branch_from "$ML_REPO8" "lane-b" "$ML8_BASE"
+ml_commit_file "$ML_REPO8" "b.txt" "lane b\n" "lane b change"
+
+ML8_OUT1="$(run_merge_lane "$ML_REPO8" --wave-branch "wave/epicT/1" --expected-base "$ML8_BASE" --lane-branch lane-a --task 16 --create)"
+ML8_EXIT1=$?
+assert_exit_code "ケース8: 1本目（lane-a）の取り込みは exit 0" 0 "$ML8_EXIT1"
+
+# 2本目のマージ実行前（1本目取り込み後）の merge-base を確認する。マージ後は wave が
+# lane-b を取り込んで祖先集合が変わるため、必ずマージ「前」に測る。
+ML8_ACTUAL_BASE_2ND="$(cd "$ML_REPO8" && git merge-base "wave/epicT/1" lane-b)"
+assert_eq "ケース8: 2本目の merge-base（実行前）は EXPECTED_BASE のまま" "$ML8_BASE" "$ML8_ACTUAL_BASE_2ND"
+
+ML8_OUT2="$(run_merge_lane "$ML_REPO8" --wave-branch "wave/epicT/1" --expected-base "$ML8_BASE" --lane-branch lane-b --task 16)"
+ML8_EXIT2=$?
+assert_exit_code "ケース8: 2本目（lane-b）の取り込みは exit 0" 0 "$ML8_EXIT2"
+
+ML8_WAVE_HEAD="$(ml_head_of "$ML_REPO8" "wave/epicT/1")"
+if [ "$ML8_WAVE_HEAD" != "$ML8_BASE" ]; then
+  pass "ケース8: wave ブランチが両レーンの成果を含む（HEAD が進んでいる）"
+else
+  fail "ケース8: wave ブランチが両レーンの成果を含む（HEAD が進んでいる）" "wave HEAD が BASE から動いていません"
+fi
+
+# --- ケース9: 別ベースから分岐したレーンが exit 10 で拒否され、wave ブランチが動かないこと ---
+ML_REPO9="$(make_temp_repo)"
+ML9_OLD_BASE="$(ml_head_of "$ML_REPO9" HEAD)"
+ml_commit_file "$ML_REPO9" "base.txt" "wave base\n" "wave base commit"
+ML9_EXPECTED_BASE="$(ml_head_of "$ML_REPO9" HEAD)"
+
+ml_branch_from "$ML_REPO9" "lane-ok" "$ML9_EXPECTED_BASE"
+ml_commit_file "$ML_REPO9" "ok.txt" "lane ok\n" "lane ok change"
+
+ml_branch_from "$ML_REPO9" "lane-wrong-base" "$ML9_OLD_BASE"
+ml_commit_file "$ML_REPO9" "wrong.txt" "lane wrong base\n" "lane wrong base change"
+
+run_merge_lane "$ML_REPO9" --wave-branch "wave/epicT/1" --expected-base "$ML9_EXPECTED_BASE" --lane-branch lane-ok --task 16 --create >/dev/null
+ML9_SETUP_EXIT=$?
+assert_exit_code "ケース9: 事前準備（lane-ok の取り込み）は exit 0" 0 "$ML9_SETUP_EXIT"
+
+ML9_WAVE_HEAD_BEFORE="$(ml_head_of "$ML_REPO9" "wave/epicT/1")"
+
+ML9_OUT="$(run_merge_lane "$ML_REPO9" --wave-branch "wave/epicT/1" --expected-base "$ML9_EXPECTED_BASE" --lane-branch lane-wrong-base --task 16)"
+ML9_EXIT=$?
+assert_exit_code "ケース9: 別ベースから分岐したレーンは exit 10" 10 "$ML9_EXIT"
+
+case "$ML9_OUT" in
+  *"$ML9_OLD_BASE"*) pass "ケース9: 実際の merge-base とそのコミットログが stdout に出る" ;;
+  *) fail "ケース9: 実際の merge-base とそのコミットログが stdout に出る" "output=[${ML9_OUT}]" ;;
+esac
+
+ML9_WAVE_HEAD_AFTER="$(ml_head_of "$ML_REPO9" "wave/epicT/1")"
+assert_eq "ケース9: exit 10 のとき wave ブランチが動かない" "$ML9_WAVE_HEAD_BEFORE" "$ML9_WAVE_HEAD_AFTER"
+
+# --- ケース10: 競合するレーンが exit 11 で拒否され、git merge --abort 後に作業ツリーが
+#     汚れていないこと（git status --porcelain が空） ---
+ML_REPO10="$(make_temp_repo)"
+ml_commit_file "$ML_REPO10" "conflict.txt" "base\n" "wave base commit"
+ML10_BASE="$(ml_head_of "$ML_REPO10" HEAD)"
+
+ml_branch_from "$ML_REPO10" "lane-c1" "$ML10_BASE"
+ml_commit_file "$ML_REPO10" "conflict.txt" "change1\n" "lane c1 change"
+
+ml_branch_from "$ML_REPO10" "lane-c2" "$ML10_BASE"
+ml_commit_file "$ML_REPO10" "conflict.txt" "change2\n" "lane c2 change"
+
+run_merge_lane "$ML_REPO10" --wave-branch "wave/epicT/1" --expected-base "$ML10_BASE" --lane-branch lane-c1 --task 16 --create >/dev/null
+ML10_SETUP_EXIT=$?
+assert_exit_code "ケース10: 事前準備（lane-c1 の取り込み）は exit 0" 0 "$ML10_SETUP_EXIT"
+
+ML10_WAVE_HEAD_BEFORE="$(ml_head_of "$ML_REPO10" "wave/epicT/1")"
+
+ML10_OUT="$(run_merge_lane "$ML_REPO10" --wave-branch "wave/epicT/1" --expected-base "$ML10_BASE" --lane-branch lane-c2 --task 16)"
+ML10_EXIT=$?
+assert_exit_code "ケース10: 競合するレーンは exit 11" 11 "$ML10_EXIT"
+
+case "$ML10_OUT" in
+  *"conflict.txt"*) pass "ケース10: 競合ファイル一覧（conflict.txt）が stdout に出る" ;;
+  *) fail "ケース10: 競合ファイル一覧（conflict.txt）が stdout に出る" "output=[${ML10_OUT}]" ;;
+esac
+
+ML10_PORCELAIN="$(cd "$ML_REPO10" && git status --porcelain)"
+assert_eq "ケース10: git merge --abort 後に作業ツリーが汚れていない" "" "$ML10_PORCELAIN"
+
+ML10_WAVE_HEAD_AFTER="$(ml_head_of "$ML_REPO10" "wave/epicT/1")"
+assert_eq "ケース10: exit 11 のとき wave ブランチが動かない" "$ML10_WAVE_HEAD_BEFORE" "$ML10_WAVE_HEAD_AFTER"
+
+# --- ケース11: レーン1本のウェーブで履歴が fast-forward になること（lanes=1 相当） ---
+ML_REPO11="$(make_temp_repo)"
+ml_commit_file "$ML_REPO11" "base.txt" "wave base\n" "wave base commit"
+ML11_BASE="$(ml_head_of "$ML_REPO11" HEAD)"
+
+ml_branch_from "$ML_REPO11" "lane-solo" "$ML11_BASE"
+ml_commit_file "$ML_REPO11" "solo.txt" "lane solo\n" "lane solo change"
+ML11_LANE_HEAD="$(ml_head_of "$ML_REPO11" lane-solo)"
+
+run_merge_lane "$ML_REPO11" --wave-branch "wave/epicT/1" --expected-base "$ML11_BASE" --lane-branch lane-solo --task 16 --create >/dev/null
+ML11_EXIT=$?
+assert_exit_code "ケース11: 単独レーンの取り込みは exit 0" 0 "$ML11_EXIT"
+
+ML11_WAVE_HEAD="$(ml_head_of "$ML_REPO11" "wave/epicT/1")"
+assert_eq "ケース11: fast-forward により wave HEAD がレーンの HEAD と一致する" "$ML11_LANE_HEAD" "$ML11_WAVE_HEAD"
+
+ML11_MERGE_COUNT="$(cd "$ML_REPO11" && git log --merges --oneline "wave/epicT/1" | wc -l | tr -d ' ')"
+assert_eq "ケース11: fast-forward によりマージコミットが作られない" "0" "$ML11_MERGE_COUNT"
+
+# --- ケース12: 引数バリデーション（引数エラーは exit 2） ---
+ML_REPO_ARGS="$(make_temp_repo)"
+
+run_merge_lane "$ML_REPO_ARGS" >/dev/null 2>&1
+assert_exit_code "引数なしは exit 2" 2 "$?"
+
+run_merge_lane "$ML_REPO_ARGS" --expected-base HEAD --lane-branch dummy >/dev/null 2>&1
+assert_exit_code "--wave-branch 省略は exit 2" 2 "$?"
+
+run_merge_lane "$ML_REPO_ARGS" --wave-branch wave/epicT/1 --lane-branch dummy >/dev/null 2>&1
+assert_exit_code "--expected-base 省略は exit 2" 2 "$?"
+
+run_merge_lane "$ML_REPO_ARGS" --wave-branch wave/epicT/1 --expected-base HEAD >/dev/null 2>&1
+assert_exit_code "--lane-branch 省略は exit 2" 2 "$?"
+
+run_merge_lane "$ML_REPO_ARGS" --wave-branch wave/epicT/1 --expected-base no-such-ref --lane-branch dummy >/dev/null 2>&1
+assert_exit_code "--expected-base が解決できない値は exit 2" 2 "$?"
+
+# --- ケース13: wave ブランチが無く --create も無ければ exit 1（その他の失敗） ---
+ML_REPO_NOCREATE="$(make_temp_repo)"
+ML_NOCREATE_BASE="$(ml_head_of "$ML_REPO_NOCREATE" HEAD)"
+ml_branch_from "$ML_REPO_NOCREATE" "lane-x" "$ML_NOCREATE_BASE"
+ml_commit_file "$ML_REPO_NOCREATE" "x.txt" "lane x\n" "lane x change"
+
+run_merge_lane "$ML_REPO_NOCREATE" --wave-branch "wave/epicT/1" --expected-base "$ML_NOCREATE_BASE" --lane-branch lane-x >/dev/null 2>&1
+assert_exit_code "wave ブランチが無く --create 無しは exit 1" 1 "$?"
+
+# --- ケース14: レーンのブランチが存在しなければ exit 1（その他の失敗） ---
+ML_REPO_NOLANE="$(make_temp_repo)"
+ML_NOLANE_BASE="$(ml_head_of "$ML_REPO_NOLANE" HEAD)"
+
+run_merge_lane "$ML_REPO_NOLANE" --wave-branch "wave/epicT/1" --expected-base "$ML_NOLANE_BASE" --lane-branch no-such-lane-branch --create >/dev/null 2>&1
+assert_exit_code "存在しないレーンブランチは exit 1" 1 "$?"
+
+# --- ケース15（Review #40）: 未コミットのローカル変更でマージが「競合ではない理由」で
+#     失敗した場合、exit 1 になり（exit 11 にならず）、`git merge --abort` を試みない
+#     （呼べば「There is no merge to abort」で失敗し作業ツリーが汚れる）こと。
+#     git merge は "Your local changes to the following files would be overwritten by
+#     merge" で非0終了するが、MERGE_HEAD は作られず未マージパスも無いため、これは
+#     本物の競合と区別しなければならない。 ---
+ML_REPO15="$(make_temp_repo)"
+ml_commit_file "$ML_REPO15" "file.txt" "base\n" "wave base commit"
+ML15_BASE="$(ml_head_of "$ML_REPO15" HEAD)"
+
+(cd "$ML_REPO15" && git branch "wave/epicT/1" "$ML15_BASE") >/dev/null 2>&1
+
+ml_branch_from "$ML_REPO15" "lane-local" "$ML15_BASE"
+ml_commit_file "$ML_REPO15" "file.txt" "lane change\n" "lane local change"
+
+# wave ブランチへ切り替え、file.txt に未コミットの変更を残す（この時点でコミット済みの
+# 変更は無いので checkout 自体は成功する）。merge-lane.sh 自身も同じブランチへ checkout
+# するため（no-op）、この未コミット変更はそのまま merge 実行時まで残る。
+(cd "$ML_REPO15" && git checkout -q "wave/epicT/1") >/dev/null 2>&1
+(cd "$ML_REPO15" && printf 'uncommitted local change\n' > file.txt) >/dev/null 2>&1
+
+ML15_PORCELAIN_BEFORE="$(cd "$ML_REPO15" && git status --porcelain)"
+
+ML15_OUT="$(run_merge_lane "$ML_REPO15" --wave-branch "wave/epicT/1" --expected-base "$ML15_BASE" --lane-branch lane-local --task 16)"
+ML15_EXIT=$?
+assert_exit_code "ケース15: ローカル未コミット変更によるマージ失敗は exit 1（exit 11 にならない）" 1 "$ML15_EXIT"
+
+case "$ML15_OUT" in
+  *"マージ競合が発生しました"*) fail "ケース15: 「マージ競合が発生しました」の見出しは出ない（本物の競合ではないため）" "output=[${ML15_OUT}]" ;;
+  *) pass "ケース15: 「マージ競合が発生しました」の見出しは出ない（本物の競合ではないため）" ;;
+esac
+
+case "$ML15_OUT" in
+  *"マージに失敗しました（競合ではありません）"*) pass "ケース15: 「競合ではない失敗」の見出しが出る" ;;
+  *) fail "ケース15: 「競合ではない失敗」の見出しが出る" "output=[${ML15_OUT}]" ;;
+esac
+
+ML15_MERGE_HEAD_EXISTS="$(cd "$ML_REPO15" && [ -f .git/MERGE_HEAD ] && echo yes || echo no)"
+assert_eq "ケース15: MERGE_HEAD が存在しない（git merge --abort を呼んでいない証跡）" "no" "$ML15_MERGE_HEAD_EXISTS"
+
+ML15_PORCELAIN_AFTER="$(cd "$ML_REPO15" && git status --porcelain)"
+assert_eq "ケース15: 未コミットのローカル変更（file.txt）がそのまま残っている（abort による破棄が起きていない）" \
+  "$ML15_PORCELAIN_BEFORE" "$ML15_PORCELAIN_AFTER"
+
+# ---------------------------------------------------------------------------
+# adapters/codex/run-loop.sh: 統合ゲートが全テストを実行すること（回帰防止 #37）
+#
+# Review #37: mechanical_gate() が check-readability.sh --git だけを実行しており、
+# sandbox-exec.sh 経由でプロジェクトの全テストを走らせていなかった（statically
+# 検証できる範囲に限定し、実際の gh/docker 呼び出しは行わない）。
+# ---------------------------------------------------------------------------
+
+echo ""
+echo "== adapters/codex/run-loop.sh（統合ゲートの全テスト実行・回帰防止 #37） =="
+
+RUN_LOOP_SCRIPT="${REPO_ROOT}/adapters/codex/run-loop.sh"
+
+RL_BASHN_OUT="$(bash -n "$RUN_LOOP_SCRIPT" 2>&1)"
+assert_exit_code "run-loop.sh: bash -n は exit 0" 0 "$?"
+[ -z "$RL_BASHN_OUT" ] || echo "         ${RL_BASHN_OUT}"
+
+if command -v shellcheck >/dev/null 2>&1; then
+  RL_SHELLCHECK_OUT="$(cd "$(dirname "$RUN_LOOP_SCRIPT")" && shellcheck -x "$(basename "$RUN_LOOP_SCRIPT")" 2>&1)"
+  if [ $? -eq 0 ]; then
+    pass "shellcheck: run-loop.sh"
+  else
+    fail "shellcheck: run-loop.sh" "$RL_SHELLCHECK_OUT"
+  fi
+else
+  skip "shellcheck: run-loop.sh" "コマンドが見つからないためスキップ"
+fi
+
+# mechanical_gate() の関数本体だけを取り出して静的に検証する
+RL_MECH_GATE_BODY="$(sed -n '/^mechanical_gate() {/,/^}/p' "$RUN_LOOP_SCRIPT")"
+RL_MECH_GATE_ONELINE="$(printf '%s' "$RL_MECH_GATE_BODY" | tr '\n' ' ')"
+
+case "$RL_MECH_GATE_ONELINE" in
+  *"sandbox-exec.sh"*'"$TEST_CMD"'*)
+    pass "run-loop.sh: mechanical_gate() が sandbox-exec.sh に \$TEST_CMD を渡している" ;;
+  *)
+    fail "run-loop.sh: mechanical_gate() が sandbox-exec.sh に \$TEST_CMD を渡している" "$RL_MECH_GATE_BODY" ;;
+esac
+
+case "$RL_MECH_GATE_ONELINE" in
+  *"check-readability.sh"*)
+    pass "run-loop.sh: mechanical_gate() が check-readability.sh を呼んでいる" ;;
+  *)
+    fail "run-loop.sh: mechanical_gate() が check-readability.sh を呼んでいる" "$RL_MECH_GATE_BODY" ;;
+esac
+
+# テストと可読性ガードが && で連結され、テスト失敗時に可読性ガードへ進まない（AND判定）こと
+case "$RL_MECH_GATE_ONELINE" in
+  *"sandbox-exec.sh"*'&&'*"check-readability.sh"*)
+    pass "run-loop.sh: mechanical_gate() はテストと可読性ガードを && で連結している" ;;
+  *)
+    fail "run-loop.sh: mechanical_gate() はテストと可読性ガードを && で連結している" "$RL_MECH_GATE_BODY" ;;
+esac
+
+# DEV_WORKFLOW_TEST_CMD 未設定時は、gh/git を呼ぶ前に停止すること
+RL_FAKE_BIN="$(mktemp -d "${TMPDIR:-/tmp}/dw-test-fakebin-rl.XXXXXX")"
+for rl_fake in gh git; do
+  cat > "${RL_FAKE_BIN}/${rl_fake}" <<'FAKE_BIN'
+#!/bin/bash
+exit 0
+FAKE_BIN
+  chmod +x "${RL_FAKE_BIN}/${rl_fake}"
+done
+
+RL_UNSET_OUT="$(PATH="${RL_FAKE_BIN}:${PATH}" DEV_WORKFLOW_DRY_RUN=1 DEV_WORKFLOW_TEST_CMD="" \
+  bash "$RUN_LOOP_SCRIPT" 999 2>&1)"
+RL_UNSET_EXIT=$?
+assert_exit_code "run-loop.sh: DEV_WORKFLOW_TEST_CMD 未設定は exit 1" 1 "$RL_UNSET_EXIT"
+case "$RL_UNSET_OUT" in
+  *"DEV_WORKFLOW_TEST_CMD"*)
+    pass "run-loop.sh: 未設定時のエラーメッセージに DEV_WORKFLOW_TEST_CMD を含む" ;;
+  *)
+    fail "run-loop.sh: 未設定時のエラーメッセージに DEV_WORKFLOW_TEST_CMD を含む" "$RL_UNSET_OUT" ;;
+esac
+
+RL_SET_OUT="$(PATH="${RL_FAKE_BIN}:${PATH}" DEV_WORKFLOW_DRY_RUN=1 DEV_WORKFLOW_TEST_CMD='true' \
+  bash "$RUN_LOOP_SCRIPT" 999 2>&1)"
+case "$RL_SET_OUT" in
+  *"DEV_WORKFLOW_TEST_CMD が未設定です"*)
+    fail "run-loop.sh: DEV_WORKFLOW_TEST_CMD 設定時は未設定エラーを出さない" "$RL_SET_OUT" ;;
+  *)
+    pass "run-loop.sh: DEV_WORKFLOW_TEST_CMD 設定時は未設定エラーを出さない" ;;
+esac
+
+# 伝播スキップ（skip <番号> reason depends-on-skipped <依存先番号>）を issue コメントし、
+# 同一実行内で重複コメントしないこと（静的検証: 分岐と重複防止の仕組みが存在するか）
+# 行番号を固定値でハードコードせず、目印となる固定文字列（grep -F）から範囲を求める。
+RL_LOOP_START="$(grep -n -F 'read -r kind sub num extra dep; do' "$RUN_LOOP_SCRIPT" | head -1 | cut -d: -f1)"
+RL_LOOP_END_REL="$(tail -n "+${RL_LOOP_START}" "$RUN_LOOP_SCRIPT" | grep -n -F 'done <<< "$PLAN"' | head -1 | cut -d: -f1)"
+RL_LOOP_END=$((RL_LOOP_START + RL_LOOP_END_REL - 1))
+RL_WARN_LOOP="$(sed -n "${RL_LOOP_START},${RL_LOOP_END}p" "$RUN_LOOP_SCRIPT")"
+RL_WARN_LOOP_ONELINE="$(printf '%s' "$RL_WARN_LOOP" | tr '\n' ' ')"
+
+RL_SKIP_BRANCH_OK=1
+case "$RL_WARN_LOOP_ONELINE" in
+  *'"$kind" = "skip"'*) : ;;
+  *) RL_SKIP_BRANCH_OK=0 ;;
+esac
+case "$RL_WARN_LOOP_ONELINE" in
+  *"gh issue comment"*) : ;;
+  *) RL_SKIP_BRANCH_OK=0 ;;
+esac
+case "$RL_WARN_LOOP_ONELINE" in
+  *"depends-on-skipped"*) : ;;
+  *) RL_SKIP_BRANCH_OK=0 ;;
+esac
+if [ "$RL_SKIP_BRANCH_OK" -eq 1 ]; then
+  pass "run-loop.sh: skip 行（伝播スキップ）を issue にコメントしている"
+else
+  fail "run-loop.sh: skip 行（伝播スキップ）を issue にコメントしている" "$RL_WARN_LOOP"
+fi
+
+case "$RL_WARN_LOOP_ONELINE" in
+  *"PROPAGATED_CSV"*)
+    pass "run-loop.sh: 伝播スキップの重複コメントを防ぐ仕組みがある" ;;
+  *)
+    fail "run-loop.sh: 伝播スキップの重複コメントを防ぐ仕組みがある" "$RL_WARN_LOOP" ;;
+esac
+
+# ---------------------------------------------------------------------------
+# skills/run/SKILL.md: 統合ゲート失敗時のリカバリと0レーン取り込みの分岐
+# （回帰防止 #38, #41）
+# ---------------------------------------------------------------------------
+
+echo ""
+echo "== skills/run/SKILL.md（統合ゲート失敗リカバリ・0レーン分岐の回帰防止 #38, #41） =="
+
+RUN_SKILL="${REPO_ROOT}/skills/run/SKILL.md"
+
+# #38: Step 8「統合ゲート失敗時の原因特定手順」は、この時点で checkout 中の wave ブランチに対して
+# 実行される。`git branch -f` はチェックアウト中のブランチの強制更新を拒否するため使ってはならない。
+RS_STEP8_RECOVERY="$(awk '/^#### 統合ゲート失敗時の原因特定手順/{f=1} /^#### スキップの伝播/{f=0} f' "$RUN_SKILL")"
+
+case "$RS_STEP8_RECOVERY" in
+  *'git branch -f "wave/'*)
+    fail "SKILL.md: 統合ゲート失敗時の原因特定手順がチェックアウト中のwaveブランチに git branch -f を使っていない（#38）" "$RS_STEP8_RECOVERY" ;;
+  *)
+    pass "SKILL.md: 統合ゲート失敗時の原因特定手順がチェックアウト中のwaveブランチに git branch -f を使っていない（#38）" ;;
+esac
+
+case "$RS_STEP8_RECOVERY" in
+  *'git checkout -B "wave/'*)
+    pass "SKILL.md: 統合ゲート失敗時の原因特定手順が git checkout -B でwaveブランチを作り直す（#38）" ;;
+  *)
+    fail "SKILL.md: 統合ゲート失敗時の原因特定手順が git checkout -B でwaveブランチを作り直す（#38）" "$RS_STEP8_RECOVERY" ;;
+esac
+
+# #41: 取り込めたレーンが0本ならwaveブランチは存在しない。Step 5にその分岐が明記され、
+# Step 6の冒頭にブランチ存在確認のガードがあること。
+RS_STEP5="$(awk '/^### Step 5:/{f=1} /^### Step 6:/{f=0} f' "$RUN_SKILL")"
+
+case "$RS_STEP5" in
+  *"取り込めたレーンが0本"*)
+    pass "SKILL.md: Step 5 に「取り込めたレーンが0本」の分岐が明記されている（#41）" ;;
+  *)
+    fail "SKILL.md: Step 5 に「取り込めたレーンが0本」の分岐が明記されている（#41）" "$RS_STEP5" ;;
+esac
+
+RS_STEP6="$(awk '/^### Step 6:/{f=1} /^### Step 7:/{f=0} f' "$RUN_SKILL")"
+
+case "$RS_STEP6" in
+  *'git rev-parse --verify'*)
+    pass "SKILL.md: Step 6 冒頭に wave ブランチ存在確認のガードがある（#41）" ;;
+  *)
+    fail "SKILL.md: Step 6 冒頭に wave ブランチ存在確認のガードがある（#41）" "$RS_STEP6" ;;
+esac
+
+# ---------------------------------------------------------------------------
+# skills-codex/dev-workflow-run/SKILL.md: 統合ゲートの記述が Claude 版と揃っていること
+# （回帰防止 #37）
+# ---------------------------------------------------------------------------
+
+echo ""
+echo "== skills-codex/dev-workflow-run/SKILL.md（統合ゲートの記述・回帰防止 #37） =="
+
+CODEX_RUN_SKILL="${REPO_ROOT}/skills-codex/dev-workflow-run/SKILL.md"
+
+CRS_STEP5="$(awk '/^### Step 5:/{f=1} /^### Step 6:/{f=0} f' "$CODEX_RUN_SKILL")"
+
+case "$CRS_STEP5" in
+  *"sandbox-exec.sh"*)
+    pass "SKILL.md(codex): Step 5 が sandbox-exec.sh で全テストを実行する記述を含む" ;;
+  *)
+    fail "SKILL.md(codex): Step 5 が sandbox-exec.sh で全テストを実行する記述を含む" "$CRS_STEP5" ;;
+esac
+
+case "$CRS_STEP5" in
+  *"check-readability.sh"*)
+    pass "SKILL.md(codex): Step 5 が check-readability.sh の記述を含む" ;;
+  *)
+    fail "SKILL.md(codex): Step 5 が check-readability.sh の記述を含む" "$CRS_STEP5" ;;
+esac
+
+case "$CRS_STEP5" in
+  *"対象の選択を"*"generator に委ねない"*)
+    pass "SKILL.md(codex): Step 5 が「対象の選択をgeneratorに委ねない」を含む" ;;
+  *)
+    fail "SKILL.md(codex): Step 5 が「対象の選択をgeneratorに委ねない」を含む" "$CRS_STEP5" ;;
+esac
+
+case "$CRS_STEP5" in
+  *"SKIP を通過扱いにしない"*)
+    pass "SKILL.md(codex): Step 5 が「SKIPを通過扱いにしない」を含む" ;;
+  *)
+    fail "SKILL.md(codex): Step 5 が「SKIPを通過扱いにしない」を含む" "$CRS_STEP5" ;;
+esac
+
+if grep -q '^EPIC_NUMBER' "$CODEX_RUN_SKILL"; then
+  fail "SKILL.md(codex): 未定義変数 \$EPIC_NUMBER を新たに導入していない" "EPIC_NUMBER の代入が見つかりました"
+else
+  if grep -q '\$EPIC_NUMBER' "$CODEX_RUN_SKILL"; then
+    fail "SKILL.md(codex): 未定義変数 \$EPIC_NUMBER を参照していない" "$(grep -n '\$EPIC_NUMBER' "$CODEX_RUN_SKILL")"
+  else
+    pass "SKILL.md(codex): 未定義変数 \$EPIC_NUMBER を参照していない"
+  fi
+fi
+
+# ---------------------------------------------------------------------------
 # 結果集計
 # ---------------------------------------------------------------------------
 

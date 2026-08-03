@@ -1,6 +1,6 @@
 {
   "name": "dev-workflow",
-  "version": "0.11.0",
+  "version": "0.12.0",
   "description": "3エージェント自律開発ワークフロー。planner・generator・evaluatorが仕様策定から自律実装までを担う。",
   "author": {
     "name": "masatoImayama",

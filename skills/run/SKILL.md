@@ -51,7 +51,8 @@ Epic issue本文の「ブランチ」セクションからブランチ名を取�
 ```bash
 # Epic issueからブランチ名を取得 (形式: epic/epicXX/[機能名])
 EPIC_BRANCH=$(gh issue view $ARGUMENTS --json body -q '.body' | grep -oP '`epic/epic\d+/[^`]+`' | tr -d '`' | head -1)
-EPIC_NUM=$(printf '%s' "$EPIC_BRANCH" | grep -oP 'epic\d+' | head -1)   # 例: epic259
+EPIC_NUM=$(printf '%s' "$EPIC_BRANCH" | grep -oP 'epic\d+' | head -1)   # 例: epic259（sandbox-exec.sh の --epic 用の識別子）
+EPIC_ISSUE_NUM="${EPIC_NUM#epic}"   # 例: 259（plan-waves.sh の --epic 用。数値のEpic issue番号。ブランチ名の命名規則epic/epicXX上、epicXXの数値部分=Epic issue番号）
 
 # ブランチの存在確認
 git fetch origin
@@ -112,6 +113,31 @@ bash "${CLAUDE_PLUGIN_ROOT}/scripts/sandbox-exec.sh" --epic "$EPIC_NUM" --warm '
 
 コンテナ内でコードをマウントし、全ての実装・テスト・ビルドコマンドをコンテナ内で実行する。
 Gitオペレーション（commit, push等）はホスト側で実行する。
+
+#### プロジェクト固有の準備コマンド（Epic 本文の `## 準備コマンド` 節）
+
+生成物の配置（wasm 等）のような**タスクに依らず同じ結果になる**プロジェクト固有の準備は、
+タスクごとに generator へ繰り返させず、ここ（Epic 開始時）で1回だけ実行する。
+
+```bash
+# Epic本文に「## 準備コマンド」節があれば、その中身（フェンスコードブロックの内容）を取り出す
+PREP_CMD="$(gh issue view $ARGUMENTS --json body -q '.body' \
+  | awk '/^## 準備コマンド/{f=1; next} /^## /{f=0} f' \
+  | sed -n '/^```/,/^```/p' | sed '1d;$d')"
+
+if [ -n "$PREP_CMD" ]; then
+  echo "Epic本文の準備コマンドを実行します:"
+  echo "$PREP_CMD"
+  bash "${CLAUDE_PLUGIN_ROOT}/scripts/sandbox-exec.sh" --epic "$EPIC_NUM" --warm "$PREP_CMD"
+fi
+```
+
+- **節が無ければ何もしない**（上記の `[build-command]` による `--warm` だけが従来どおり走る）。
+  既存の Epic（`## 準備コマンド` 節が無いもの）はこの追加ステップの影響を受けない
+- `--warm` は失敗してもループを止めない（`sandbox-exec.sh` の既存挙動）。準備コマンドが失敗しても
+  表示だけしてそのまま先へ進む
+- コンテナは Epic 単位で常駐するため、この1回の準備が以降の全ウェーブ・全レーンに効く。
+  generator 側には「タスクごとに再実行しない」旨を明記済み（`core/roles/generator.md`）
 
 ### サンドボックスへのコマンド投入は sandbox-exec.sh 経由に統一する
 
@@ -192,155 +218,380 @@ services:
 
 ```
 main (保護: 人間のみマージ可)
- └─ epic/epicXX/[機能名] (Epic単位のブランチ)
+ └─ epic/epicXX/[機能名] (Epic単位のブランチ。統合ゲートを通ったコミットだけが載る)
      └─ 作業 worktree: .claude/worktrees/epicXX/  ← このツリー内で全作業（許可済み領域・兄弟ディレクトリは作らない）
-         └─ generator の isolation worktree (Docker sandbox内で実装 → epicブランチにマージ)
+         └─ wave/epicXX/<ウェーブ番号>  ← レーンを取り込み統合ゲートに掛ける一時ブランチ（originへpushしない）
+             └─ 各レーンの作業ブランチ（generator の isolation worktree 由来）
 ```
 
 - Epic 専用 worktree は **`.claude/worktrees/<epicN>`** に作る（`../<repo>-epicN` の兄弟は作らない）。additionalDirectories はリポジトリルート許可で足り、他リポジトリに権限が及ばない。
-- generatorはworktreeでEpicブランチをベースに作業する
+- 各レーン（generator の isolation worktree）は、そのウェーブ開始時点のEpicブランチtip（`WAVE_BASE`）から分岐する
+- レーンは wave ブランチを経由し、**統合ゲート通過後にのみ** `--ff-only` でEpicブランチへ合流する
 - 実装・テスト・ビルドは全てDockerコンテナ内で実行する
-- タスク完了後はEpicブランチにマージする（mainではない）
 - 全タスク完了後、Epicブランチ→mainのPRを作成する
 - mainへのマージは人間が行う
+- wave ブランチはローカルの一時ブランチであり、originへはpushしない。**Epicブランチへのforce pushは行わない**
 
-## タスク選定ロジック
+## タスク選定・実行方式（ウェーブ単位の並列実行）
 
-plannerは介在しない。代わりに以下のルールで次のタスクを自動選定する:
-
-1. Epic issueのbodyからタスク一覧を取得
-2. 未クローズのTask issueをPhase順にソート
-3. 同一Phase内では番号が小さい順
-4. 最初の未完了タスクを選定
+plannerは介在しない。タスクの実行順序は`- 前提: #N`が作る**依存グラフだけ**を根拠に決める
+（`core/instructions.md`「タスク選定順序」参照）。Phaseは人間向けの区分であり、実行順序の決定には
+使わない。ウェーブ分解は `scripts/plan-waves.sh` に切り出されており、散文としてこのスキルが
+解釈し直すことはしない。
 
 ```bash
-# 未完了タスクをPhase順で取得
-gh issue list --label "task" --state open --json number,title,body --limit 50
+# ドライラン: 現在のウェーブ分解を人間向けに確認する（依存宣言のレビューにも使える）
+# plan-waves.sh の --epic は数値のEpic issue番号（$EPIC_ISSUE_NUM）。sandbox-exec.sh の
+# --epic（epicXX形式の $EPIC_NUM）とは別の契約なので取り違えないこと
+bash "${CLAUDE_PLUGIN_ROOT}/scripts/plan-waves.sh" --epic "$EPIC_ISSUE_NUM" --lanes "$LANES" --print
 ```
 
-## 自律ループ（YOLOモード）
+### `--lanes`（並列度）の受け取り
 
-**ユーザー確認なしで**以下のサイクルを全Taskが完了するまで繰り返す:
+- 既定は **3**。`$ARGUMENTS` に `--lanes N` が含まれていればそれを使う。無ければ環境変数
+  `DEV_WORKFLOW_MAX_LANES` を使う。どちらも無ければ既定の3を使う（優先順位: `--lanes` 引数 >
+  `DEV_WORKFLOW_MAX_LANES` > 既定3）
+- **ホスト性能からの自動算出はしない**（ボトルネックはI/Oでありコア数と相関しないため）
+- **`--lanes 1` を指定すると、現行（並列化前）と等価な逐次実行になる。** 障害発生時のロール
+  バック手段として使える。並列用と逐次用でコードパスを分けていないため、値を変えるだけで
+  安全に落とせる
 
-### Step 1: 次のタスクを選定
+```bash
+LANES="${DEV_WORKFLOW_MAX_LANES:-3}"
+# $ARGUMENTS に --lanes N が含まれていれば LANES をその値で上書きする
+```
 
-未完了のTask issueからPhase順で次のタスクを選ぶ。
+## 自律ループ（YOLOモード、ウェーブ単位）
 
-### Step 2: Epicブランチを最新に同期
+**ユーザー確認なしで**、以下のサイクルをウェーブが無くなるまで繰り返す。
 
-**各タスク開始前に必ずEpicブランチを最新に同期する。**
-前のタスクの変更が反映されていない古いベースでworktreeを作ると、コンフリクトやファイル不整合が発生する。
-同期は**メインリポではなく Epic 専用 worktree（`$EPIC_WT`）内で**行う。
+```bash
+SKIPPED_CSV=""   # 3回失敗して見送ったタスク番号のカンマ区切り。ループを回すうちに積み上げる
+WAVE_NO=0        # wave ブランチ名に使う通し番号。plan-waves.sh の出力の「wave番号」とは別物
+                 # （再計算のたびに wave 1 から始まり直すため、通し番号はここで自前に管理する）
+
+# --- 計測（並列化とオーバーヘッド削減の寄与を分けて読むための実測。詳細は「進捗表示」節） ---
+# 前ウェーブの内訳（次ウェーブ開始時のバナー表示に使う）。ウェーブ1の開始時点では空文字のまま。
+PREV_WAVE_IMPL_SEC=""
+PREV_WAVE_MERGE_SEC=""
+PREV_WAVE_GATE_SEC=""
+# Epic全体の累計（PR本文の集計に使う）
+TOTAL_IMPL_SEC=0
+TOTAL_MERGE_SEC=0
+TOTAL_GATE_SEC=0
+DONE_TASK_COUNT=0   # 統合ゲートを通過して取り込めたタスク数の累計
+
+# 秒数を "Nm Ss" 形式にする（例: 65 -> 1m05s）。追加の依存物（jq等）は使わず `date +%s` の差分のみで計測する
+fmt_duration() {
+  local total_sec="$1"
+  printf '%dm%02ds' "$((total_sec / 60))" "$((total_sec % 60))"
+}
+```
+
+### Step 1: ウェーブ計画を取得する
+
+**毎ウェーブ、計画を再計算する**（前ウェーブの完了・スキップを反映するため。1回だけ計算して
+使い回さない）。完了したタスクは `gh issue list --state open` から自然に消えるため、
+再計算のたびに残りのタスクだけを対象とした**新しいウェーブ1**が得られる。
+すなわち、**出力の `wave 1 tasks ...` が常に「次に実行すべきウェーブ」である。**
+
+```bash
+cd "$EPIC_WT"
+PLAN_ARGS=(--epic "$EPIC_ISSUE_NUM" --lanes "$LANES")
+[ -n "$SKIPPED_CSV" ] && PLAN_ARGS+=(--skipped "$SKIPPED_CSV")
+PLAN="$(bash "${CLAUDE_PLUGIN_ROOT}/scripts/plan-waves.sh" "${PLAN_ARGS[@]}")"
+PLAN_EXIT=$?
+echo "$PLAN"
+```
+
+- `PLAN_EXIT` が **3**（循環依存）なら、列挙されたタスクをそのままEpic issueにコメントし停止する
+- `warn missing-deps <番号>` / `warn unknown-dep <番号> <dep番号>` が出力に含まれる場合、
+  該当タスクの宣言漏れ・不明な依存を報告に含める（fail-safeで完全逐次扱いになっている旨も明記）
+- 出力に `wave` 行が無い（＝全タスク完了）→ ループを終了し **「Epic一括レビュー」** へ進む
+- `wave 1 tasks 4,5,10` のような行から、今回処理するタスク番号の集合を取り出す。各タスクの
+  `subbatch` 列（`task` 行）を見て、サブバッチ単位に分割する
+- 処理対象のウェーブが決まったら `WAVE_NO=$((WAVE_NO + 1))` する（wave ブランチ名
+  `wave/${EPIC_NUM}/${WAVE_NO}` に使う通し番号。plan-waves.sh の出力の「wave番号」とは別物）
+
+今回のウェーブの内容が決まったら、Step 2 に進む前に進捗バナーを表示する（形式は
+「進捗表示」節を参照。`PREV_WAVE_*` はウェーブ1の実行前は空文字なので「前ウェーブ: (初回のため計測なし)」
+と表示する）。
+
+### Step 2: WAVE_BASE を記録する
 
 ```bash
 cd "$EPIC_WT"            # 作業 worktree に居ることを保証
 git fetch origin
-git checkout ${EPIC_BRANCH}
-git pull origin ${EPIC_BRANCH}
+git checkout "${EPIC_BRANCH}"
+git pull origin "${EPIC_BRANCH}"
+WAVE_BASE=$(git rev-parse HEAD)
+IMPL_START_SEC=$(date +%s)   # 「実装」フェーズ（Step 3〜4）の計測開始
 ```
 
-### Step 3: generator - Docker sandbox内でタスクを実装
+**同期はここ（ウェーブの先頭）でだけ行う。** タスクごとには行わない。この `WAVE_BASE` が、
+このウェーブに属する全レーンが共有する唯一の正しい分岐元になる。各レーン（generatorの
+isolation worktree）はこの `WAVE_BASE` から分岐するため、generator自身は
+`fetch` / `checkout` / `pull` を行わない（`core/roles/generator.md`）。
 
-generatorをworktreeで起動し、Docker sandbox内でEpicブランチ上のタスクを実装する:
+### Step 3: サブバッチごとに generator を並列起動する
+
+ウェーブ内タスク数が `lanes` を超える場合、Step 1 で取得した `subbatch` 列に従い、
+issue番号の小さい順に `lanes` 件ずつのサブバッチへ分割済みである。**統合ゲートはサブバッチ
+ごとではなく、ウェーブの全サブバッチが完了した後に1回だけ行う。**
+
+サブバッチ内のタスクは**同一メッセージで複数の generator を同時に起動する**（レーンA・B・C…）:
 
 ```
 @generator
-Task #[番号] を実装してください。
-- Epicブランチ: [epic/epicXX/機能名]（最新は commit [ハッシュ]）
-- 作業開始前に `git fetch origin` で同期し、`git merge-base --is-ancestor origin/[epicブランチ] HEAD`
-  でベースを検証すること。偽なら実装を始めず、実出力を添えて報告し停止すること
+Task #[番号A] を実装してください（レーン A）。
+- Epicブランチ: [epic/epicXX/機能名]
+- WAVE_BASE: [WAVE_BASEのコミットハッシュ]（ブランチ名ではなくこのハッシュそのものに対して検証すること）
+- 作業開始前に `git merge-base --is-ancestor "[WAVE_BASE]" HEAD` でベースを検証すること。
+  偽なら実装を始めず、実出力を添えて報告し停止すること
+- **`git fetch` / `git checkout` / `git pull` は実行しないこと。** 同期は run が Epic 専用
+  worktree で既に済ませており、あなたの isolation worktree は WAVE_BASE から分岐している
 - サンドボックスへのコマンド投入は `${CLAUDE_PLUGIN_ROOT}/scripts/sandbox-exec.sh` 経由で行い、
   ビルド・テストは1回の呼び出しにまとめること（分けると待ち時間が倍増する）
-- `sandbox-exec.sh` を呼ぶ際は必ず `--epic "$EPIC_NUM"` を渡すこと（例: `--epic "$EPIC_NUM" 'make test'`）。
-  省略すると環境変数 `DEV_WORKFLOW_EPIC` が参照されるので、渡し忘れた場合は
-  `export DEV_WORKFLOW_EPIC="$EPIC_NUM"` してから叩くこと。あなたは isolation worktree
-  （`.claude/worktrees/agent-*`）で動くため、これを怠ると Epic 単位のコンテナに載らず
-  タスクごとに別コンテナが生まれる
+- `sandbox-exec.sh` を呼ぶ際は必ず `--epic "$EPIC_NUM"` を渡すこと（例: `--epic "$EPIC_NUM" 'make test'`）
+- プロジェクト固有の準備（wasm配置等）は Epic 開始時に run が1回実行済み。**タスクごとに
+  再実行しないこと**。効いていないと判断した場合も自前で再実行せず、その事実を報告すること
 - 回帰確認はプロジェクトの全テストで行うこと。`-run` で絞った結果を「回帰なし」と報告しないこと
 - SKIP されたテストがあれば件数と内容を報告に含めること
 - issueの要件を確認
-- 親Epic issueの本文から仕様書・計画書を参照
+- Task issueの記載だけで着手できない場合に限り、親Epic issueの本文を参照すること
 - テストファーストで実装
 - 変更をコミット
-- 報告には「実際に叩いたテストコマンドの全文」と「ベース検証の実出力」を含めること
+- 作業開始直後に `date +%s` で開始時刻を記録し、報告直前にも `date +%s` で終了時刻を記録すること
+- 報告には「実際に叩いたテストコマンドの全文」「ベース検証の実出力」「レーン記号（A）」
+  「最終的な作業ブランチ名」「開始時刻・終了時刻（`date +%s` の値、または `HH:MM` 表記でよい）」
+  を含めること（作業ブランチ名は Step 5 の merge-lane.sh で使う。開始・終了時刻は Step 4 の
+  進捗表示で使う）
+
+@generator
+Task #[番号B] を実装してください（レーン B）。
+（内容はレーンAと同様。WAVE_BASE は同じハッシュを渡す）
 ```
 
-### Step 4: 機械的ゲート（LLMレビューなし）
+Claude Code のサブエージェントは**バッチ全員が終わるまで結果が返らない**ため、
+「1本終わったら次を投入する」動的なレーン補充は原理的に実装できない。サブバッチの所要時間は
+最長レーンで決まる（バリア同期）。これは harness の制約として受け入れる。
 
-**evaluatorは起動しない。** 以下をbashで実行し、結果だけで通過判定する:
+サブバッチが複数ある場合は、直前のサブバッチの完了を待ってから次のサブバッチを起動する
+（全サブバッチが順に完了するまでは Step 4 へ進まない）。
+
+### Step 4: レーン内ゲートの結果を確認する
+
+各generatorは自分のisolation worktree内で完了報告（テスト実行結果・SKIP件数・可読性チェック）
+を返す。レーン内ゲートに失敗したレーンは**wave へ取り込まず**、試行回数を保持したまま
+次ウェーブへ持ち越す（ウェーブ内では再試行しない。理由は Step 8 参照）。
+
+品質・設計・セキュリティの観点はここでは見ない。**それらはEpic完了後の一括レビューで見る。**
+
+全サブバッチの完了直後に、実装フェーズの計測を締める:
+
+```bash
+IMPL_END_SEC=$(date +%s)
+IMPL_SEC=$((IMPL_END_SEC - IMPL_START_SEC))
+```
+
+`IMPL_SEC` は「並列化の寄与」を表す実測値（サブバッチの所要時間は最長レーンで決まるバリア同期の
+実測を含む）。各generatorが報告した開始・終了時刻をもとに、レーンごとの結果行を表示する:
+
+```
+レーン結果: A=#5(12:03-12:11 8m00s) B=#10(12:03-12:09 6m00s) C=#11(12:03-12:07 4m12s)
+```
+
+（レーン内ゲートに失敗したレーンは末尾に `失敗` を添える。例: `C=#11(12:03-12:05 失敗)`）
+
+### Step 5: wave ブランチへレーンを取り込む
+
+全サブバッチ完了後、Epic worktreeでwaveブランチを作成し、（レーン内ゲートに通った）レーンを
+issue番号順に取り込む。**`--create` は「1本目のレーン」ではなく、最初に実際に取り込むレーンに
+付ける。** 取り込み対象はレーン内ゲートに通ったレーンに限られるため、issue番号順で先頭の
+レーン（例: レーンA）がレーン内ゲートに失敗していれば、`--create` はレーンBなど次に取り込む
+レーンに付く。
 
 ```bash
 cd "$EPIC_WT"
+MERGE_START_SEC=$(date +%s)   # 「統合」フェーズ（merge-lane.sh群）の計測開始
 
-# 1) テスト＋ビルド（Docker sandbox内）— 1回にまとめる。落ちたら不合格
+# 最初に実際に取り込むレーン（レーンAとは限らない）: --create でwaveブランチをWAVE_BASEから作成する
+bash "${CLAUDE_PLUGIN_ROOT}/scripts/merge-lane.sh" \
+  --wave-branch "wave/${EPIC_NUM}/${WAVE_NO}" --expected-base "$WAVE_BASE" \
+  --lane-branch "[レーンAの作業ブランチ]" --task <番号A> --create
+
+# 2本目以降: waveブランチは既に存在するので --create は不要
+bash "${CLAUDE_PLUGIN_ROOT}/scripts/merge-lane.sh" \
+  --wave-branch "wave/${EPIC_NUM}/${WAVE_NO}" --expected-base "$WAVE_BASE" \
+  --lane-branch "[レーンBの作業ブランチ]" --task <番号B>
+
+MERGE_END_SEC=$(date +%s)
+MERGE_SEC=$((MERGE_END_SEC - MERGE_START_SEC))
+```
+
+終了コードで扱いを分岐する:
+
+| 終了コード | 意味 | 扱い |
+|---|---|---|
+| 0 | 取り込み成功 | 次のレーンへ |
+| 10 | merge-base ≠ WAVE_BASE（ベース逸脱） | 取り込まず差し戻す。実出力をTask issueにコメント。**cherry-pickによる載せ替えはしない** |
+| 11 | マージ競合（`git merge --abort` 済み） | 取り込まず、stdoutの競合ファイル一覧と相手レーンをTask issueにコメント。次ウェーブで再実行 |
+| 2 | 引数エラー | runの呼び出しミス。停止して報告する |
+| 1 | その他の失敗 | 停止して報告する |
+
+取り込めなかったレーンはこの時点でwaveに含まれない。**先に取り込めたレーンの成果は活かし、
+ウェーブ全体は捨てない。**
+
+**取り込めたレーンが0本の場合**（全レーンがレーン内ゲートに失敗した、またはレーン内ゲートに
+通った全レーンが `merge-lane.sh` から exit 10/11 で拒否された）、`merge-lane.sh --create` が
+一度も成功しておらず `wave/${EPIC_NUM}/${WAVE_NO}` は存在しない。この場合は **Step 6・Step 7 を
+実行せず**、このウェーブの各タスクの試行回数を加算したうえで Step 1 に戻る（次ウェーブへ）。
+
+### Step 6: wave ブランチで統合ゲートを1回実行する
+
+全レーンの取り込み（成功分のみ）が終わったら、waveブランチ上で**1回だけ**機械的ゲートを実行する。
+**このStepはStep 5で取り込めたレーンが1本以上ある場合のみ実行する**（0本の場合はStep 5末尾の
+分岐を参照）。念のため冒頭で wave ブランチの存在を確認してから進む:
+
+```bash
+cd "$EPIC_WT"
+git rev-parse --verify -q "refs/heads/wave/${EPIC_NUM}/${WAVE_NO}" >/dev/null || {
+  echo "ERROR: wave/${EPIC_NUM}/${WAVE_NO} が存在しません（取り込めたレーンが0本）。Step 7を実行せずStep 1へ戻ってください"
+  exit 1
+}
+git checkout "wave/${EPIC_NUM}/${WAVE_NO}"
+GATE_START_SEC=$(date +%s)   # 「統合ゲート」フェーズの計測開始
+
+# 1) テスト（Docker sandbox内）— 1回にまとめる。落ちたら不合格
 bash "${CLAUDE_PLUGIN_ROOT}/scripts/sandbox-exec.sh" --epic "$EPIC_NUM" '[全テストを走らせるコマンド]'
 
-# 2) 可読性ガード — 差分に対して実行（PostToolUseフックと同じ判定）
+# 2) 可読性ガード — waveブランチの差分に対して実行（PostToolUseフックと同じ判定）
 bash "${CLAUDE_PLUGIN_ROOT}/scripts/check-readability.sh" --git
+
+GATE_END_SEC=$(date +%s)
+GATE_SEC=$((GATE_END_SEC - GATE_START_SEC))
 ```
+
+内容の要件は従来と同じ（プロジェクトの全テストを1コマンドで／対象の選択をgeneratorに委ねない／
+SKIPを通過扱いにしない。詳細は下記）。
+
+**Epic worktreeに対する単独のゲートは廃止する。** レーンの変更がEpicに入るのは統合ゲート
+通過後のマージであり、Epic worktreeを先に検証しても検証対象として意味を持たない。加えて、
+generatorが並列に実施するレーン内ゲートと合わせて毎タスク2回フルテストが走る重複も解消される。
+検証点は次の2つに整理される。
+
+| 検証点 | 対象ツリー | 頻度 |
+|---|---|---|
+| レーン内ゲート | generatorのisolation worktree | タスクごと（並列に走るため時間が重ならない） |
+| 統合ゲート | waveブランチ（全レーン取り込み後） | ウェーブごとに1回 |
 
 #### 何を実行すれば「回帰なし」と言えるか
 
 ゲートで走らせるのは**プロジェクトの全テスト**とする。`make test` 等のプロジェクト標準
-ターゲットがあればそれを優先し、**対象の選択を generator に委ねない。**
+ターゲットがあればそれを優先し、**対象の選択をgeneratorに委ねない。**
 
 - ビルドタグ付きのテスト（`//go:build integration` 等）があるプロジェクトでは、それも含める
 - ビルド・vet・テストを**別々の呼び出しに分けない**。サンドボックスはソースツリーを
-  バインドマウントしており、フルツリーを走査するコマンドは1回ごとにその走査コストを払う。
-  分けるとその分だけ待ち時間が倍増する（実測: 1コマンドあたり約2分）
+  バインドマウントしており、フルツリーを走査するコマンドは1回ごとにその走査コストを払う
 - テストがビルドを兼ねるなら（`go test ./...` 等）、それ1本で足りる
 
 #### SKIP を通過扱いにしない
 
 依存物が未配置だとテストが無言で `SKIP` され、`ok` と表示されて成功に見える。
-**`ok` の有無だけで判定してはならない。** 出力中の SKIP 件数を確認し、
-検証したかったテストが実際に走ったことを確かめる。想定外の SKIP は不合格として扱う。
+**`ok` の有無だけで判定してはならない。** 出力中のSKIP件数を確認し、
+検証したかったテストが実際に走ったことを確かめる。想定外のSKIPは不合格として扱う。
 
-- **全て通過** → Step 5 へ
-- **いずれか失敗** → 失敗ログをgeneratorに渡して Step 3 に戻る（同一タスクで3回失敗したらスキップ）
+- **通過** → Step 7 へ
+- **失敗** → Step 8「統合ゲート失敗」のリカバリへ（Epicブランチは無傷のまま）
 
-品質・設計・セキュリティの観点はここでは見ない。**それらはEpic完了後の一括レビューで見る。**
+### Step 7: Epicブランチへ取り込んで次のウェーブへ
 
-### Step 5: Epicブランチに取り込んで次のタスクへ
+#### なぜ `--ff-only` の役割を分離するか
 
-#### マージは必ず `--ff-only` で行う
+従来は `git merge --ff-only <レーン>` の1本で「ベース逸脱の検出」と「履歴の直線性の強制」を
+兼ねていたが、後者が並列実行を構造的に不可能にしていた（同一ベースから分岐した並列ブランチは
+原理的にfast-forwardできない）。**この2つの役割は分離できる**: ベース逸脱の検出はStep 5の
+`merge-lane.sh`によるmerge-base完全一致検証が引き継ぎ、直線性の強制はやめる。
 
-**generator の「ベースは正しい」という報告を信じてマージしてはならない。** 指示と異なるベース
-（例: main）から分岐していても、そのツリー上でテストは通ってしまうため、報告だけでは検出できない。
-`--ff-only` は誤ったベースからのマージをここで機械的に止める。
+epicへの取り込みは、waveがWAVE_BASEの子孫であるため統合ゲート通過後は必ずfast-forwardになる。
 
 ```bash
 cd "$EPIC_WT"
 git checkout "${EPIC_BRANCH}"
-git merge --ff-only "[generatorの作業ブランチ]"
+git merge --ff-only "wave/${EPIC_NUM}/${WAVE_NO}"
+git push origin "${EPIC_BRANCH}"
 ```
 
-`fatal: Not possible to fast-forward` で失敗した場合、**generator の報告ではなく実態を確認する**:
+**Epicへのforce pushは行わない。waveブランチはoriginへpushしない**（ローカルの一時ブランチ）。
+
+1. 取り込めたレーンに対応するTask issueをクローズする: `gh issue close [番号]`
+2. Epic issueの進捗を更新する
+3. このウェーブの計測を確定し、次ウェーブのバナー表示・PR本文の集計に使う値を更新する:
 
 ```bash
-# 実際の分岐元を見る。epic ブランチのコミットでなければ、別ベースから分岐している
-git merge-base "${EPIC_BRANCH}" "[作業ブランチ]"
-git log --oneline -1 "$(git merge-base "${EPIC_BRANCH}" "[作業ブランチ]")"
+WAVE_TOTAL_SEC=$((IMPL_SEC + MERGE_SEC + GATE_SEC))
+echo "前ウェーブ: 実装 $(fmt_duration "$IMPL_SEC") + 統合 $(fmt_duration "$MERGE_SEC") + 統合ゲート $(fmt_duration "$GATE_SEC") = $(fmt_duration "$WAVE_TOTAL_SEC")"
+
+PREV_WAVE_IMPL_SEC="$IMPL_SEC"
+PREV_WAVE_MERGE_SEC="$MERGE_SEC"
+PREV_WAVE_GATE_SEC="$GATE_SEC"
+
+TOTAL_IMPL_SEC=$((TOTAL_IMPL_SEC + IMPL_SEC))
+TOTAL_MERGE_SEC=$((TOTAL_MERGE_SEC + MERGE_SEC))
+TOTAL_GATE_SEC=$((TOTAL_GATE_SEC + GATE_SEC))
+DONE_TASK_COUNT=$((DONE_TASK_COUNT + N))   # N = 直前の「取り込めたレーンに対応するTask issueをクローズする」で閉じた件数
 ```
 
-誤ったベースだった場合は cherry-pick で載せ替える。**載せ替えは自動マージが成功しても
-安全とは限らない**（先行タスクの変更が無いツリーで実装されているため）ので、
-載せ替え後に Step 4 の機械的ゲートを**必ず再実行する**。
+4. → Step 1 に戻る（次のウェーブへ）
+
+全ウェーブが完了したら **「Epic一括レビュー」** へ進む。
+
+**統合ゲートに失敗した場合（Step 8 のリカバリを経由した場合）は、この計測更新を行わない。**
+`PREV_WAVE_*` と累計は「統合ゲートを通過して実際に取り込めたウェーブ」だけを反映する
+（失敗した試行の時間まで合算すると、並列化とオーバーヘッド削減の寄与という本来の目的が
+読み取れない数字になるため）。
+
+### Step 8: 失敗時のリカバリ
+
+**共通原則: 失敗したレーンだけを落とし、先に取り込めたレーンの成果は活かす。ウェーブ全体は捨てない。**
+
+| 失敗パターン | 扱い |
+|---|---|
+| レーン内ゲート失敗 | waveに取り込まず、試行回数を保持したまま次ウェーブへ持ち越す。**ウェーブ内では再試行しない** |
+| `merge-lane.sh` exit 10（ベース逸脱） | 取り込まず差し戻す。実出力をissueにコメント。**cherry-pick載せ替えはしない** |
+| `merge-lane.sh` exit 11（競合） | 取り込まず、競合ファイル一覧と相手レーンをissueにコメント。次ウェーブで再実行 |
+| 競合で2回失敗 | 次ウェーブで**単独レーン**（`lanes=1`相当のサブバッチ）として実行する |
+| 同一タスクで3回失敗 | スキップする。issueにコメントし、`SKIPPED_CSV` に加える（以降の`plan-waves.sh`呼び出しの`--skipped`に反映される） |
+| 統合ゲート失敗 | Epicは無傷のまま。WAVE_BASEからwaveブランチを作り直し、レーンを1本ずつ「マージ→ゲート」で積んで原因レーンを一意に特定する。特定したレーンだけ差し戻し、残りは活かす |
+
+**「ウェーブ内で再試行しない」理由**: バリア同期のため、ウェーブ内の再試行は完了済みの他レーンを
+待たせ続けるだけになる。次ウェーブに回せばベースが進むだけで、「先行タスクの変更が無かった
+せいで落ちた」「同じ行を触ったせいで競合した」類の失敗は自然に解消する。
+
+#### 統合ゲート失敗時の原因特定手順
+
+この時点で `wave/${EPIC_NUM}/${WAVE_NO}` は checkout 中のブランチであり、`git branch -f` は
+チェックアウト中のブランチの強制更新を拒否する。**`git checkout -B` で作り直すこと**
+（`git branch -f` の後に `git checkout` を続ける2行構成にはしない）。
 
 ```bash
-git cherry-pick "${EPIC_BRANCH}..[作業ブランチ]"
+cd "$EPIC_WT"
+git checkout -B "wave/${EPIC_NUM}/${WAVE_NO}" "$WAVE_BASE"
+
+# レーンを1本ずつ merge-lane.sh で取り込み、そのつどゲートを実行する
+bash "${CLAUDE_PLUGIN_ROOT}/scripts/merge-lane.sh" \
+  --wave-branch "wave/${EPIC_NUM}/${WAVE_NO}" --expected-base "$WAVE_BASE" \
+  --lane-branch "[レーン1の作業ブランチ]" --task <番号1>
+bash "${CLAUDE_PLUGIN_ROOT}/scripts/sandbox-exec.sh" --epic "$EPIC_NUM" '[全テストを走らせるコマンド]'
+# 通れば次のレーンを取り込んでまたゲートを実行する。落ちた時点のレーンが原因と一意に特定できる
 ```
 
-`--ff-only` を使わずにマージすると、先行タスクの変更を打ち消す差分が静かに取り込まれる。
+#### スキップの伝播
 
-#### 残りの手順
-
-1. Epicブランチをリモートにpush: `git push origin ${EPIC_BRANCH}`
-2. Task issueをクローズ: `gh issue close [番号]`
-3. Epic issueの進捗を更新
-4. → Step 1 に戻る（次のタスクへ）
-
-全タスクが完了したら **「Epic一括レビュー」** へ進む。
+スキップされたタスクに依存する後続タスクは、`plan-waves.sh` の出力（`skip <番号> reason
+depends-on-skipped <依存先番号>`）に従って実行せずスキップし、Task issueにその旨をコメントする
+（推移的に伝播する）。スキップ一覧は**Epic一括レビュー前にEpic issueへコメントし、PR本文にも
+明記して人間に判断を渡す**（詳細は「Epic一括レビュー」節）。
 
 ## サンドボックスの後片付け（正常終了・異常終了を問わず必ず実行）
 
@@ -371,22 +622,89 @@ bash "${CLAUDE_PLUGIN_ROOT}/scripts/sandbox-exec.sh" --down --all   # 現在の�
 
 ## 進捗表示
 
-各サイクルの開始時に進捗を表示する:
+本Epicは並列化とオーバーヘッド削減の2つを同時に行うため、**両者の寄与を別々に読めるように**
+計測を分けて表示する（「実装」= 並列化の寄与、「統合」「統合ゲート」= 並列化が追加で持ち込むコスト・
+直列に残るコスト）。時刻の取得に追加の依存物（`jq` 等）は使わず、`date +%s` の差分だけで計測する
+（`fmt_duration` ヘルパーは「自律ループ」節冒頭で定義済み）。
+
+### Step 1 の直後（ウェーブ開始時）に表示するバナー
 
 ```
 ═══════════════════════════════════════
-  Run: Epic $ARGUMENTS [YOLO]
-  ブランチ: epic/epicXX/[機能名]
-  Sandbox: Docker
-  進捗: [完了数] / [全タスク数] tasks
-  現在: Task #[番号] - [タスク名]
-  Phase: [現在のPhase]
+  Run: Epic $ARGUMENTS [YOLO / lanes=[LANES]]
+  ウェーブ: [ウェーブ番号] / [総ウェーブ数]   タスク: [完了数] / [全タスク数] 完了（スキップ [スキップ数]）
+  レーン: A=#[番号A] B=#[番号B] C=#[番号C]
+  前ウェーブ: [PREV_WAVE_*が空なら「(初回のため計測なし)」／それ以外は下記の内訳]
 ═══════════════════════════════════════
 ```
+
+「前ウェーブ」の行は次の形式（Step 7 で確定させた `PREV_WAVE_*` を使う）:
+
+```bash
+if [ -n "$PREV_WAVE_IMPL_SEC" ]; then
+  PREV_TOTAL_SEC=$((PREV_WAVE_IMPL_SEC + PREV_WAVE_MERGE_SEC + PREV_WAVE_GATE_SEC))
+  echo "前ウェーブ: 実装 $(fmt_duration "$PREV_WAVE_IMPL_SEC") + 統合 $(fmt_duration "$PREV_WAVE_MERGE_SEC") + 統合ゲート $(fmt_duration "$PREV_WAVE_GATE_SEC") = $(fmt_duration "$PREV_TOTAL_SEC")"
+else
+  echo "前ウェーブ: (初回のため計測なし)"
+fi
+```
+
+「[総ウェーブ数]」は `plan-waves.sh` の出力からは得られない（残タスクからの再計算のため、既に
+完了したウェーブ数を含む総数は自明ではない）。**Epic issueの「タスク一覧」節に列挙されたウェーブ
+数を初回に数えて控えておき、以降はその値を使い回す**（スキップの伝播で後続ウェーブが減っても、
+「予定していたウェーブ数」としてそのまま使ってよい。厳密な再計算は要求しない）。
+
+### Step 4 の直後（サブバッチ完了時）に表示するレーン結果
+
+```
+レーン結果: A=#5(12:03-12:11 8m00s) B=#10(12:03-12:09 6m00s) C=#11(12:03-12:07 4m12s)
+```
+
+各generatorが報告した開始・終了時刻（Step 3 のプロンプトで要求済み）をもとに組み立てる。
+レーン内ゲートに失敗したレーンは末尾に `失敗` を添える。
+
+### Step 7 の直後（ウェーブ完了時）に表示するウェーブ合計
+
+```bash
+echo "前ウェーブ: 実装 $(fmt_duration "$IMPL_SEC") + 統合 $(fmt_duration "$MERGE_SEC") + 統合ゲート $(fmt_duration "$GATE_SEC") = $(fmt_duration "$WAVE_TOTAL_SEC")"
+```
+
+これは次ウェーブのバナーで使う文言と同じ（`PREV_WAVE_*` に格納した値をそのまま使う）。
+
+### PR本文への集計（Epic完了時）
+
+全ウェーブ完了後、PR本文（後述「PR作成」節）に次の集計を載せる。`TOTAL_IMPL_SEC` /
+`TOTAL_MERGE_SEC` / `TOTAL_GATE_SEC` は Step 7 で毎ウェーブ加算した累計、`WAVE_NO` は
+実行した総ウェーブ数、`DONE_TASK_COUNT` は取り込めたタスク数である。
+
+```
+## 実行時間
+- ウェーブ数: [WAVE_NO] / タスク数: [DONE_TASK_COUNT] / 並列度: [LANES]
+- 実装（レーン）合計: [fmt_duration TOTAL_IMPL_SEC] / 統合合計: [fmt_duration TOTAL_MERGE_SEC] / 統合ゲート合計: [fmt_duration TOTAL_GATE_SEC]
+- 総所要時間: [fmt_duration (TOTAL_IMPL_SEC + TOTAL_MERGE_SEC + TOTAL_GATE_SEC)]
+```
+
+これにより、次に何を削るべきか（LLM時間か、統合ゲートの待ち時間か、統合処理か）が実測で分かる。
+並列化タスク（#15・#16・#18・#20・#21・#22）とオーバーヘッド削減タスク（#17・#19・#23）の
+どちらの寄与が大きかったかは、複数Epicでこの集計を比較することで読み取れる。
 
 ## Epic一括レビュー（全タスク完了後・PR作成前）
 
 全Task issueがクローズされた時点で、**ここで初めてevaluatorを起動する。**
+
+### R0: スキップ一覧をEpic issueにコメントする
+
+3回失敗してスキップしたタスク、または依存先のスキップが伝播して未実行のままとなったタスクが
+あれば、一括レビューの前に一覧をEpic issueへコメントする。無ければこの節は省略する。
+
+```bash
+gh issue comment "$ARGUMENTS" --body "$(cat <<'BODY'
+## スキップされたタスク
+
+- #[番号]: [スキップ理由（3回失敗 / 依存先 #[番号] のスキップの伝播）]
+BODY
+)"
+```
 
 ### R1: 一括レビューの実行
 
@@ -441,7 +759,8 @@ BODY
 
 `APPROVE` なら何もせずPR作成へ進む。`REQUEST_CHANGES` の場合:
 
-1. 作成した review issue を**1件ずつ** generator に渡して修正させる（通常のタスクと同じ Step 3〜5）
+1. 作成した review issue を**1件ずつ** generator に渡して修正させる
+   （通常のタスクと同じ自律ループの手順を通す。Step 1〜7）
 2. 全件対応したら **delta-review** で再レビューする:
 
 ```
@@ -514,6 +833,9 @@ Closes $ARGUMENTS
 - [x] #XX Task: [タスク2]
 ...
 
+### スキップされたタスク（未実装。人間の判断が必要）
+- [ ] #XX [タイトル] — [スキップ理由（3回失敗 / 依存先スキップの伝播）]
+
 ## レビュー結果
 - 一括レビュー: [APPROVE / 2巡で打ち切り]
 - 対応済みの指摘: #XX, #XX
@@ -523,6 +845,11 @@ Closes $ARGUMENTS
 
 ### レビューで挙がった軽微な指摘（issue化せず記録のみ）
 - [重要度lowの指摘]
+
+## 実行時間
+- ウェーブ数: [WAVE_NO] / タスク数: [DONE_TASK_COUNT] / 並列度: [LANES]
+- 実装（レーン）合計: [fmt_duration TOTAL_IMPL_SEC] / 統合合計: [fmt_duration TOTAL_MERGE_SEC] / 統合ゲート合計: [fmt_duration TOTAL_GATE_SEC]
+- 総所要時間: [fmt_duration (TOTAL_IMPL_SEC + TOTAL_MERGE_SEC + TOTAL_GATE_SEC)]
 
 ## Test plan
 - [ ] 全テスト通過確認済み（Docker sandbox内）
@@ -571,19 +898,22 @@ fi
 git worktree prune
 ```
 
-サンドボックスの後片付け（常駐コンテナの `--down`）は「Epicブランチに取り込んで次のタスクへ」の
-直後の節で**既に実行済み**である（正常終了・異常終了を問わず必ず実行する節）。ここで重複して
+サンドボックスの後片付け（常駐コンテナの `--down`）は「自律ループ（YOLOモード、ウェーブ単位）」の
+直前の節で**既に実行済み**である（正常終了・異常終了を問わず必ず実行する節）。ここで重複して
 実行する必要はない。
 
 ## 自律動作ポリシー（YOLOモード）
 
 - **ユーザーへの確認・質問は一切行わない**
-- 同一タスクで機械的ゲートに3回失敗した場合 → タスクをスキップし、issueにコメントを残して次のタスクへ進む
-- テストが5回連続で失敗した場合 → issueにデバッグログをコメントし、次のタスクへ進む
+- 同一タスクで（レーン内ゲート・統合ゲートを合わせて）3回失敗した場合 → タスクをスキップし、
+  issueにコメントを残して次のウェーブへ進む
+- 障害が続く場合は `--lanes 1` を指定すれば現行と等価な逐次実行にロールバックできる
+  （並列用と逐次用でコードパスを分けていないため、値を変えるだけで安全に落とせる）
 - **タスクループ中にevaluatorを起動しない**（レビューはEpic完了後の一括レビューのみ）
 - Epic一括レビューは最大2巡で打ち切り、未対応の指摘はissueを残したままPR本文に明記する
-- 予期しないエラーが発生した場合 → issueにエラー詳細をコメントし、次のタスクへ進む
-- スキップしたタスクはEpic issueの進捗表示で明示する
+- 予期しないエラーが発生した場合 → issueにエラー詳細をコメントし、次のウェーブへ進む
+- スキップしたタスクと依存先スキップの伝播は、Epic issueの進捗表示・コメント・PR本文で明示する
+- **Epicブランチには統合ゲートを通過したコミットだけを載せる。force pushは行わない**
 - **mainブランチには絶対にマージしない**
 - **テスト時に実ユーザーにメールを送信しないこと。** テスト用受信アドレス（mailhog, mailtrap等）が未設定の場合はタスクを中断し、issueにコメントを残して開発者に設定を促す
 - **本番環境のデータは絶対に編集・削除・変更しないこと。** テストはDocker sandbox内のテスト用データのみ使用する

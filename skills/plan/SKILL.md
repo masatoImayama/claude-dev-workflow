@@ -33,7 +33,9 @@ plannerに以下を依頼する:
 ### Phase 3: GitHub issue作成
 仕様書・計画書をEpic issue本文に埋め込んでGitHub issueを作成してください:
 - epicラベル付きの親issue（仕様書・計画書を`<details>`で本文に埋め込む）
-- taskラベル付きの子issue（計画書の各タスク）
+- taskラベル付きの子issue（計画書の各タスク）。各Task issueには以下を必ず含める
+  - `- 前提: #N`（依存タスクのissue番号。無い場合は `- 前提: なし` と明記する）
+  - Task issueだけで実装に着手できるだけの情報（該当仕様の要約・対象ファイル・完了条件・背景）
 - 親issueのタスク一覧を子issue番号で更新
 
 ### Phase 4: 確認依頼

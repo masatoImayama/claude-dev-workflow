@@ -5,6 +5,12 @@
 # これにより役割ごとに文脈が分離される（Codex のサブエージェントには専用 worktree が
 # ないため、セッションを分けることが最も強い分離手段になる）。
 #
+# タスクの実行順序は `scripts/plan-waves.sh`（Epic #14）が計算する依存グラフに従う。
+# Codex はサブエージェント専用 worktree を持たないため generator を並行実行できず、
+# `--lanes 1` 固定で呼び出す。1タスク = 1レーン = 1ウェーブとして扱い、各タスクの成果は
+# `scripts/merge-lane.sh` で wave ブランチへ取り込んでから Epic ブランチへ `--ff-only` で
+# 合流させる（`skills-codex/dev-workflow-run/SKILL.md` と同じ経路。詳細はそちらを参照）。
+#
 # 使い方:
 #   bash adapters/codex/run-loop.sh <Epic issue番号> [プロジェクトパス]
 #
@@ -14,6 +20,10 @@
 #   DEV_WORKFLOW_MAX_ATTEMPTS           同一タスクの再試行上限（既定: 3）
 #   DEV_WORKFLOW_MAX_TASKS              1回の実行で処理するタスク数の上限（既定: 50）
 #   DEV_WORKFLOW_DRY_RUN=1              codex を起動せず、実行予定の内容だけ表示する
+#   DEV_WORKFLOW_TEST_CMD                統合ゲート（mechanical_gate）で実行するプロジェクトの
+#                                        全テストコマンド（必須。既定値はない）。対象の選択を
+#                                        generator に委ねないため、run 側のこの変数で固定する。
+#                                        例: DEV_WORKFLOW_TEST_CMD='bash tests/run-tests.sh'
 #
 # 注意: このスクリプトは `--dangerously-bypass-approvals-and-sandbox` を使う。
 #       Codex 側の承認プロンプトを飛ばすため、**信頼できるリポジトリでのみ**使うこと。
@@ -36,11 +46,16 @@ SCHEMA="${PLUGIN_ROOT_DIR}/adapters/codex/schemas/evaluator-verdict.json"
 MAX_ATTEMPTS="${DEV_WORKFLOW_MAX_ATTEMPTS:-3}"
 MAX_TASKS="${DEV_WORKFLOW_MAX_TASKS:-50}"
 DRY_RUN="${DEV_WORKFLOW_DRY_RUN:-0}"
+TEST_CMD="${DEV_WORKFLOW_TEST_CMD:-}"
 
 need() { command -v "$1" >/dev/null 2>&1 || { echo "ERROR: $1 が見つかりません" >&2; exit 1; }; }
 need gh
 need git
 [ "$DRY_RUN" = "1" ] || need codex
+if [ -z "$TEST_CMD" ]; then
+  echo "ERROR: 環境変数 DEV_WORKFLOW_TEST_CMD が未設定です。統合ゲートで実行するプロジェクトの全テストコマンドを設定してください（例: DEV_WORKFLOW_TEST_CMD='bash tests/run-tests.sh'）。" >&2
+  exit 1
+fi
 
 cd "$PROJECT_ROOT" || exit 1
 
@@ -81,6 +96,20 @@ else
   git worktree add "$EPIC_WT" "${EPIC_BRANCH}" || exit 1
 fi
 
+# ── プロジェクト固有の準備コマンド（Epic本文の「## 準備コマンド」節。Epic開始時に1回だけ）──
+# 生成物の配置（wasm等）のようなタスクに依らず同じ結果になる準備は、タスクごとに generator へ
+# 繰り返させず、ここで1回だけ実行する。節が無ければ何もしない（既存Epicへの影響なし）。
+# shellcheck disable=SC2016  # フェンス記号はリテラル一致が目的で、展開させない
+PREP_CMD="$(gh issue view "$EPIC_NUMBER" --json body -q '.body' \
+  | awk '/^## 準備コマンド/{f=1; next} /^## /{f=0} f' \
+  | sed -n '/^```/,/^```/p' \
+  | sed '1d;$d')"
+if [ -n "$PREP_CMD" ]; then
+  echo "Epic本文の準備コマンドを実行します:"
+  echo "$PREP_CMD"
+  bash "${PLUGIN_ROOT_DIR}/scripts/sandbox-exec.sh" --epic "$EPIC_NUM" --warm "$PREP_CMD" || true
+fi
+
 # ── codex exec のラッパー ─────────────────────────────────────────────
 # $1: 役割名（.codex/agents/<役割>.toml の name）  $2: プロンプト  $3: 追加引数...
 run_agent() {
@@ -103,52 +132,149 @@ run_agent() {
   codex "${args[@]}" "$prompt"
 }
 
-# ── 機械的ゲート ─────────────────────────────────────────────────────
+# ── 機械的ゲート（waveブランチ上で実行する） ───────────────────────────
+# 1) プロジェクトの全テスト（sandbox-exec.sh 経由・1コマンドにまとめる）
+# 2) 可読性ガード（waveブランチの差分に対して実行。PostToolUseフックと同じ判定）
+# の AND で合否を返す。対象の選択を generator に委ねないため、テストコマンドは
+# DEV_WORKFLOW_TEST_CMD（TEST_CMD）で固定する。SKIP は「通過」ではなく、テスト
+# コマンド自身の終了コードのみで合否を判定する（無言SKIPをここで自動検出はしない。
+# generator の報告と合わせて確認すること）。
 mechanical_gate() {
-  ( cd "$EPIC_WT" && DEV_WORKFLOW_HOOK_VENDOR=exit-code \
-      bash "${PLUGIN_ROOT_DIR}/scripts/check-readability.sh" --git </dev/null )
+  if [ "$DRY_RUN" = "1" ]; then
+    echo "[dry-run] mechanical_gate: sandbox-exec.sh --epic ${EPIC_NUM} '${TEST_CMD}' && check-readability.sh --git"
+    return 0
+  fi
+  ( cd "$EPIC_WT" \
+      && bash "${PLUGIN_ROOT_DIR}/scripts/sandbox-exec.sh" --epic "$EPIC_NUM" "$TEST_CMD" \
+      && DEV_WORKFLOW_HOOK_VENDOR=exit-code \
+         bash "${PLUGIN_ROOT_DIR}/scripts/check-readability.sh" --git </dev/null )
 }
 
 # ── 開始を記録 ───────────────────────────────────────────────────────
 bash "${PLUGIN_ROOT_DIR}/scripts/notify-slack.sh" run-start "Epic #${EPIC_NUMBER}" || true
 
-# ── タスクループ ─────────────────────────────────────────────────────
+# ── タスクループ（依存グラフに基づくウェーブ実行。lanes=1 固定）───────
+# 1タスク = 1レーン = 1ウェーブとして扱う。plan-waves.sh を毎回再計算し、
+# 常に「次に処理すべきタスク」を先頭から1件だけ取り出す（Codexは並列起動しないため）。
 processed=0
 skipped=0
+SKIPPED_CSV=""
+PROPAGATED_CSV=""   # 依存先スキップにより伝播スキップ済みとして既にコメントしたタスク番号（重複コメント防止）
+WAVE_NO=0
 
 while [ "$processed" -lt "$MAX_TASKS" ]; do
-  task="$(gh issue list --label task --state open --json number -q '.[0].number' 2>/dev/null)"
-  [ -z "$task" ] || [ "$task" = "null" ] && break
+  PLAN_ARGS=(--epic "$EPIC_NUMBER" --lanes 1)
+  [ -n "$SKIPPED_CSV" ] && PLAN_ARGS+=(--skipped "$SKIPPED_CSV")
+  PLAN="$(bash "${PLUGIN_ROOT_DIR}/scripts/plan-waves.sh" "${PLAN_ARGS[@]}")"
+  PLAN_EXIT=$?
+
+  if [ "$PLAN_EXIT" -eq 3 ]; then
+    echo "ERROR: 循環依存を検出しました。停止します。" >&2
+    printf '%s\n' "$PLAN" >&2
+    gh issue comment "$EPIC_NUMBER" --body "自律実行: 循環依存を検出したため停止しました。$(printf '%s' "$PLAN")" || true
+    break
+  fi
+  if [ "$PLAN_EXIT" -ne 0 ]; then
+    echo "ERROR: plan-waves.sh が exit ${PLAN_EXIT} で失敗しました" >&2
+    printf '%s\n' "$PLAN" >&2
+    break
+  fi
+
+  while IFS=$'\t' read -r kind sub num extra dep; do
+    if [ "$kind" = "warn" ]; then
+      if [ "$sub" = "missing-deps" ]; then
+        echo "[警告] 前提未宣言（宣言漏れ・完全逐次にフォールバック）: #${num}"
+      elif [ "$sub" = "unknown-dep" ]; then
+        echo "[警告] 不明な依存（Epic外・存在しない issue。無視されます）: #${num} -> #${extra}"
+      fi
+    elif [ "$kind" = "skip" ]; then
+      # sub=スキップされたタスク番号 num=reason extra=depends-on-skipped dep=依存先番号
+      case ",${PROPAGATED_CSV}," in
+        *",${sub},"*) ;;  # 既にコメント済み（毎回のplan-waves.sh再計算で重複するため）
+        *)
+          echo "[警告] 依存先スキップにより伝播スキップ: #${sub}（依存先 #${dep}）"
+          gh issue comment "$sub" --body "自律実行: 依存先 #${dep} がスキップされたため、このタスクは実行せずスキップしました（推移的伝播）。" || true
+          PROPAGATED_CSV="${PROPAGATED_CSV:+${PROPAGATED_CSV},}${sub}"
+          ;;
+      esac
+    fi
+  done <<< "$PLAN"
+
+  WAVE1_LINE="$(printf '%s\n' "$PLAN" | awk -F'\t' '$1=="wave" && $2==1 {print; exit}')"
+  if [ -z "$WAVE1_LINE" ]; then
+    echo "残タスクなし。タスクループを終了します。"
+    break
+  fi
+  TASKS_CSV="$(printf '%s' "$WAVE1_LINE" | cut -f4)"
+  task="${TASKS_CSV%%,*}"
 
   echo ""
   echo "═══ Task #${task}  (処理済 ${processed} / スキップ ${skipped}) ═══"
 
+  # WAVE_BASE を記録する（このタスク専用の1タスクウェーブの唯一の分岐元）
   git -C "$EPIC_WT" fetch origin
-  git -C "$EPIC_WT" pull origin "${EPIC_BRANCH}" || true
+  git -C "$EPIC_WT" checkout "${EPIC_BRANCH}"
+  git -C "$EPIC_WT" pull origin "${EPIC_BRANCH}"
+  WAVE_BASE="$(git -C "$EPIC_WT" rev-parse HEAD)"
+  WAVE_NO=$((WAVE_NO + 1))
+  WAVE_BRANCH="wave/${EPIC_NUM}/${WAVE_NO}"
+  LANE_BRANCH="task/${EPIC_NUM}/${task}"
 
   attempt=1
   passed=0
   while [ "$attempt" -le "$MAX_ATTEMPTS" ]; do
-    echo "-- generator 試行 ${attempt}/${MAX_ATTEMPTS}"
-    run_agent generator "generator として Task #${task} を実装してください。
-Epicブランチ: ${EPIC_BRANCH}（作業開始前に必ず最新を同期すること）
-作業ディレクトリから移動しないこと。
-issueの要件と、親Epic issue #${EPIC_NUMBER} 本文の仕様書・計画書を確認すること。
-テストファーストで実装し、全テストが通ることを確認してから、変更をコミットすること。"
+    echo "-- 試行 ${attempt}/${MAX_ATTEMPTS}"
 
-    if mechanical_gate; then
-      passed=1
-      break
+    # レーン（作業ブランチ）を WAVE_BASE から作り直す（前回試行の変更を引きずらない）
+    git -C "$EPIC_WT" checkout -q "${EPIC_BRANCH}"
+    git -C "$EPIC_WT" branch -f "$LANE_BRANCH" "$WAVE_BASE"
+    git -C "$EPIC_WT" checkout -q "$LANE_BRANCH"
+
+    run_agent generator "generator として Task #${task} を実装してください。
+WAVE_BASE: ${WAVE_BASE}（ブランチ名ではなくこのハッシュそのものに対して検証すること）
+作業開始前に \`git merge-base --is-ancestor ${WAVE_BASE} HEAD\` でベースを検証すること。偽なら実装を始めず、実出力を添えて報告し停止すること。
+\`git fetch\` / \`git checkout\` / \`git pull\` は実行しないこと（同期は済んでいる。作業ブランチ ${LANE_BRANCH} は WAVE_BASE から分岐している）。
+作業ディレクトリから移動しないこと。
+issueの要件を確認すること。Task issueの記載だけで着手できない場合に限り、親Epic issue #${EPIC_NUMBER} 本文の仕様書・計画書を確認すること。
+テストファーストで実装し、全テストが通ることを確認してから、変更を ${LANE_BRANCH} にコミットすること。"
+
+    # レーンを wave ブランチへ取り込む（WAVE_BASE から作り直し、cherry-pick 載せ替えはしない）
+    git -C "$EPIC_WT" checkout -q "${EPIC_BRANCH}"
+    git -C "$EPIC_WT" branch -f "$WAVE_BRANCH" "$WAVE_BASE"
+    MERGE_OUT="$(cd "$EPIC_WT" && bash "${PLUGIN_ROOT_DIR}/scripts/merge-lane.sh" \
+      --wave-branch "$WAVE_BRANCH" --expected-base "$WAVE_BASE" \
+      --lane-branch "$LANE_BRANCH" --task "$task")"
+    MERGE_EXIT=$?
+    echo "$MERGE_OUT"
+
+    if [ "$MERGE_EXIT" -eq 0 ]; then
+      if ( cd "$EPIC_WT" && git checkout -q "$WAVE_BRANCH" ) && mechanical_gate; then
+        ( cd "$EPIC_WT" \
+          && git checkout -q "${EPIC_BRANCH}" \
+          && git merge --ff-only "$WAVE_BRANCH" \
+          && git push origin "${EPIC_BRANCH}" )
+        passed=1
+        break
+      fi
+      echo "-- 統合ゲート不合格。差し戻します。"
+    elif [ "$MERGE_EXIT" -eq 10 ]; then
+      echo "-- ベース逸脱を検出しました（merge-lane.sh exit 10）。取り込まず差し戻します。"
+      gh issue comment "$task" --body "自律実行: ベース逸脱を検出しました（merge-lane.sh exit 10）。$(printf '%s' "$MERGE_OUT")" || true
+    elif [ "$MERGE_EXIT" -eq 11 ]; then
+      echo "-- マージ競合を検出しました（merge-lane.sh exit 11）。取り込まず差し戻します。"
+      gh issue comment "$task" --body "自律実行: マージ競合を検出しました（merge-lane.sh exit 11）。$(printf '%s' "$MERGE_OUT")" || true
+    else
+      echo "-- merge-lane.sh が想定外の exit ${MERGE_EXIT} で終了しました。" >&2
     fi
-    echo "-- 機械的ゲート不合格。差し戻します。"
+
     attempt=$((attempt + 1))
   done
 
   if [ "$passed" -eq 1 ]; then
-    git -C "$EPIC_WT" push origin "${EPIC_BRANCH}" || true
     gh issue close "$task" || true
   else
     gh issue comment "$task" --body "自律実行: 機械的ゲートに ${MAX_ATTEMPTS} 回失敗したためスキップしました。手動での確認が必要です。" || true
+    SKIPPED_CSV="${SKIPPED_CSV:+${SKIPPED_CSV},}${task}"
     skipped=$((skipped + 1))
   fi
 

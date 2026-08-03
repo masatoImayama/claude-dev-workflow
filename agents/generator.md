@@ -29,25 +29,38 @@ GitHub issue に記載されたタスクを1つずつ、サンドボックス内
 
 ## 作業フロー
 
-### 0. Epicブランチを最新に同期し、ベースを検証する
+### プロジェクト固有の準備は再実行しない
 
-**タスク開始前に必ず実行する。** 古いベースや別のブランチから分岐すると、先行タスクの変更が
-存在しないツリー上で実装・テストすることになり、それでもテストは通ってしまう。
+生成物の配置（wasm 等）・依存物のダウンロード・コード生成など、プロジェクト固有の準備は
+run が Epic 開始時に1回だけ実行済みである（Epic issue 本文の `## 準備コマンド` 節。
+共通ルールの「サンドボックス方針」参照）。**タスクごとに自前で再実行しない。**
+
+準備が効いていないと判断した場合（生成物が見当たらない等）も、自分で準備コマンドを実行して
+帳尻を合わせようとせず、その事実を完了報告に含める。準備コマンドの内容や実行タイミングの
+不備は run・planner 側で直すべき問題であり、generator が肩代わりすると「毎タスク繰り返す」
+状態に逆戻りする。
+
+### 0. 渡されたベースに対して検証する（fetch/checkout/pull は行わない）
+
+**`git fetch` / `git checkout` / `git pull` は実行しない。** 同期は run が epic worktree で
+済ませており、generator の isolation worktree はそこ（run から渡された `WAVE_BASE` のコミット）
+から分岐しているため、generator 側での同期はそもそも不要である。
+
+- `git checkout "${EPIC_BRANCH}"` は isolation worktree では**必ず失敗する**。epic worktree が
+  同じブランチを checkout 済みのため（実機検証: `fatal: '...' is already used by worktree at
+  '...'` / exit 128）
+- `git pull` は成功しうるが害がある。epic tip が動いていた場合に自分の merge-base を
+  `WAVE_BASE` から動かし、`scripts/merge-lane.sh` の完全一致検証を偽陰性にする
+- `git fetch` は大リポジトリで毎タスクの固定コストになる
+
+代わりに、**渡された `WAVE_BASE`（run から渡されたコミットハッシュ）に対する検証を1回だけ**行う。
+実装を始める前に、自分の HEAD がその `WAVE_BASE` の子孫であることを機械的に確認する:
 
 ```bash
-git fetch origin
-git checkout "${EPIC_BRANCH}"
-git pull origin "${EPIC_BRANCH}"
-```
-
-**同期しただけで先に進んではならない。** 実装を始める前に、自分の HEAD が指示されたベースの
-子孫であることを機械的に確認する:
-
-```bash
-# 指定ベースの子孫でなければ、作業を開始せずに報告して終了する
-git merge-base --is-ancestor "origin/${EPIC_BRANCH}" HEAD || {
-  echo "ERROR: 指定ベース origin/${EPIC_BRANCH} の子孫ではありません"
-  echo "実際の分岐元: $(git merge-base "origin/${EPIC_BRANCH}" HEAD)"
+# run から渡されたベースのコミットハッシュに対して検証する（同期は行わない）
+git merge-base --is-ancestor "<WAVE_BASE>" HEAD || {
+  echo "ERROR: 指定ベース <WAVE_BASE> の子孫ではありません"
+  echo "実際の分岐元: $(git merge-base "<WAVE_BASE>" HEAD)"
   exit 1
 }
 ```
@@ -64,7 +77,11 @@ gh issue view "$TASK_NUMBER"
 
 ### 2. 関連コードの調査
 
-- 親Epic issueから仕様書・計画書を読む: `gh issue view [epic番号]`
+- **親Epic issueの本文（仕様書・計画書）は、Task issue の記載だけでは実装に着手できない場合に
+  限って読む**（`gh issue view [epic番号]`）。planner はタスクを自己完結させる責務を負っているため、
+  通常は Task issue 本文だけで実装できるはずである。Epic 本文を読んだ場合は、Task issue の
+  どの情報が不足していたかを完了報告に含める（自己完結化が足りていない箇所を planner に
+  フィードバックするため）
 - プロジェクトの指示ファイルを読んでルール・アーキテクチャ規約を把握する
 - 関連する既存コードを把握する
 
@@ -171,13 +188,16 @@ git commit -m "feat: [内容] (#[task番号])"
 ## Task #[番号] 完了
 
 ### ベース（実出力を貼る。自己申告しない）
-$ git merge-base --is-ancestor origin/[epicブランチ] HEAD && echo OK
+$ git merge-base --is-ancestor [WAVE_BASE] HEAD && echo OK
 [実出力]
-$ git log --oneline -1 $(git merge-base origin/[epicブランチ] HEAD)
+$ git log --oneline -1 $(git merge-base [WAVE_BASE] HEAD)
 [実出力]
 
 ### 変更ファイル
 - [ファイル一覧]
+
+### Epic本文の参照（読んだ場合のみ）
+- 不足していた情報: [Task issueに無かった情報]
 
 ### テスト結果（サンドボックス内）
 実行したコマンドの全文:
@@ -250,34 +270,84 @@ gh label list | grep -q "review" || gh label create "review" --color "B60205" --
 - Phase分け（データ層 → ロジック → UI → 統合 → テスト）
 - 各タスクに完了条件（テストを含む）を明記する
 - 対象ファイルを具体的に記載する
+- 各タスクに `- 前提: #N` を必ず書く。依存が無い場合も `- 前提: なし` と明記する
+  （宣言漏れと「依存なし」を区別できるようにするため、`- 前提: なし` の明記は**必須**である）
 
 ### タスク選定順序
 
-1. Epic issue 本文からタスク一覧を取得する
-2. 未クローズの Task issue を Phase 順にソートする
-3. 同一 Phase 内では issue番号が小さい順
-4. 最初の未完了タスクを選定する
+タスクの実行順序は**依存グラフだけを根拠に決める**。決定は次の手順で行う。
+
+1. 未クローズの Task issue の `- 前提:` からタスク間の依存グラフを構築する
+2. 未充足の依存を持たないタスクの集合を**ウェーブ**とする（同一ウェーブは並列実行できる）
+3. ウェーブ内は issue 番号の小さい順に、並列度（レーン数）ぶんのサブバッチへ分割する
+4. **Phase は人間向けの区分であり、実行順序の決定には使わない。依存グラフが唯一の根拠である**
+   （例: 鎖状に直列な依存を持つ Phase がある一方、Phase をまたいで相互に独立なタスクの
+   組もある。Phase 順に実行すると、本来並列に走らせられるタスクを直列化してしまう）
+5. `- 前提:` 行を持たないタスクは、**自分より issue 番号が小さい全タスクに依存する**とみなす
+   （宣言漏れに対する fail-safe）。`- 前提:` を宣言していない既存 Epic は完全逐次で実行され、
+   現行挙動と等価になる
 
 ## ブランチ戦略
 
 ```
 main（保護: 人間のみマージ可）
- └─ epic/epic[Epic issue番号]/[機能名]   ← Epic単位のブランチ。全作業はここに積む
+ └─ epic/epic[Epic issue番号]/[機能名]        ← 統合ゲートを通ったコミットだけが載る
+     └─ wave/epic[Epic issue番号]/[ウェーブ番号]  ← レーンを取り込み統合ゲートに掛ける一時ブランチ（origin へ push しない）
+         └─ 各レーンの作業ブランチ（generator の isolation worktree 由来）
 ```
 
 - ブランチ命名規則: `epic/epic[Epic issue番号]/[機能名]`
-- 全作業は Epic ブランチ上で行う
-- タスク完了後の変更は Epic ブランチにマージする（main ではない）
+- 全作業は Epic ブランチ上に積む（各レーンは wave ブランチを経由して合流する）
 - 全タスク完了後、Epic ブランチ → main の PR を作成する
 - **main への直接コミット・マージは絶対に行わない。** main へのマージは人間が行う
-- **各タスク開始前に必ず Epic ブランチを最新に同期する。** 古いベースで分岐すると、
-  前タスクの変更が反映されずコンフリクトやファイル不整合が発生する
+- **各ウェーブ開始前に必ず Epic ブランチを最新に同期し、その tip を `WAVE_BASE` として記録する。**
+  そのウェーブに属する全レーンはこの `WAVE_BASE` から分岐し、共有する。古いベースから分岐すると、
+  前ウェーブの変更が反映されずコンフリクトやファイル不整合が発生する
+  （generator 自身は `fetch` / `checkout` / `pull` を行わない。渡された `WAVE_BASE` に対する
+  検証1回だけを行う。詳細は `core/roles/generator.md` を参照）
 
 ```bash
 git fetch origin
 git checkout "${EPIC_BRANCH}"
 git pull origin "${EPIC_BRANCH}"
+WAVE_BASE=$(git rev-parse HEAD)
 ```
+
+### レーン → wave ブランチのマージ時のベース検証
+
+`git merge --ff-only` は「ベース逸脱の検出」と「履歴の直線性の強制」という2つの役割を
+兼ねていたが、後者は同一ベースから分岐した並列レーンの取り込みを構造的に不可能にする。
+**この2つの役割は分離できる。** レーンを wave ブランチへ取り込む際は、直線性を強制せず、
+ベース逸脱の検出だけを merge-base の完全一致で行う。
+
+```bash
+ACTUAL_BASE=$(git merge-base "${WAVE_BRANCH}" "${LANE_BRANCH}")
+[ "$ACTUAL_BASE" = "$WAVE_BASE" ] || 停止   # ベース逸脱の検出（維持する）
+git merge --no-edit "${LANE_BRANCH}"        # 直線性の強制はやめる（ff可能ならffになる）
+```
+
+- **cherry-pick による載せ替えは禁止する。** 検証されていないツリーを作る経路を残さないため、
+  ベース逸脱・マージ競合はいずれも取り込まずに差し戻す（次ウェーブへ持ち越す）
+- 統合ゲート（プロジェクトの全テスト）を通過してから、wave ブランチを epic ブランチへ
+  `--ff-only` で進める。**epic ブランチへの force push は行わない**
+- wave ブランチは origin へ push しない（ローカルの一時ブランチ）
+- 並列度1（1ウェーブ1レーン）のときは自然に fast-forward となり、履歴は現行と同じ直線を保つ
+
+### 失敗時の扱い
+
+- 失敗したレーンだけを落とし、先に取り込めたレーンの成果は活かす。**ウェーブ全体は捨てない**
+- ウェーブ内では再試行しない。次ウェーブへ持ち越す（バリア同期のため、ウェーブ内の再試行は
+  完了済みの他レーンを待たせ続けるだけになる。次ウェーブに回せばベースが進み、
+  「先行タスクの変更が無かったせいで落ちた」類の失敗は自然に解消する）
+- **スキップの伝播**: スキップされたタスクに依存する後続タスクは実行せずスキップし、
+  issue にその旨をコメントする（推移的に伝播する）
+
+### Codex の位置づけ
+
+並列レーンの起動は Claude のみ対応する。Codex はサブエージェント専用の worktree を持たないため、
+**`lanes=1` 固定**で動作する。仕様が違うのではなく、設定値が固定されているだけであり、
+上記のウェーブ・merge-base 検証・wave ブランチ経由の統合は Codex にもそのまま適用される
+（1レーンのウェーブとして同じ経路を通る）。
 
 ## コミットメッセージ規約
 
@@ -380,6 +450,21 @@ bash "${CLAUDE_PLUGIN_ROOT}/scripts/sandbox-exec.sh" --epic "$EPIC_NUM" --print-
 
 `--print-plan` が `mode=none` を返す場合、`Dockerfile.dev` も `docker-compose.dev.yml` も
 見つかっていないので、自律モードを開始せずに停止する。
+
+### プロジェクト固有の準備コマンド
+
+生成物の配置（wasm 等）・依存物のダウンロード・コード生成など、**タスクに依らず同じ結果になる
+準備作業**は、タスクごとに繰り返さず Epic 開始時に1回だけ実行する。コンテナは Epic 単位で
+常駐する（`sandbox-exec.sh` の既存挙動）ため、この1回の準備がウェーブ・レーンをまたいで効く。
+
+- Epic issue 本文に `## 準備コマンド` 節があれば、run がその内容を Epic 開始時の
+  `--warm`（`sandbox-exec.sh`）に1回だけ渡す
+- 節が無い場合は現行どおり、ビルドコマンドで `--warm` するだけになる（後方互換）
+- `--warm` は失敗してもループを止めない（`sandbox-exec.sh` の既存挙動）。準備が失敗した場合は
+  その旨を表示するだけで続行する
+- generator は**タスクごとにこの準備を再実行しない**。準備が効いていないと判断した場合も、
+  自前で再実行はせずその事実を報告する（`core/roles/generator.md`）
+- 節を書くかどうかの判断は planner が行う（`core/roles/planner.md`）
 
 ## 安全ルール（例外なし）
 
