@@ -2824,6 +2824,197 @@ assert_eq "DEV_WORKFLOW_MAX_LANES で既定の lanes を上書きできる" "5" 
   "$(printf '%s\n' "$PW_ENV_LANES_OUTPUT" | awk -F'\t' '$1=="lanes"{print $2}')"
 
 # ---------------------------------------------------------------------------
+# merge-lane.sh（merge-base 検証と wave ブランチ統合。Task #16）
+#
+# 一時 git リポジトリを組み立てて検証する（Docker 非依存）。scripts/merge-lane.sh は
+# cwd のリポジトリに対して checkout / merge-base / merge / abort を行うため、
+# plan-waves.sh と違いスクリプト自体をコピーせず、cwd を一時リポジトリに変えて
+# REPO_ROOT のスクリプトを直接呼び出す。
+# ---------------------------------------------------------------------------
+
+echo "== merge-lane.sh（merge-base 検証と wave ブランチ統合） =="
+
+MERGE_LANE_SCRIPT="${REPO_ROOT}/scripts/merge-lane.sh"
+
+ml_commit_file() {
+  # ml_commit_file <repo_dir> <相対ファイル名> <内容> <コミットメッセージ>
+  local repo="$1" file="$2" content="$3" msg="$4"
+  (
+    cd "$repo" || exit 1
+    printf '%s' "$content" > "$file"
+    git add "$file"
+    git commit -q -m "$msg"
+  ) >/dev/null 2>&1
+}
+
+ml_branch_from() {
+  # ml_branch_from <repo_dir> <新ブランチ名> <開始点（コミットish）>
+  local repo="$1" branch="$2" start="$3"
+  (
+    cd "$repo" || exit 1
+    git checkout -q -b "$branch" "$start"
+  ) >/dev/null 2>&1
+}
+
+ml_head_of() {
+  # ml_head_of <repo_dir> <ref>  ref が指すコミットの完全なSHAを返す
+  (cd "$1" || exit 1; git rev-parse "$2") 2>/dev/null
+}
+
+run_merge_lane() {
+  # run_merge_lane <repo_dir> [追加の引数...]  戻り値は標準出力（呼び出し側で $? を確認する）
+  local repo="$1"
+  shift
+  (cd "$repo" || exit 1; bash "$MERGE_LANE_SCRIPT" "$@")
+}
+
+# --- ケース8: 同一ベースから分岐した2レーンが順に取り込め、2本目の merge-base が
+#     EXPECTED_BASE のままであること ---
+ML_REPO8="$(make_temp_repo)"
+ml_commit_file "$ML_REPO8" "base.txt" "wave base\n" "wave base commit"
+ML8_BASE="$(ml_head_of "$ML_REPO8" HEAD)"
+ml_branch_from "$ML_REPO8" "lane-a" "$ML8_BASE"
+ml_commit_file "$ML_REPO8" "a.txt" "lane a\n" "lane a change"
+ml_branch_from "$ML_REPO8" "lane-b" "$ML8_BASE"
+ml_commit_file "$ML_REPO8" "b.txt" "lane b\n" "lane b change"
+
+ML8_OUT1="$(run_merge_lane "$ML_REPO8" --wave-branch "wave/epicT/1" --expected-base "$ML8_BASE" --lane-branch lane-a --task 16 --create)"
+ML8_EXIT1=$?
+assert_exit_code "ケース8: 1本目（lane-a）の取り込みは exit 0" 0 "$ML8_EXIT1"
+
+# 2本目のマージ実行前（1本目取り込み後）の merge-base を確認する。マージ後は wave が
+# lane-b を取り込んで祖先集合が変わるため、必ずマージ「前」に測る。
+ML8_ACTUAL_BASE_2ND="$(cd "$ML_REPO8" && git merge-base "wave/epicT/1" lane-b)"
+assert_eq "ケース8: 2本目の merge-base（実行前）は EXPECTED_BASE のまま" "$ML8_BASE" "$ML8_ACTUAL_BASE_2ND"
+
+ML8_OUT2="$(run_merge_lane "$ML_REPO8" --wave-branch "wave/epicT/1" --expected-base "$ML8_BASE" --lane-branch lane-b --task 16)"
+ML8_EXIT2=$?
+assert_exit_code "ケース8: 2本目（lane-b）の取り込みは exit 0" 0 "$ML8_EXIT2"
+
+ML8_WAVE_HEAD="$(ml_head_of "$ML_REPO8" "wave/epicT/1")"
+if [ "$ML8_WAVE_HEAD" != "$ML8_BASE" ]; then
+  pass "ケース8: wave ブランチが両レーンの成果を含む（HEAD が進んでいる）"
+else
+  fail "ケース8: wave ブランチが両レーンの成果を含む（HEAD が進んでいる）" "wave HEAD が BASE から動いていません"
+fi
+
+# --- ケース9: 別ベースから分岐したレーンが exit 10 で拒否され、wave ブランチが動かないこと ---
+ML_REPO9="$(make_temp_repo)"
+ML9_OLD_BASE="$(ml_head_of "$ML_REPO9" HEAD)"
+ml_commit_file "$ML_REPO9" "base.txt" "wave base\n" "wave base commit"
+ML9_EXPECTED_BASE="$(ml_head_of "$ML_REPO9" HEAD)"
+
+ml_branch_from "$ML_REPO9" "lane-ok" "$ML9_EXPECTED_BASE"
+ml_commit_file "$ML_REPO9" "ok.txt" "lane ok\n" "lane ok change"
+
+ml_branch_from "$ML_REPO9" "lane-wrong-base" "$ML9_OLD_BASE"
+ml_commit_file "$ML_REPO9" "wrong.txt" "lane wrong base\n" "lane wrong base change"
+
+run_merge_lane "$ML_REPO9" --wave-branch "wave/epicT/1" --expected-base "$ML9_EXPECTED_BASE" --lane-branch lane-ok --task 16 --create >/dev/null
+ML9_SETUP_EXIT=$?
+assert_exit_code "ケース9: 事前準備（lane-ok の取り込み）は exit 0" 0 "$ML9_SETUP_EXIT"
+
+ML9_WAVE_HEAD_BEFORE="$(ml_head_of "$ML_REPO9" "wave/epicT/1")"
+
+ML9_OUT="$(run_merge_lane "$ML_REPO9" --wave-branch "wave/epicT/1" --expected-base "$ML9_EXPECTED_BASE" --lane-branch lane-wrong-base --task 16)"
+ML9_EXIT=$?
+assert_exit_code "ケース9: 別ベースから分岐したレーンは exit 10" 10 "$ML9_EXIT"
+
+case "$ML9_OUT" in
+  *"$ML9_OLD_BASE"*) pass "ケース9: 実際の merge-base とそのコミットログが stdout に出る" ;;
+  *) fail "ケース9: 実際の merge-base とそのコミットログが stdout に出る" "output=[${ML9_OUT}]" ;;
+esac
+
+ML9_WAVE_HEAD_AFTER="$(ml_head_of "$ML_REPO9" "wave/epicT/1")"
+assert_eq "ケース9: exit 10 のとき wave ブランチが動かない" "$ML9_WAVE_HEAD_BEFORE" "$ML9_WAVE_HEAD_AFTER"
+
+# --- ケース10: 競合するレーンが exit 11 で拒否され、git merge --abort 後に作業ツリーが
+#     汚れていないこと（git status --porcelain が空） ---
+ML_REPO10="$(make_temp_repo)"
+ml_commit_file "$ML_REPO10" "conflict.txt" "base\n" "wave base commit"
+ML10_BASE="$(ml_head_of "$ML_REPO10" HEAD)"
+
+ml_branch_from "$ML_REPO10" "lane-c1" "$ML10_BASE"
+ml_commit_file "$ML_REPO10" "conflict.txt" "change1\n" "lane c1 change"
+
+ml_branch_from "$ML_REPO10" "lane-c2" "$ML10_BASE"
+ml_commit_file "$ML_REPO10" "conflict.txt" "change2\n" "lane c2 change"
+
+run_merge_lane "$ML_REPO10" --wave-branch "wave/epicT/1" --expected-base "$ML10_BASE" --lane-branch lane-c1 --task 16 --create >/dev/null
+ML10_SETUP_EXIT=$?
+assert_exit_code "ケース10: 事前準備（lane-c1 の取り込み）は exit 0" 0 "$ML10_SETUP_EXIT"
+
+ML10_WAVE_HEAD_BEFORE="$(ml_head_of "$ML_REPO10" "wave/epicT/1")"
+
+ML10_OUT="$(run_merge_lane "$ML_REPO10" --wave-branch "wave/epicT/1" --expected-base "$ML10_BASE" --lane-branch lane-c2 --task 16)"
+ML10_EXIT=$?
+assert_exit_code "ケース10: 競合するレーンは exit 11" 11 "$ML10_EXIT"
+
+case "$ML10_OUT" in
+  *"conflict.txt"*) pass "ケース10: 競合ファイル一覧（conflict.txt）が stdout に出る" ;;
+  *) fail "ケース10: 競合ファイル一覧（conflict.txt）が stdout に出る" "output=[${ML10_OUT}]" ;;
+esac
+
+ML10_PORCELAIN="$(cd "$ML_REPO10" && git status --porcelain)"
+assert_eq "ケース10: git merge --abort 後に作業ツリーが汚れていない" "" "$ML10_PORCELAIN"
+
+ML10_WAVE_HEAD_AFTER="$(ml_head_of "$ML_REPO10" "wave/epicT/1")"
+assert_eq "ケース10: exit 11 のとき wave ブランチが動かない" "$ML10_WAVE_HEAD_BEFORE" "$ML10_WAVE_HEAD_AFTER"
+
+# --- ケース11: レーン1本のウェーブで履歴が fast-forward になること（lanes=1 相当） ---
+ML_REPO11="$(make_temp_repo)"
+ml_commit_file "$ML_REPO11" "base.txt" "wave base\n" "wave base commit"
+ML11_BASE="$(ml_head_of "$ML_REPO11" HEAD)"
+
+ml_branch_from "$ML_REPO11" "lane-solo" "$ML11_BASE"
+ml_commit_file "$ML_REPO11" "solo.txt" "lane solo\n" "lane solo change"
+ML11_LANE_HEAD="$(ml_head_of "$ML_REPO11" lane-solo)"
+
+run_merge_lane "$ML_REPO11" --wave-branch "wave/epicT/1" --expected-base "$ML11_BASE" --lane-branch lane-solo --task 16 --create >/dev/null
+ML11_EXIT=$?
+assert_exit_code "ケース11: 単独レーンの取り込みは exit 0" 0 "$ML11_EXIT"
+
+ML11_WAVE_HEAD="$(ml_head_of "$ML_REPO11" "wave/epicT/1")"
+assert_eq "ケース11: fast-forward により wave HEAD がレーンの HEAD と一致する" "$ML11_LANE_HEAD" "$ML11_WAVE_HEAD"
+
+ML11_MERGE_COUNT="$(cd "$ML_REPO11" && git log --merges --oneline "wave/epicT/1" | wc -l | tr -d ' ')"
+assert_eq "ケース11: fast-forward によりマージコミットが作られない" "0" "$ML11_MERGE_COUNT"
+
+# --- ケース12: 引数バリデーション（引数エラーは exit 2） ---
+ML_REPO_ARGS="$(make_temp_repo)"
+
+run_merge_lane "$ML_REPO_ARGS" >/dev/null 2>&1
+assert_exit_code "引数なしは exit 2" 2 "$?"
+
+run_merge_lane "$ML_REPO_ARGS" --expected-base HEAD --lane-branch dummy >/dev/null 2>&1
+assert_exit_code "--wave-branch 省略は exit 2" 2 "$?"
+
+run_merge_lane "$ML_REPO_ARGS" --wave-branch wave/epicT/1 --lane-branch dummy >/dev/null 2>&1
+assert_exit_code "--expected-base 省略は exit 2" 2 "$?"
+
+run_merge_lane "$ML_REPO_ARGS" --wave-branch wave/epicT/1 --expected-base HEAD >/dev/null 2>&1
+assert_exit_code "--lane-branch 省略は exit 2" 2 "$?"
+
+run_merge_lane "$ML_REPO_ARGS" --wave-branch wave/epicT/1 --expected-base no-such-ref --lane-branch dummy >/dev/null 2>&1
+assert_exit_code "--expected-base が解決できない値は exit 2" 2 "$?"
+
+# --- ケース13: wave ブランチが無く --create も無ければ exit 1（その他の失敗） ---
+ML_REPO_NOCREATE="$(make_temp_repo)"
+ML_NOCREATE_BASE="$(ml_head_of "$ML_REPO_NOCREATE" HEAD)"
+ml_branch_from "$ML_REPO_NOCREATE" "lane-x" "$ML_NOCREATE_BASE"
+ml_commit_file "$ML_REPO_NOCREATE" "x.txt" "lane x\n" "lane x change"
+
+run_merge_lane "$ML_REPO_NOCREATE" --wave-branch "wave/epicT/1" --expected-base "$ML_NOCREATE_BASE" --lane-branch lane-x >/dev/null 2>&1
+assert_exit_code "wave ブランチが無く --create 無しは exit 1" 1 "$?"
+
+# --- ケース14: レーンのブランチが存在しなければ exit 1（その他の失敗） ---
+ML_REPO_NOLANE="$(make_temp_repo)"
+ML_NOLANE_BASE="$(ml_head_of "$ML_REPO_NOLANE" HEAD)"
+
+run_merge_lane "$ML_REPO_NOLANE" --wave-branch "wave/epicT/1" --expected-base "$ML_NOLANE_BASE" --lane-branch no-such-lane-branch --create >/dev/null 2>&1
+assert_exit_code "存在しないレーンブランチは exit 1" 1 "$?"
+
+# ---------------------------------------------------------------------------
 # 結果集計
 # ---------------------------------------------------------------------------
 
