@@ -3336,6 +3336,228 @@ case "$RL_WARN_LOOP_ONELINE" in
 esac
 
 # ---------------------------------------------------------------------------
+# adapters/codex/run-loop.sh: watchdog / heartbeat の結線（Task #53）
+#
+# Epic #42 決定事項4: 両アダプタとも「検知して通知するだけ」に揃える（ハードタイムアウト・
+# 自動再投入は実装しない）。--start は run-start より後、--wave は generator 起動前、
+# --stop は正常終了・異常終了を問わず必ず通ること（trap ... EXIT）を検証する。
+# ---------------------------------------------------------------------------
+
+echo ""
+echo "== adapters/codex/run-loop.sh（watchdog結線・回帰防止 #53） =="
+
+RL_FULL_SRC="$(cat "$RUN_LOOP_SCRIPT")"
+
+# --start は notify-slack.sh run-start より後にあること（run マーカーより先に watchdog を
+# 起動すると自己終了条件を誤検知しうるため）
+RL_RUN_START_LINE="$(grep -n 'notify-slack.sh" run-start' "$RUN_LOOP_SCRIPT" | head -1 | cut -d: -f1)"
+RL_WD_START_LINE="$(grep -n 'watchdog.sh" --start' "$RUN_LOOP_SCRIPT" | head -1 | cut -d: -f1)"
+if [ -n "$RL_RUN_START_LINE" ] && [ -n "$RL_WD_START_LINE" ] && [ "$RL_WD_START_LINE" -gt "$RL_RUN_START_LINE" ]; then
+  pass "run-loop.sh: watchdog.sh --start の呼び出しが notify-slack.sh run-start より後にある（#53）"
+else
+  fail "run-loop.sh: watchdog.sh --start の呼び出しが notify-slack.sh run-start より後にある（#53）" \
+    "run-start行=${RL_RUN_START_LINE:-なし} --start行=${RL_WD_START_LINE:-なし}"
+fi
+
+# --wave は LANE_BRANCH 確定後・generator 起動（run_agent generator）前にあること
+RL_WD_WAVE_LINE="$(grep -n 'watchdog.sh" --wave' "$RUN_LOOP_SCRIPT" | head -1 | cut -d: -f1)"
+RL_LANE_BRANCH_LINE="$(grep -n 'LANE_BRANCH="task/' "$RUN_LOOP_SCRIPT" | head -1 | cut -d: -f1)"
+RL_RUN_AGENT_GEN_LINE="$(grep -n 'run_agent generator' "$RUN_LOOP_SCRIPT" | head -1 | cut -d: -f1)"
+if [ -n "$RL_WD_WAVE_LINE" ] && [ -n "$RL_LANE_BRANCH_LINE" ] && [ -n "$RL_RUN_AGENT_GEN_LINE" ] \
+   && [ "$RL_WD_WAVE_LINE" -gt "$RL_LANE_BRANCH_LINE" ] && [ "$RL_WD_WAVE_LINE" -lt "$RL_RUN_AGENT_GEN_LINE" ]; then
+  pass "run-loop.sh: watchdog.sh --wave の呼び出しが LANE_BRANCH確定後・generator起動前にある（#53）"
+else
+  fail "run-loop.sh: watchdog.sh --wave の呼び出しが LANE_BRANCH確定後・generator起動前にある（#53）" \
+    "--wave行=${RL_WD_WAVE_LINE:-なし} LANE_BRANCH行=${RL_LANE_BRANCH_LINE:-なし} run_agent行=${RL_RUN_AGENT_GEN_LINE:-なし}"
+fi
+
+# --stop は trap ... EXIT で結線され、正常終了・異常終了・途中の exit を問わず必ず通ること
+case "$RL_FULL_SRC" in
+  *"trap '_run_loop_watchdog_stop' EXIT"*)
+    pass "run-loop.sh: watchdog.sh --stop が trap ... EXIT で結線されている（#53）" ;;
+  *)
+    fail "run-loop.sh: watchdog.sh --stop が trap ... EXIT で結線されている（#53）" "" ;;
+esac
+
+case "$RL_FULL_SRC" in
+  *'watchdog.sh" --stop'*)
+    pass "run-loop.sh: watchdog.sh --stop の呼び出しが存在する（#53）" ;;
+  *)
+    fail "run-loop.sh: watchdog.sh --stop の呼び出しが存在する（#53）" "" ;;
+esac
+
+# trap は最初の `exit` より前（EPIC_NUMBER 未指定エラーより前）に仕掛けられていること
+# （引数エラーのような早期終了経路でも --stop が通ることを保証するため）
+RL_TRAP_LINE="$(grep -n "trap '_run_loop_watchdog_stop' EXIT" "$RUN_LOOP_SCRIPT" | head -1 | cut -d: -f1)"
+RL_FIRST_EXIT_LINE="$(grep -nE '^[[:space:]]*exit 1$' "$RUN_LOOP_SCRIPT" | head -1 | cut -d: -f1)"
+if [ -n "$RL_TRAP_LINE" ] && [ -n "$RL_FIRST_EXIT_LINE" ] && [ "$RL_TRAP_LINE" -lt "$RL_FIRST_EXIT_LINE" ]; then
+  pass "run-loop.sh: trap は最初の exit より前に仕掛けられている（早期終了経路もカバー・#53）"
+else
+  fail "run-loop.sh: trap は最初の exit より前に仕掛けられている（早期終了経路もカバー・#53）" \
+    "trap行=${RL_TRAP_LINE:-なし} 最初のexit行=${RL_FIRST_EXIT_LINE:-なし}"
+fi
+
+# watchdog.sh が無い・失敗する環境でもループを止めないよう、--start / --wave の呼び出しが
+# `|| true` で握りつぶされていること（--stop は trap 関数内部で握りつぶし済み）
+RL_WD_START_TAIL="$(sed -n "${RL_WD_START_LINE}p" "$RUN_LOOP_SCRIPT")"
+case "$RL_WD_START_TAIL" in
+  *'|| true'*)
+    pass "run-loop.sh: watchdog.sh --start の失敗はループを止めない（|| true・#53）" ;;
+  *)
+    fail "run-loop.sh: watchdog.sh --start の失敗はループを止めない（|| true・#53）" "$RL_WD_START_TAIL" ;;
+esac
+
+RL_WD_WAVE_BLOCK="$(sed -n "${RL_WD_WAVE_LINE},$((RL_WD_WAVE_LINE + 1))p" "$RUN_LOOP_SCRIPT")"
+case "$RL_WD_WAVE_BLOCK" in
+  *'|| true'*)
+    pass "run-loop.sh: watchdog.sh --wave の失敗はループを止めない（|| true・#53）" ;;
+  *)
+    fail "run-loop.sh: watchdog.sh --wave の失敗はループを止めない（|| true・#53）" "$RL_WD_WAVE_BLOCK" ;;
+esac
+
+# タイムアウトによる kill 経路が存在しないこと（Epic #42 決定事項4:
+# ハードタイムアウト・自動再投入は実装しない。両アダプタで機能差を作らない）
+for RL_FORBIDDEN in 'kill -TERM' 'kill -9' 'DEV_WORKFLOW_AGENT_TIMEOUT_SEC'; do
+  if grep -qF -- "$RL_FORBIDDEN" "$RUN_LOOP_SCRIPT"; then
+    fail "run-loop.sh: タイムアウトによる kill 経路が存在しない（${RL_FORBIDDEN} 不在・#53）" \
+      "$(grep -nF -- "$RL_FORBIDDEN" "$RUN_LOOP_SCRIPT")"
+  else
+    pass "run-loop.sh: タイムアウトによる kill 経路が存在しない（${RL_FORBIDDEN} 不在・#53）"
+  fi
+done
+
+# --- 動的検証: DEV_WORKFLOW_DRY_RUN=1 で --start → --wave → --stop がこの順で呼ばれる。
+#     watchdog.sh を差し替え可能なスタブ（呼び出し引数を記録するだけ）に置き換え、
+#     実際に run-loop.sh 全体を DRY_RUN で走らせて確認する（Docker・codex には触れない）。
+#     `${PLUGIN_ROOT_DIR}/scripts/watchdog.sh` は BASH_SOURCE から解決される絶対パスのため、
+#     run-loop.sh・scripts 一式を一時ディレクトリへ複製し、その中の watchdog.sh だけを
+#     差し替える（実リポジトリのファイルは一切変更しない）。
+rl_build_fixture() {
+  # rl_build_fixture <fixture_dir_var_prefix>
+  # 呼び出し側の変数 <prefix>_ROOT / <prefix>_PROJECT / <prefix>_GH_DIR / <prefix>_WD_LOG を埋める。
+  local prefix="$1"
+  local fake_root project origin gh_dir wd_log
+  fake_root="$(mktemp -d "${TMPDIR:-/tmp}/dw-test-rl-root.XXXXXX")"
+  mkdir -p "${fake_root}/adapters/codex" "${fake_root}/scripts"
+  cp "$RUN_LOOP_SCRIPT" "${fake_root}/adapters/codex/run-loop.sh"
+  cp -r "${REPO_ROOT}/scripts/." "${fake_root}/scripts/"
+
+  origin="$(mktemp -d "${TMPDIR:-/tmp}/dw-test-rl-origin.XXXXXX")"
+  (cd "$origin" && git init -q --bare) >/dev/null 2>&1
+
+  project="$(mktemp -d "${TMPDIR:-/tmp}/dw-test-rl-project.XXXXXX")"
+  (
+    cd "$project" || exit 1
+    git init -q
+    git config user.email "dev-workflow-test@example.com"
+    git config user.name "dev-workflow test"
+    git remote add origin "$origin"
+    printf 'test\n' > README.md
+    git add README.md
+    git commit -q -m init
+    git branch "epic/epic999/watchdog-wiring"
+    git push -q origin "epic/epic999/watchdog-wiring"
+    mkdir -p .codex/agents
+    printf 'name = "generator"\n' > .codex/agents/generator.toml
+    printf 'name = "evaluator"\n' > .codex/agents/evaluator.toml
+  ) >/dev/null 2>&1
+
+  gh_dir="$(mktemp -d "${TMPDIR:-/tmp}/dw-test-rl-ghfake.XXXXXX")"
+  cat > "${gh_dir}/gh" <<'FAKE_GH'
+#!/bin/bash
+case "$*" in
+  "issue view 999 --json body -q .body")
+    printf 'ブランチ: epic/epic999/watchdog-wiring\n'
+    ;;
+  *"issue list --label task --state open"*)
+    printf '501\x1f- 前提: なし\x1f- Epic: #999\n'
+    ;;
+  *)
+    exit 0
+    ;;
+esac
+FAKE_GH
+  chmod +x "${gh_dir}/gh"
+
+  wd_log="$(mktemp "${TMPDIR:-/tmp}/dw-test-rl-wdlog.XXXXXX")"
+
+  eval "${prefix}_ROOT=\"\$fake_root\""
+  eval "${prefix}_PROJECT=\"\$project\""
+  eval "${prefix}_GH_DIR=\"\$gh_dir\""
+  eval "${prefix}_WD_LOG=\"\$wd_log\""
+}
+
+rl_build_fixture RL_FX
+
+# watchdog.sh を「呼び出し引数を1行ずつ記録するだけ」のスタブに差し替える
+# （DEV_WORKFLOW_TEST_WATCHDOG_LOG が指す先へ追記。実際の監視は一切行わない）
+cat > "${RL_FX_ROOT}/scripts/watchdog.sh" <<'FAKE_WD'
+#!/bin/bash
+echo "$*" >> "${DEV_WORKFLOW_TEST_WATCHDOG_LOG:?}"
+exit 0
+FAKE_WD
+chmod +x "${RL_FX_ROOT}/scripts/watchdog.sh"
+
+RL_DYN_OUT="$(
+  PATH="${RL_FX_GH_DIR}:${PATH}" \
+  DEV_WORKFLOW_DRY_RUN=1 \
+  DEV_WORKFLOW_TEST_CMD='true' \
+  DEV_WORKFLOW_MAX_TASKS=1 \
+  DEV_WORKFLOW_TEST_WATCHDOG_LOG="$RL_FX_WD_LOG" \
+  bash "${RL_FX_ROOT}/adapters/codex/run-loop.sh" 999 "$RL_FX_PROJECT" 2>&1
+)"
+RL_DYN_EXIT=$?
+
+assert_exit_code "run-loop.sh: DRY_RUN実行（watchdogスタブあり）は exit 0 で完走する（#53）" 0 "$RL_DYN_EXIT"
+
+RL_WD_CALLS="$(awk '{print $1}' "$RL_FX_WD_LOG" 2>/dev/null)"
+assert_eq "run-loop.sh: DRY_RUN実行時、watchdog.shが --start → --wave → --stop の順で呼ばれる（#53）" \
+  "$(printf -- '--start\n--wave\n--stop')" "$RL_WD_CALLS"
+
+if [ "$(grep -c '^--wave' "$RL_FX_WD_LOG" 2>/dev/null)" = "1" ]; then
+  pass "run-loop.sh: --wave はタスク1件（MAX_TASKS=1）につき1回だけ呼ばれる（#53）"
+else
+  fail "run-loop.sh: --wave はタスク1件（MAX_TASKS=1）につき1回だけ呼ばれる（#53）" "$(cat "$RL_FX_WD_LOG" 2>/dev/null)"
+fi
+
+case "$(grep '^--start' "$RL_FX_WD_LOG" 2>/dev/null)" in
+  *'--epic epic999'*'--label Epic #999'*)
+    pass "run-loop.sh: --start に --epic / --label が渡っている（#53）" ;;
+  *)
+    fail "run-loop.sh: --start に --epic / --label が渡っている（#53）" "$(grep '^--start' "$RL_FX_WD_LOG" 2>/dev/null)" ;;
+esac
+
+case "$(grep '^--wave' "$RL_FX_WD_LOG" 2>/dev/null)" in
+  *'--epic epic999'*'--wave-no 1'*'--tasks 501'*)
+    pass "run-loop.sh: --wave に --epic / --wave-no / --tasks が渡っている（#53）" ;;
+  *)
+    fail "run-loop.sh: --wave に --epic / --wave-no / --tasks が渡っている（#53）" "$(grep '^--wave' "$RL_FX_WD_LOG" 2>/dev/null)" ;;
+esac
+
+# --- watchdog.sh が無い環境でも run-loop 自体は継続すること ---
+rl_build_fixture RL_FX2
+# scripts/watchdog.sh を配置しない（「スクリプトが無い」環境の再現）
+rm -f "${RL_FX2_ROOT}/scripts/watchdog.sh"
+
+RL_MISSING_OUT="$(
+  PATH="${RL_FX2_GH_DIR}:${PATH}" \
+  DEV_WORKFLOW_DRY_RUN=1 \
+  DEV_WORKFLOW_TEST_CMD='true' \
+  DEV_WORKFLOW_MAX_TASKS=1 \
+  bash "${RL_FX2_ROOT}/adapters/codex/run-loop.sh" 999 "$RL_FX2_PROJECT" 2>&1
+)"
+RL_MISSING_EXIT=$?
+
+assert_exit_code "run-loop.sh: watchdog.sh が無くても run-loop 自体は exit 0 で継続する（#53）" 0 "$RL_MISSING_EXIT"
+
+case "$RL_MISSING_OUT" in
+  *"Epic一括レビュー"*)
+    pass "run-loop.sh: watchdog.sh が無くてもEpic一括レビューまで到達する（#53）" ;;
+  *)
+    fail "run-loop.sh: watchdog.sh が無くてもEpic一括レビューまで到達する（#53）" "$RL_MISSING_OUT" ;;
+esac
+
+# ---------------------------------------------------------------------------
 # skills/run/SKILL.md: 統合ゲート失敗時のリカバリと0レーン取り込みの分岐
 # （回帰防止 #38, #41）
 # ---------------------------------------------------------------------------
@@ -3514,6 +3736,97 @@ else
     pass "SKILL.md(codex): 未定義変数 \$EPIC_NUMBER を参照していない"
   fi
 fi
+
+# ---------------------------------------------------------------------------
+# skills-codex/dev-workflow-run/SKILL.md: watchdog の結線（--start/--wave/--stop）と
+# ハング時の運用手順の記述（回帰防止 #53。skills/run/SKILL.md #51 の Codex 側対応物）
+# ---------------------------------------------------------------------------
+
+echo ""
+echo "== skills-codex/dev-workflow-run/SKILL.md（watchdog結線・ハング時運用手順の回帰防止 #53） =="
+
+# --start の呼び出しが run-start の記述より後にあること
+CRS_RUN_START_LINE="$(grep -n 'notify-slack.sh" run-start' "$CODEX_RUN_SKILL" | head -1 | cut -d: -f1)"
+CRS_WATCHDOG_START_LINE="$(grep -n 'watchdog.sh" --start' "$CODEX_RUN_SKILL" | head -1 | cut -d: -f1)"
+
+if [ -n "$CRS_RUN_START_LINE" ] && [ -n "$CRS_WATCHDOG_START_LINE" ] && [ "$CRS_WATCHDOG_START_LINE" -gt "$CRS_RUN_START_LINE" ]; then
+  pass "SKILL.md(codex): watchdog.sh --start の呼び出しが notify-slack.sh run-start より後にある（#53）"
+else
+  fail "SKILL.md(codex): watchdog.sh --start の呼び出しが notify-slack.sh run-start より後にある（#53）" \
+    "run-start行=${CRS_RUN_START_LINE:-なし} --start行=${CRS_WATCHDOG_START_LINE:-なし}"
+fi
+
+# --wave の呼び出しが Step 2（WAVE_BASEを記録し、レーンを作る節）にあること
+CRS_STEP2="$(awk '/^### Step 2:/{f=1} /^### Step 3:/{f=0} f' "$CODEX_RUN_SKILL")"
+
+case "$CRS_STEP2" in
+  *'watchdog.sh" --wave'*)
+    pass "SKILL.md(codex): watchdog.sh --wave の呼び出しが Step 2（WAVE_BASE）の節にある（#53）" ;;
+  *)
+    fail "SKILL.md(codex): watchdog.sh --wave の呼び出しが Step 2（WAVE_BASE）の節にある（#53）" "$CRS_STEP2" ;;
+esac
+
+# --stop の呼び出しが「正常終了・異常終了を問わず」と書かれた節の中にあり、
+# かつ完了通知（run-complete）より前の位置にあること
+CRS_CLEANUP="$(awk '/^## サンドボックスの後片付け（正常終了・異常終了を問わず必ず実行）/{f=1} /^## /{if (f && !/サンドボックスの後片付け/) f=0} f' "$CODEX_RUN_SKILL")"
+
+case "$CRS_CLEANUP" in
+  *'watchdog.sh" --stop'*)
+    pass "SKILL.md(codex): watchdog.sh --stop の呼び出しが「正常終了・異常終了を問わず」の節にある（#53）" ;;
+  *)
+    fail "SKILL.md(codex): watchdog.sh --stop の呼び出しが「正常終了・異常終了を問わず」の節にある（#53）" "$CRS_CLEANUP" ;;
+esac
+
+CRS_WATCHDOG_STOP_LINE="$(grep -n 'watchdog.sh" --stop' "$CODEX_RUN_SKILL" | head -1 | cut -d: -f1)"
+CRS_RUN_COMPLETE_LINE="$(grep -n 'notify-slack.sh" run-complete' "$CODEX_RUN_SKILL" | head -1 | cut -d: -f1)"
+
+if [ -n "$CRS_WATCHDOG_STOP_LINE" ] && [ -n "$CRS_RUN_COMPLETE_LINE" ] && [ "$CRS_WATCHDOG_STOP_LINE" -lt "$CRS_RUN_COMPLETE_LINE" ]; then
+  pass "SKILL.md(codex): watchdog.sh --stop の呼び出しが完了通知（run-complete）より前の位置にある（#53）"
+else
+  fail "SKILL.md(codex): watchdog.sh --stop の呼び出しが完了通知（run-complete）より前の位置にある（#53）" \
+    "--stop行=${CRS_WATCHDOG_STOP_LINE:-なし} run-complete行=${CRS_RUN_COMPLETE_LINE:-なし}"
+fi
+
+# 「ハングしたときに人間がすること」の節が存在し、--abort の説明と再実行の手順を含むこと
+CRS_HANG_SECTION="$(awk '/^## ハングしたときに人間がすること/{f=1} /^## Epic一括レビュー/{f=0} f' "$CODEX_RUN_SKILL")"
+
+if [ -n "$CRS_HANG_SECTION" ]; then
+  pass "SKILL.md(codex): 「ハングしたときに人間がすること」の節が存在する（#53）"
+else
+  fail "SKILL.md(codex): 「ハングしたときに人間がすること」の節が存在する（#53）" "節が見つかりません"
+fi
+
+case "$CRS_HANG_SECTION" in
+  *'watchdog.sh" --abort'*)
+    pass "SKILL.md(codex): ハング時の節に watchdog.sh --abort の説明がある（#53）" ;;
+  *)
+    fail "SKILL.md(codex): ハング時の節に watchdog.sh --abort の説明がある（#53）" "$CRS_HANG_SECTION" ;;
+esac
+
+case "$CRS_HANG_SECTION" in
+  *'dev-workflow-run'*)
+    pass "SKILL.md(codex): ハング時の節に再実行（dev-workflow-run スキル）の手順がある（#53）" ;;
+  *)
+    fail "SKILL.md(codex): ハング時の節に再実行（dev-workflow-run スキル）の手順がある（#53）" "$CRS_HANG_SECTION" ;;
+esac
+
+# 「自動で打ち切って再投入することはできない」旨の記述が存在すること（Claude版と同一方針）
+case "$CRS_HANG_SECTION" in
+  *'自動で打ち切って再投入する'*'実装しない'*)
+    pass "SKILL.md(codex): 「自動で打ち切って再投入することは実装しない」旨の記述がある（#53）" ;;
+  *)
+    fail "SKILL.md(codex): 「自動で打ち切って再投入することは実装しない」旨の記述がある（#53）" "$CRS_HANG_SECTION" ;;
+esac
+
+# Claude Code版と挙動が同じ（アダプタ間に機能差を作らない）旨の記述が
+# ハング節・自律実行開始節のいずれかに存在すること
+CRS_FULL_SRC="$(cat "$CODEX_RUN_SKILL")"
+case "$CRS_FULL_SRC" in
+  *'アダプタ間に機能差を'*'作らない'*)
+    pass "SKILL.md(codex): 「アダプタ間に機能差を作らない」旨の記述がある（#53）" ;;
+  *)
+    fail "SKILL.md(codex): 「アダプタ間に機能差を作らない」旨の記述がある（#53）" "" ;;
+esac
 
 # ---------------------------------------------------------------------------
 # notify-slack.sh: watchdog イベント（stall / stall-recovered / sleep-gap / budget、Task #46）
