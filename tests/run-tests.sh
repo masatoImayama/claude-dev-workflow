@@ -3923,6 +3923,346 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+# scripts/watchdog.sh（常駐監視の骨格とライフサイクル。Task #45、Epic #42）
+#
+# run のメインループはサブエージェント実行中に別処理を回せないため、監視は
+# nohup で自己デタッチする常駐プロセスとして実装している（Epic #42 仕様書「2. 全体像」
+# 「5. デタッチした常駐プロセス」）。ここでは検知ロジック（#47〜#49）ではなく、
+# 起動・停止・状態確認・自己終了・二重起動防止・stale PID 検出のライフサイクルだけを
+# 検証する。実プロセスを扱うケースは合計10秒以内に収め、終了後にプロセスを残さない。
+# ---------------------------------------------------------------------------
+
+echo ""
+echo "== scripts/watchdog.sh（常駐監視の骨格とライフサイクル。Task #45） =="
+
+WD_SCRIPT="${REPO_ROOT}/scripts/watchdog.sh"
+
+# wd_new_root  一時マーカールート（.claude/ 付き）を作って絶対パスを返す
+wd_new_root() {
+  local dir
+  dir="$(mktemp -d "${TMPDIR:-/tmp}/dw-test-watchdog.XXXXXX")"
+  mkdir -p "${dir}/.claude"
+  printf '%s' "$dir"
+}
+
+# wd_pid_of <root>  PIDファイルに書かれたPID部分だけを返す（無ければ空文字）
+wd_pid_of() {
+  local root="$1" line=""
+  [ -f "${root}/.claude/.dev-workflow-watchdog.pid" ] || return 0
+  IFS= read -r line < "${root}/.claude/.dev-workflow-watchdog.pid" || true
+  printf '%s' "${line%% *}"
+}
+
+# wd_pid_alive <pid>  そのPIDが実際に稼働していれば0を返す
+#
+# `kill -0` だけではゾンビ（終了済みだが未回収のプロセス）にも成功してしまう
+# （POSIXの仕様どおり）。init を持たないこのサンドボックスコンテナでは孤児プロセスが
+# 永久にゾンビのまま残ることが実測で判明したため、watchdog.sh の
+# _watchdog_pid_alive と同じロジック（/proc の State 行でゾンビを除外する）を
+# テスト側でも使う。
+wd_pid_alive() {
+  local pid="$1"
+  case "$pid" in
+    ''|*[!0-9]*) return 1 ;;
+  esac
+  kill -0 "$pid" 2>/dev/null || return 1
+
+  if [ -r "/proc/${pid}/status" ]; then
+    local line
+    while IFS= read -r line; do
+      case "$line" in
+        State:*)
+          case "$line" in
+            *'(zombie)'*) return 1 ;;
+          esac
+          break
+          ;;
+      esac
+    done < "/proc/${pid}/status"
+  fi
+
+  return 0
+}
+
+# テストが途中で失敗しても、起動した監視デーモンを必ず後始末する
+# （ホストには他の作業が動いているため、無関係なプロセスには触れない。
+#   ここで kill するのはこのテストが自分で起動したPIDだけ）
+WD_CLEANUP_PIDS=()
+wd_cleanup_all() {
+  local p
+  for p in "${WD_CLEANUP_PIDS[@]:-}"; do
+    [ -n "$p" ] || continue
+    wd_pid_alive "$p" && kill "$p" 2>/dev/null
+  done
+}
+trap wd_cleanup_all EXIT
+
+# --- ライフサイクル: start（即時に返る・生存）→ status（running）→ 二重start（1プロセスのまま）
+#     → stop（確実に停止）→ status（stopped・PIDファイル消滅） ---
+
+WD_ROOT1="$(wd_new_root)"
+: > "${WD_ROOT1}/.claude/.dev-workflow-run"
+
+WD_T0=""
+printf -v WD_T0 '%(%s)T' -1
+WD_START_OUT="$(DEV_WORKFLOW_MARKER_ROOT="$WD_ROOT1" DEV_WORKFLOW_WATCHDOG_TICK_SEC=30 \
+  bash "$WD_SCRIPT" --start --epic 45 --label "Epic #45 test" 2>&1)"
+WD_T1=""
+printf -v WD_T1 '%(%s)T' -1
+WD_ELAPSED=$((WD_T1 - WD_T0))
+
+if [ "$WD_ELAPSED" -le 1 ]; then
+  pass "watchdog.sh --start: 呼び出しが1秒以内に返る（実測 ${WD_ELAPSED}s）"
+else
+  fail "watchdog.sh --start: 呼び出しが1秒以内に返る" "実測 ${WD_ELAPSED}s / 出力: ${WD_START_OUT}"
+fi
+
+WD_PID1="$(wd_pid_of "$WD_ROOT1")"
+WD_CLEANUP_PIDS+=("$WD_PID1")
+
+if [ -n "$WD_PID1" ] && wd_pid_alive "$WD_PID1"; then
+  pass "watchdog.sh --start: 起動したプロセスが親の呼び出し終了後も生存している（pid=${WD_PID1}）"
+else
+  fail "watchdog.sh --start: 起動したプロセスが親の呼び出し終了後も生存している" "pid=[${WD_PID1}]"
+fi
+
+WD_STATUS_OUT="$(DEV_WORKFLOW_MARKER_ROOT="$WD_ROOT1" bash "$WD_SCRIPT" --status)"
+WD_STATUS_EXIT=$?
+case "$WD_STATUS_OUT" in
+  running*) pass "watchdog.sh --status: running を返す（${WD_STATUS_OUT}）" ;;
+  *)        fail "watchdog.sh --status: running を返す" "$WD_STATUS_OUT" ;;
+esac
+assert_exit_code "watchdog.sh --status: running のときexit 0" 0 "$WD_STATUS_EXIT"
+
+case "$WD_STATUS_OUT" in
+  *"pid=${WD_PID1}"*) pass "watchdog.sh --status: PIDファイルのPIDと一致する" ;;
+  *)                  fail "watchdog.sh --status: PIDファイルのPIDと一致する" "$WD_STATUS_OUT" ;;
+esac
+
+# 二重に --start しても新しいプロセスは作らず、既存PIDのまま（監視プロセスは1つ）
+WD_START2_OUT="$(DEV_WORKFLOW_MARKER_ROOT="$WD_ROOT1" bash "$WD_SCRIPT" --start 2>&1)"
+WD_PID1_AFTER="$(wd_pid_of "$WD_ROOT1")"
+assert_eq "watchdog.sh --start: 二重起動してもPIDが変わらない（監視プロセスは1つ）" \
+  "$WD_PID1" "$WD_PID1_AFTER"
+case "$WD_START2_OUT" in
+  *"already running"*) pass "watchdog.sh --start: 二重起動時にその旨を出力する" ;;
+  *)                    fail "watchdog.sh --start: 二重起動時にその旨を出力する" "$WD_START2_OUT" ;;
+esac
+
+# --stop で確実に停止する
+WD_STOP_OUT="$(DEV_WORKFLOW_MARKER_ROOT="$WD_ROOT1" bash "$WD_SCRIPT" --stop 2>&1)"
+case "$WD_STOP_OUT" in
+  *"stopped"*) pass "watchdog.sh --stop: 停止メッセージを出す" ;;
+  *)           fail "watchdog.sh --stop: 停止メッセージを出す" "$WD_STOP_OUT" ;;
+esac
+
+if wd_pid_alive "$WD_PID1"; then
+  fail "watchdog.sh --stop: プロセスが実際に終了している" "pid=${WD_PID1} がまだ生存"
+else
+  pass "watchdog.sh --stop: プロセスが実際に終了している（pid=${WD_PID1}）"
+fi
+
+WD_STATUS_AFTER_STOP="$(DEV_WORKFLOW_MARKER_ROOT="$WD_ROOT1" bash "$WD_SCRIPT" --status)"
+WD_STATUS_AFTER_STOP_EXIT=$?
+assert_eq "watchdog.sh --status: --stop後はstoppedを返す" "stopped" "$WD_STATUS_AFTER_STOP"
+assert_exit_code "watchdog.sh --status: stoppedのときexit 1" 1 "$WD_STATUS_AFTER_STOP_EXIT"
+
+if [ -f "${WD_ROOT1}/.claude/.dev-workflow-watchdog.pid" ]; then
+  fail "watchdog.sh --stop: PIDファイルが残っていない（受け入れ条件8）"
+else
+  pass "watchdog.sh --stop: PIDファイルが残っていない（受け入れ条件8）"
+fi
+
+# --- stale PID: プロセスが存在しないPIDファイルが残っていても --start できる ---
+
+WD_ROOT2="$(wd_new_root)"
+: > "${WD_ROOT2}/.claude/.dev-workflow-run"
+
+# 確実に生存していないPIDを用意する（起動して即終了させ、waitで回収済みにする）
+bash -c 'exit 0' &
+WD_DEAD_PID=$!
+wait "$WD_DEAD_PID" 2>/dev/null
+printf '%s %s\n' "$WD_DEAD_PID" "1700000000" > "${WD_ROOT2}/.claude/.dev-workflow-watchdog.pid"
+
+DEV_WORKFLOW_MARKER_ROOT="$WD_ROOT2" DEV_WORKFLOW_WATCHDOG_TICK_SEC=30 \
+  bash "$WD_SCRIPT" --start > /dev/null 2>&1
+WD_PID2="$(wd_pid_of "$WD_ROOT2")"
+WD_CLEANUP_PIDS+=("$WD_PID2")
+
+if [ -n "$WD_PID2" ] && [ "$WD_PID2" != "$WD_DEAD_PID" ] && wd_pid_alive "$WD_PID2"; then
+  pass "watchdog.sh --start: 残骸PIDファイル（存在しないPID）があっても起動できる（新pid=${WD_PID2}）"
+else
+  fail "watchdog.sh --start: 残骸PIDファイル（存在しないPID）があっても起動できる" "pid=[${WD_PID2}] dead_pid=[${WD_DEAD_PID}]"
+fi
+
+if grep -q "stale-pid" "${WD_ROOT2}/.claude/.dev-workflow-watchdog.log" 2>/dev/null; then
+  pass "watchdog.sh --start: stale PID検出をログに記録する"
+else
+  fail "watchdog.sh --start: stale PID検出をログに記録する" "$(cat "${WD_ROOT2}/.claude/.dev-workflow-watchdog.log" 2>&1)"
+fi
+
+DEV_WORKFLOW_MARKER_ROOT="$WD_ROOT2" bash "$WD_SCRIPT" --stop > /dev/null 2>&1
+
+# --- --tick-once: 常駐せず1周だけ回してexit 0で返る ---
+
+WD_ROOT3="$(wd_new_root)"
+
+WD_TICK_T0=""
+printf -v WD_TICK_T0 '%(%s)T' -1
+DEV_WORKFLOW_MARKER_ROOT="$WD_ROOT3" bash "$WD_SCRIPT" --tick-once > /dev/null 2>&1
+WD_TICK_EXIT=$?
+WD_TICK_T1=""
+printf -v WD_TICK_T1 '%(%s)T' -1
+
+assert_exit_code "watchdog.sh --tick-once: exit 0で返る" 0 "$WD_TICK_EXIT"
+
+if [ $((WD_TICK_T1 - WD_TICK_T0)) -le 2 ]; then
+  pass "watchdog.sh --tick-once: 常駐せずすぐに返る"
+else
+  fail "watchdog.sh --tick-once: 常駐せずすぐに返る" "実測 $((WD_TICK_T1 - WD_TICK_T0))s"
+fi
+
+WD_TICK_LOG="${WD_ROOT3}/.claude/.dev-workflow-watchdog.log"
+if [ -f "$WD_TICK_LOG" ] && grep -q "$(printf '\ttick\t')" "$WD_TICK_LOG"; then
+  pass "watchdog.sh --tick-once: ログにtickイベントが1行追記される"
+else
+  fail "watchdog.sh --tick-once: ログにtickイベントが1行追記される" "$(cat "$WD_TICK_LOG" 2>&1)"
+fi
+
+if [ -f "${WD_ROOT3}/.claude/.dev-workflow-watchdog.pid" ]; then
+  fail "watchdog.sh --tick-once: 常駐しない（PIDファイルを作らない）"
+else
+  pass "watchdog.sh --tick-once: 常駐しない（PIDファイルを作らない）"
+fi
+
+# --- DEV_WORKFLOW_WATCHDOG_NOW を与えるとログの時刻がその値になる ---
+
+WD_ROOT4="$(wd_new_root)"
+WD_FIXED_NOW=1700000000
+WD_EXPECTED_TS=""
+printf -v WD_EXPECTED_TS '%(%Y-%m-%d %H:%M:%S)T' "$WD_FIXED_NOW"
+DEV_WORKFLOW_MARKER_ROOT="$WD_ROOT4" DEV_WORKFLOW_WATCHDOG_NOW="$WD_FIXED_NOW" \
+  bash "$WD_SCRIPT" --tick-once > /dev/null 2>&1
+WD_LOGGED_LINE="$(tail -1 "${WD_ROOT4}/.claude/.dev-workflow-watchdog.log" 2>/dev/null)"
+WD_LOGGED_TS="${WD_LOGGED_LINE%%$'\t'*}"
+assert_eq "watchdog.sh: DEV_WORKFLOW_WATCHDOG_NOW を与えるとログの時刻がその値になる" \
+  "$WD_EXPECTED_TS" "$WD_LOGGED_TS"
+
+# --- run マーカーを消すと（短いtick間隔で）自己終了する。受け入れ条件8 ---
+
+WD_ROOT5="$(wd_new_root)"
+: > "${WD_ROOT5}/.claude/.dev-workflow-run"
+
+DEV_WORKFLOW_MARKER_ROOT="$WD_ROOT5" DEV_WORKFLOW_WATCHDOG_TICK_SEC=1 \
+  bash "$WD_SCRIPT" --start > /dev/null 2>&1
+WD_PID5="$(wd_pid_of "$WD_ROOT5")"
+WD_CLEANUP_PIDS+=("$WD_PID5")
+
+rm -f "${WD_ROOT5}/.claude/.dev-workflow-run"
+
+WD_SELF_TERM_OK=0
+WD_WAIT_I=0
+while [ "$WD_WAIT_I" -lt 25 ]; do
+  if [ -n "$WD_PID5" ] && ! wd_pid_alive "$WD_PID5"; then
+    WD_SELF_TERM_OK=1
+    break
+  fi
+  sleep 0.2
+  WD_WAIT_I=$((WD_WAIT_I + 1))
+done
+
+if [ "$WD_SELF_TERM_OK" -eq 1 ]; then
+  pass "watchdog.sh: run マーカー消失で自己終了する（受け入れ条件8）"
+else
+  fail "watchdog.sh: run マーカー消失で自己終了する" "pid=${WD_PID5} が終了しなかった"
+fi
+
+if [ -f "${WD_ROOT5}/.claude/.dev-workflow-watchdog.pid" ]; then
+  fail "watchdog.sh: 自己終了後にPIDファイルが残っていない（受け入れ条件8）"
+else
+  pass "watchdog.sh: 自己終了後にPIDファイルが残っていない（受け入れ条件8）"
+fi
+
+if grep -q "exit-reason" "${WD_ROOT5}/.claude/.dev-workflow-watchdog.log" 2>/dev/null \
+  && grep -q "run marker missing" "${WD_ROOT5}/.claude/.dev-workflow-watchdog.log" 2>/dev/null; then
+  pass "watchdog.sh: 自己終了の理由がログに記録される"
+else
+  fail "watchdog.sh: 自己終了の理由がログに記録される" "$(cat "${WD_ROOT5}/.claude/.dev-workflow-watchdog.log" 2>&1)"
+fi
+
+# ---------------------------------------------------------------------------
+# scripts/watchdog.sh: エージェントを自動で打ち切る経路が存在しない（受け入れ条件6）
+#
+# 決定事項（Epic #42）: watchdog は検知して通知するだけであり、しきい値超過で
+# 自動的にツール呼び出しの拒否やプロセスkillを仕込む経路を持たない。
+# ここでは kill の使用箇所が watchdog_stop（人間が --stop を明示的に実行したときだけ
+# 通る経路）の1箇所に限られ、対象が監視デーモン自身のPIDであること、tick/検知フック
+# （自動発火の起点になり得る箇所）に kill が存在しないことを grep で証明する。
+#
+# `kill -0`（シグナル0=何も起こさない存在確認クエリ。POSIXの標準的なイディオム）は
+# ここでの「kill」から除外する。実際にプロセスを終了させないため、受け入れ条件6が
+# 問題にしている「自動打ち切り」には当たらない（_watchdog_pid_alive が
+# start/stop/status の生存確認に使っており、tick処理・検知フックからは呼ばれない）。
+# ---------------------------------------------------------------------------
+
+echo ""
+echo "== scripts/watchdog.sh: エージェントを自動で打ち切る経路が存在しない（受け入れ条件6） =="
+
+# コメント行を除いた実コード上で「実際に終了させる」kill（kill -0 は除く）が
+# 使われている箇所を数える
+WD_KILL_LINES="$(grep -v '^[[:space:]]*#' "$WD_SCRIPT" | grep -E '(^|[^A-Za-z0-9_])kill[[:space:]]' | grep -v -- '-0' || true)"
+WD_KILL_COUNT="$(printf '%s\n' "$WD_KILL_LINES" | grep -c . || true)"
+[ -z "$WD_KILL_LINES" ] && WD_KILL_COUNT=0
+
+assert_eq "watchdog.sh: 終了シグナルとしてのkillは1箇所だけ（--stop のみ・kill -0の存在確認は除く）" "1" "$WD_KILL_COUNT"
+
+case "$WD_KILL_LINES" in
+  *'kill "$pid"'*)
+    pass "watchdog.sh: kill は監視デーモン自身のPID（\$pid）だけを対象にする" ;;
+  *)
+    fail "watchdog.sh: kill は監視デーモン自身のPID（\$pid）だけを対象にする" "$WD_KILL_LINES" ;;
+esac
+
+# その1箇所が watchdog_stop（--stop の処理）の中に閉じていること
+WD_STOP_FN_BODY="$(awk '/^watchdog_stop\(\) \{/{f=1} f{print} f&&/^}/{exit}' "$WD_SCRIPT")"
+case "$WD_STOP_FN_BODY" in
+  *'kill "$pid"'*)
+    pass "watchdog.sh: kill は watchdog_stop（人間が --stop を叩いたときだけ）に閉じている" ;;
+  *)
+    fail "watchdog.sh: kill は watchdog_stop（人間が --stop を叩いたときだけ）に閉じている" "$WD_STOP_FN_BODY" ;;
+esac
+
+# tick処理・検知フック（監視ループが自動的に回す経路）に kill が存在しないこと
+WD_HOOK_BLOCK="$(awk '/^# 監視ループのフック点/{f=1} f&&/^# --start$/{exit} f' "$WD_SCRIPT")"
+if printf '%s' "$WD_HOOK_BLOCK" | grep -q 'kill'; then
+  fail "watchdog.sh: tick処理・検知フック（自動発火経路）にkillが存在しない（受け入れ条件6）" "$WD_HOOK_BLOCK"
+else
+  pass "watchdog.sh: tick処理・検知フック（自動発火経路）にkillが存在しない（受け入れ条件6）"
+fi
+
+# エージェント（Claude Code / Codex のCLIプロセスやサブエージェント）のPIDを扱う
+# 変数・識別子が存在しないこと（watchdogは監視デーモン自身のPIDしか知らない）
+if grep -qiE 'claude[_-]?pid|codex[_-]?pid|agent[_-]?pid|cli[_-]?pid' "$WD_SCRIPT"; then
+  fail "watchdog.sh: エージェント/CLIプロセスのPIDを扱う変数が存在しない（受け入れ条件6）" \
+    "$(grep -inE 'claude[_-]?pid|codex[_-]?pid|agent[_-]?pid|cli[_-]?pid' "$WD_SCRIPT")"
+else
+  pass "watchdog.sh: エージェント/CLIプロセスのPIDを扱う変数が存在しない（受け入れ条件6）"
+fi
+
+# --abort（人間が明示的に叩く打ち切り。#50のスコープ）はまだ実装されておらず、
+# .dev-workflow-abort を自動で作る経路も存在しないこと
+if grep -q 'dev-workflow-abort' "$WD_SCRIPT"; then
+  fail "watchdog.sh: 現時点で .dev-workflow-abort を扱うコードが存在しない（#50のスコープ）" \
+    "$(grep -n 'dev-workflow-abort' "$WD_SCRIPT")"
+else
+  pass "watchdog.sh: 現時点で .dev-workflow-abort を扱うコードが存在しない（#50のスコープ）"
+fi
+
+# --- テスト後始末: 生き残っているデーモンがあれば停止する ---
+wd_cleanup_all
+trap - EXIT
+
+# ---------------------------------------------------------------------------
 # 結果集計
 # ---------------------------------------------------------------------------
 
