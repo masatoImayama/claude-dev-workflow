@@ -37,9 +37,22 @@
 #       Codexにはタスクごとのisolation worktreeという概念自体が無く（adapters/codex/run-loop.sh
 #       のEPIC_WT）、generator/evaluatorは常にこの共有worktreeで動くため、Claudeの
 #       isolation worktreeパターンと同じ役割をこちらが担う
-#   run のメインループは絶対に拒否されない。Claudeはcwdが上記パターンに一致しない
-#   （epic worktree・リポジトリルート）ため。Codexはrun-loop.sh自体がbashスクリプトであり
-#   codexセッション（フックの発火源）ではないため、そもそもこのフックが呼ばれない。
+#   run のメインループは、無人ループ（`adapters/codex/run-loop.sh` / Claudeの`skills/run/SKILL.md`）
+#   経由なら絶対に拒否されない。Claudeはcwdが上記パターンに一致しない（epic worktree・
+#   リポジトリルート）ため。Codexは`run-loop.sh`自体がbashスクリプトでありcodexセッション
+#   （フックの発火源）ではなく、`.codex/worktrees/`パターンが対象にするのは同スクリプトが
+#   `codex exec -C "$EPIC_WT"` で別セッションとして起動するgenerator/evaluatorだけであるため、
+#   メインループのフックはそもそも呼ばれない（レビュー#63）。
+#   一方、Codexのスキル`dev-workflow-run`（skills-codex/dev-workflow-run/SKILL.md）を
+#   セッション内で直接回す経路では、メインループ自身が `cd "$EPIC_WT"` した**同一セッション内**
+#   でgenerator/evaluatorサブエージェントを呼ぶ（Codexのカスタムエージェントにcwd相当が無く、
+#   セッションのcwdをそのまま継承するため。docs/dev-workflow-multi-vendor-guide.md §3.3.3）。
+#   この経路ではメインループとサブエージェントのツール呼び出しが区別できるcwdの差を持たず、
+#   `--abort`がメインループのツール呼び出しにも及びうる（あるいは逆に全く効かない。cwdの
+#   報告がセッション起動時点の値なのか、呼び出し時点の実ディレクトリなのかに依存する）。
+#   したがってこの経路では`--abort`を「サブエージェントだけを止める手段」として当てにせず、
+#   確実に止めたい場合はセッションそのものを中断すること
+#   （skills-codex/dev-workflow-run/SKILL.md「ハングしたときに人間がすること」参照）。
 #   post（PostToolUse）では拒否しない（後から止めても意味が無いため）。
 #   通知方法はCLIごとに契約が異なる（scripts/check-readability.sh と同じ出し分け）:
 #     - Claude Code … exit 2 + stderr にメッセージ。**ハードブロック**（ツール呼び出しは

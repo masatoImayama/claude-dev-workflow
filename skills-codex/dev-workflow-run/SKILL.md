@@ -400,6 +400,19 @@ Slack に `:rotating_light: 応答なし` が届いたら、人間が次の手�
    `bash "${CLAUDE_PLUGIN_ROOT}/scripts/watchdog.sh" --stop` を実行して watchdog を止めること。**
    放置すると watchdog は打ち切りに気付かず無活動検知（15分）・エスカレーション（30分ごと最大3回）を
    続け、既に打ち切ったはずの run について「応答なし」の通知が届き続ける
+
+   **`--abort` が届く保証があるのは `run-loop.sh`（`adapters/codex/run-loop.sh`）経由で
+   `codex exec -C "$EPIC_WT"` として起動される generator/evaluator セッションに限られる**
+   （`heartbeat.sh` が拒否対象と判定する cwd パターン `.codex/worktrees/` は、この起動経路の
+   セッションを想定したものである。詳細は `scripts/heartbeat.sh` 冒頭コメント参照）。
+   **このスキル（`dev-workflow-run`）をセッション内で直接回している場合は `--abort` に
+   依存できない。** このスキルは冒頭で `cd "$EPIC_WT"` した後、同一セッション内で
+   generator/evaluator サブエージェントを呼ぶ。Codex のカスタムエージェントには cwd 相当の
+   設定項目が無くセッションの cwd をそのまま継承するため（`docs/dev-workflow-multi-vendor-guide.md`
+   §3.3.3）、メインループ（このスキル自身）とサブエージェントのツール呼び出しを cwd で
+   区別できず、`--abort` はメインループのツール呼び出しにも及びうる（あるいは全く効かない）。
+   **このスキルをセッション内で直接回している場合、確実に止められる唯一の手段は本節冒頭のとおり
+   セッションそのものを中断し、続けて `watchdog.sh --stop` を実行することである。**
 3. **再開する場合**: `dev-workflow-run` スキルを再実行する。次の3点により、中断→再開でも
    安全に途中から続けられる（Task #54）。
    - **残タスクは open な Task issue から再計算される。** クローズ済みのタスクは

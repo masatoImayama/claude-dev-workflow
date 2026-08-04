@@ -4003,6 +4003,40 @@ case "$CRS_HANG_SECTION" in
     fail "SKILL.md(codex): セッション中断時にStopフックが走らずrunマーカーが残る旨の説明がある（#62）" "$CRS_HANG_SECTION" ;;
 esac
 
+# --abort が届く保証は run-loop.sh 経由の generator/evaluator セッションに限られ、
+# このスキルをセッション内で直接回す経路では依存できない旨が明記されていること（レビュー#63）
+case "$CRS_HANG_SECTION" in
+  *'run-loop.sh'*'に限られる'*)
+    pass "SKILL.md(codex): --abort が届く保証はrun-loop.sh経由のセッションに限られる旨の記述がある（#63）" ;;
+  *)
+    fail "SKILL.md(codex): --abort が届く保証はrun-loop.sh経由のセッションに限られる旨の記述がある（#63）" \
+      "$CRS_HANG_SECTION" ;;
+esac
+
+case "$CRS_HANG_SECTION" in
+  *'このスキル'*'セッション内で直接回している場合は'*'--abort'*'依存できない'*)
+    pass "SKILL.md(codex): スキルをセッション内で直接回す経路では--abortに依存できない旨の記述がある（#63）" ;;
+  *)
+    fail "SKILL.md(codex): スキルをセッション内で直接回す経路では--abortに依存できない旨の記述がある（#63）" \
+      "$CRS_HANG_SECTION" ;;
+esac
+
+case "$CRS_HANG_SECTION" in
+  *'cwd で'*'区別できず'*)
+    pass "SKILL.md(codex): メインループとサブエージェントをcwdで区別できない旨の記述がある（#63）" ;;
+  *)
+    fail "SKILL.md(codex): メインループとサブエージェントをcwdで区別できない旨の記述がある（#63）" \
+      "$CRS_HANG_SECTION" ;;
+esac
+
+case "$CRS_HANG_SECTION" in
+  *'確実に止められる唯一の手段は'*'セッションそのものを中断し'*'watchdog.sh --stop'*)
+    pass "SKILL.md(codex): スキル直接実行時の唯一の確実な打ち切り手段がセッション中断+watchdog.sh --stopである旨の記述がある（#63）" ;;
+  *)
+    fail "SKILL.md(codex): スキル直接実行時の唯一の確実な打ち切り手段がセッション中断+watchdog.sh --stopである旨の記述がある（#63）" \
+      "$CRS_HANG_SECTION" ;;
+esac
+
 # Claude Code版と挙動が同じ（アダプタ間に機能差を作らない）旨の記述が
 # ハング節・自律実行開始節のいずれかに存在すること
 CRS_FULL_SRC="$(cat "$CODEX_RUN_SKILL")"
@@ -4725,6 +4759,47 @@ HBA_WIN_EPIC_OUT="$(DEV_WORKFLOW_MARKER_ROOT="$HBA_REPO" DEV_WORKFLOW_HOOK_VENDO
 assert_exit_code "heartbeat.sh: abortフラグあり・Windows表現のepic worktreeのcwd → 拒否されない（exit 0。#60）" \
   0 $?
 assert_eq "heartbeat.sh: abortフラグあり・Windows表現のepic worktreeのcwd → 無出力（#60）" "" "$HBA_WIN_EPIC_OUT"
+
+# --- heartbeat.sh冒頭コメント: Codexのrun経路2つ（run-loop.sh経由 / スキルをセッション内で
+#     直接回す経路）を区別した記述になっていること（レビュー#63）。以前は「Codexではrun-loop.sh
+#     自体がbashスクリプトでフックの発火源ではないため、そもそもこのフックが呼ばれない」という
+#     包括的な主張をしていたが、スキル`dev-workflow-run`をセッション内で直接回す経路では
+#     メインループ自身がcodexセッションであり、この主張が成立しない。 ---
+HB_COMMENT="$(cat "$HEARTBEAT_SCRIPT")"
+
+case "$HB_COMMENT" in
+  *'codex exec -C "$EPIC_WT"'*'generator/evaluator'*)
+    pass "heartbeat.sh: .codex/worktrees/パターンがrun-loop.shのcodex exec -Cで起動するgenerator/evaluatorセッションを対象にする旨の記述がある（#63）" ;;
+  *)
+    fail "heartbeat.sh: .codex/worktrees/パターンがrun-loop.shのcodex exec -Cで起動するgenerator/evaluatorセッションを対象にする旨の記述がある（#63）" \
+      "$HB_COMMENT" ;;
+esac
+
+case "$HB_COMMENT" in
+  *'dev-workflow-run'*'セッション内で直接回す経路'*'同一セッション内'*)
+    pass "heartbeat.sh: スキルをセッション内で直接回す経路ではメインループとサブエージェントが同一セッションである旨の記述がある（#63）" ;;
+  *)
+    fail "heartbeat.sh: スキルをセッション内で直接回す経路ではメインループとサブエージェントが同一セッションである旨の記述がある（#63）" \
+      "$HB_COMMENT" ;;
+esac
+
+case "$HB_COMMENT" in
+  *'区別できるcwdの差を持たず'*)
+    pass "heartbeat.sh: スキル直接実行経路ではメインループとサブエージェントをcwdで区別できない旨の記述がある（#63）" ;;
+  *)
+    fail "heartbeat.sh: スキル直接実行経路ではメインループとサブエージェントをcwdで区別できない旨の記述がある（#63）" \
+      "$HB_COMMENT" ;;
+esac
+
+# レビュー#63以前の「Codexではフックがそもそも呼ばれない」という無限定の主張のまま
+# 放置されていないこと（スキル直接実行経路への言及なしにこの一文だけが単独で成立していると
+# 誤りになる。#63の指摘そのものの再発防止）
+if printf '%s' "$HB_COMMENT" | grep -q 'セッション内で直接回す経路'; then
+  pass "heartbeat.sh: 「Codexではフックが呼ばれない」という主張がスキル直接実行経路の言及なしに単独で残っていない（#63）"
+else
+  fail "heartbeat.sh: 「Codexではフックが呼ばれない」という主張がスキル直接実行経路の言及なしに単独で残っていない（#63）" \
+    "$HB_COMMENT"
+fi
 
 # --- watchdog.sh --abort / --clear との結合: 実際にwatchdog.shで作った/消したフラグで動く ---
 HBA_WD_SCRIPT="${REPO_ROOT}/scripts/watchdog.sh"
