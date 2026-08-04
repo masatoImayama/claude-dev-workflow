@@ -3434,6 +3434,276 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+# notify-slack.sh: watchdog イベント（stall / stall-recovered / sleep-gap / budget、Task #46）
+#
+# 実送信（curl）は使わず、DEV_WORKFLOW_NOTIFY_SINK にファイルパスを渡して
+# 組み立てた本文（JSON）をそのファイルへ書き出させて検証する。加えて PATH に
+# 偽 curl を差し込み、sink 経由では実際の curl が一度も呼ばれないことも確認する
+# （Slack へは実送信しない・Epic #42 完了条件）。
+# ---------------------------------------------------------------------------
+
+echo ""
+echo "== notify-slack.sh: watchdog イベント（Task #46） =="
+
+NS_SCRIPT="${REPO_ROOT}/scripts/notify-slack.sh"
+NS_REPO="$(make_temp_repo)"
+NS_WORK="$(mktemp -d "${TMPDIR:-/tmp}/dw-test-notify-work.XXXXXX")"
+
+# 偽curl。sink経路では呼ばれてはならない（呼ばれたら呼び出し内容をログへ残す）
+NS_FAKE_BIN="${NS_WORK}/bin"
+mkdir -p "$NS_FAKE_BIN"
+NS_CURL_LOG="${NS_WORK}/curl-calls.log"
+printf '#!/bin/bash\necho "called: $*" >> "%s"\nexit 0\n' "$NS_CURL_LOG" > "${NS_FAKE_BIN}/curl"
+chmod +x "${NS_FAKE_BIN}/curl"
+
+run_notify() {
+  # run_notify <event> <arg> <sink_file>
+  # Webhookはダミーの https URL・sinkはファイルパスを渡し、curlを呼ばせずに検証する。
+  (
+    cd "$NS_REPO" || exit 1
+    PATH="${NS_FAKE_BIN}:${PATH}" \
+    SLACK_WEBHOOK_URL="https://example.invalid/webhook" \
+    DEV_WORKFLOW_PROJECT_NAME="dwtest" \
+    DEV_WORKFLOW_NOTIFY_SINK="$3" \
+    bash "$NS_SCRIPT" "$1" "$2" < /dev/null
+  )
+}
+
+read_sink() {
+  [ -f "$1" ] && cat "$1" || printf ''
+}
+
+# --- stall: state=pre（ツール実行中に停止） ---
+NS_STALL_PRE_SINK="${NS_WORK}/stall-pre.json"
+run_notify "stall" "無活動920秒 / レーンA / 最後のツール: Bash（state=pre: ツール実行中に停止）" "$NS_STALL_PRE_SINK"
+NS_STALL_PRE_EXIT=$?
+NS_STALL_PRE_BODY="$(read_sink "$NS_STALL_PRE_SINK")"
+
+assert_exit_code "stall(state=pre): exit 0" 0 "$NS_STALL_PRE_EXIT"
+case "$NS_STALL_PRE_BODY" in
+  *"応答なし"*) pass "stall: 見出し «応答なし» を含む" ;;
+  *) fail "stall: 見出し «応答なし» を含む" "$NS_STALL_PRE_BODY" ;;
+esac
+case "$NS_STALL_PRE_BODY" in
+  *"ツール実行中に停止"*) pass "stall(state=pre): 本文に «ツール実行中に停止» を含む（受け入れ条件2）" ;;
+  *) fail "stall(state=pre): 本文に «ツール実行中に停止» を含む（受け入れ条件2）" "$NS_STALL_PRE_BODY" ;;
+esac
+case "$NS_STALL_PRE_BODY" in
+  *"モデルの応答待ちで停止"*) fail "stall(state=pre): «モデルの応答待ちで停止» を誤って含まない" "$NS_STALL_PRE_BODY" ;;
+  *) pass "stall(state=pre): «モデルの応答待ちで停止» を誤って含まない" ;;
+esac
+case "$NS_STALL_PRE_BODY" in
+  *"<!channel>"*) pass "stall: 既定のメンション <!channel> を含む" ;;
+  *) fail "stall: 既定のメンション <!channel> を含む" "$NS_STALL_PRE_BODY" ;;
+esac
+
+# --- stall: state=post（モデルの応答待ちで停止） ---
+NS_STALL_POST_SINK="${NS_WORK}/stall-post.json"
+run_notify "stall" "無活動920秒 / レーンB / 最後のツール: (なし)（state=post: モデルの応答待ちで停止）" "$NS_STALL_POST_SINK"
+NS_STALL_POST_EXIT=$?
+NS_STALL_POST_BODY="$(read_sink "$NS_STALL_POST_SINK")"
+
+assert_exit_code "stall(state=post): exit 0" 0 "$NS_STALL_POST_EXIT"
+case "$NS_STALL_POST_BODY" in
+  *"モデルの応答待ちで停止"*) pass "stall(state=post): 本文に «モデルの応答待ちで停止» を含む（受け入れ条件2）" ;;
+  *) fail "stall(state=post): 本文に «モデルの応答待ちで停止» を含む（受け入れ条件2）" "$NS_STALL_POST_BODY" ;;
+esac
+case "$NS_STALL_POST_BODY" in
+  *"ツール実行中に停止"*) fail "stall(state=post): «ツール実行中に停止» を誤って含まない" "$NS_STALL_POST_BODY" ;;
+  *) pass "stall(state=post): «ツール実行中に停止» を誤って含まない" ;;
+esac
+
+# --- stall-recovered ---
+NS_RECOVERED_SINK="${NS_WORK}/stall-recovered.json"
+run_notify "stall-recovered" "無活動980秒から復帰 / レーンA" "$NS_RECOVERED_SINK"
+NS_RECOVERED_EXIT=$?
+NS_RECOVERED_BODY="$(read_sink "$NS_RECOVERED_SINK")"
+
+assert_exit_code "stall-recovered: exit 0" 0 "$NS_RECOVERED_EXIT"
+case "$NS_RECOVERED_BODY" in
+  *"応答が再開"*"無活動980秒から復帰 / レーンA"*) pass "stall-recovered: 見出しと詳細を含む" ;;
+  *) fail "stall-recovered: 見出しと詳細を含む" "$NS_RECOVERED_BODY" ;;
+esac
+
+# --- sleep-gap: stallとは別イベントとして区別できる（受け入れ条件3） ---
+NS_SLEEPGAP_SINK="${NS_WORK}/sleep-gap.json"
+run_notify "sleep-gap" "tick間隔60秒に対し実経過620秒（スリープ復帰と判定・無活動時間から差し引き済み）" "$NS_SLEEPGAP_SINK"
+NS_SLEEPGAP_EXIT=$?
+NS_SLEEPGAP_BODY="$(read_sink "$NS_SLEEPGAP_SINK")"
+
+assert_exit_code "sleep-gap: exit 0" 0 "$NS_SLEEPGAP_EXIT"
+case "$NS_SLEEPGAP_BODY" in
+  *"スリープ痕跡"*"tick間隔60秒に対し実経過620秒"*) pass "sleep-gap: 見出しと詳細を含む" ;;
+  *) fail "sleep-gap: 見出しと詳細を含む" "$NS_SLEEPGAP_BODY" ;;
+esac
+case "$NS_SLEEPGAP_BODY" in
+  *"応答なし"*) fail "sleep-gap: stallの見出し «応答なし» を誤って含まない（受け入れ条件3）" "$NS_SLEEPGAP_BODY" ;;
+  *) pass "sleep-gap: stallの見出し «応答なし» を誤って含まない（受け入れ条件3）" ;;
+esac
+case "$NS_STALL_PRE_BODY" in
+  *"スリープ痕跡"*) fail "stall: sleep-gapの見出し «スリープ痕跡» を誤って含まない（受け入れ条件3）" "$NS_STALL_PRE_BODY" ;;
+  *) pass "stall: sleep-gapの見出し «スリープ痕跡» を誤って含まない（受け入れ条件3）" ;;
+esac
+
+# --- budget ---
+NS_BUDGET_SINK="${NS_WORK}/budget.json"
+run_notify "budget" "ウェーブ2 / 経過98分 / 予算90分" "$NS_BUDGET_SINK"
+NS_BUDGET_EXIT=$?
+NS_BUDGET_BODY="$(read_sink "$NS_BUDGET_SINK")"
+
+assert_exit_code "budget: exit 0" 0 "$NS_BUDGET_EXIT"
+case "$NS_BUDGET_BODY" in
+  *"想定時間超過"*"ウェーブ2 / 経過98分 / 予算90分"*) pass "budget: 見出しと詳細を含む" ;;
+  *) fail "budget: 見出しと詳細を含む" "$NS_BUDGET_BODY" ;;
+esac
+case "$NS_BUDGET_BODY" in
+  *"<!channel>"*) pass "budget: 既定のメンション <!channel> を含む" ;;
+  *) fail "budget: 既定のメンション <!channel> を含む" "$NS_BUDGET_BODY" ;;
+esac
+
+# --- curlが一度も実行されていないこと（sink経路でネットワークに出ない） ---
+if [ -s "$NS_CURL_LOG" ]; then
+  fail "notify-slack.sh: sink使用時にcurlが呼ばれない（実送信しない）" "$(read_sink "$NS_CURL_LOG")"
+else
+  pass "notify-slack.sh: sink使用時にcurlが呼ばれない（実送信しない）"
+fi
+
+# --- Webhook未設定: 何もせずexit 0、標準出力・標準エラーも空、sinkにも書かれない ---
+NS_NOWEBHOOK_SINK="${NS_WORK}/nowebhook.json"
+NS_NOWEBHOOK_OUT="$(
+  cd "$NS_REPO" || exit 1
+  unset SLACK_WEBHOOK_URL
+  PATH="${NS_FAKE_BIN}:${PATH}" \
+  DEV_WORKFLOW_NOTIFY_SINK="$NS_NOWEBHOOK_SINK" \
+  bash "$NS_SCRIPT" stall "無活動920秒" < /dev/null 2>&1
+)"
+NS_NOWEBHOOK_EXIT=$?
+
+assert_exit_code "Webhook未設定: stallイベントはexit 0（既存の挙動を維持）" 0 "$NS_NOWEBHOOK_EXIT"
+assert_eq "Webhook未設定: 標準出力・標準エラーが空" "" "$NS_NOWEBHOOK_OUT"
+if [ -f "$NS_NOWEBHOOK_SINK" ]; then
+  fail "Webhook未設定: sinkファイルが作られない" "sinkファイルが作成されました"
+else
+  pass "Webhook未設定: sinkファイルが作られない"
+fi
+
+# ---------------------------------------------------------------------------
+# notify-slack.sh: 既存イベント（run-start / run-complete / stop / notification）の
+# 挙動が変わっていないこと（Task #46 の回帰確認）
+# ---------------------------------------------------------------------------
+
+echo ""
+echo "== notify-slack.sh: 既存イベントの回帰確認（Task #46） =="
+
+# --- run-start: マーカーを作るだけで通知はしない ---
+NS_RUNSTART_SINK="${NS_WORK}/run-start.json"
+NS_RUNSTART_OUT="$(
+  cd "$NS_REPO" || exit 1
+  PATH="${NS_FAKE_BIN}:${PATH}" \
+  SLACK_WEBHOOK_URL="https://example.invalid/webhook" \
+  DEV_WORKFLOW_NOTIFY_SINK="$NS_RUNSTART_SINK" \
+  bash "$NS_SCRIPT" run-start "回帰テスト用ラベル" < /dev/null 2>&1
+)"
+NS_RUNSTART_EXIT=$?
+
+assert_exit_code "run-start: exit 0（既存挙動）" 0 "$NS_RUNSTART_EXIT"
+assert_eq "run-start: 標準出力・標準エラーが空（既存挙動）" "" "$NS_RUNSTART_OUT"
+if [ -f "$NS_RUNSTART_SINK" ]; then
+  fail "run-start: 通知しない（既存挙動）" "sinkに書き込みがありました"
+else
+  pass "run-start: 通知しない（既存挙動）"
+fi
+NS_RUNSTART_MARKER_FILE="${NS_REPO}/.claude/.dev-workflow-run"
+if [ -f "$NS_RUNSTART_MARKER_FILE" ]; then
+  assert_eq "run-start: マーカーにラベルを書く（既存挙動）" "回帰テスト用ラベル" "$(read_sink "$NS_RUNSTART_MARKER_FILE")"
+else
+  fail "run-start: マーカーが作られる（既存挙動）" "マーカーファイルがありません"
+fi
+
+# --- run-complete: マーカーを消し、ラベル入りの見出しで通知する ---
+NS_RUNCOMPLETE_SINK="${NS_WORK}/run-complete.json"
+NS_RUNCOMPLETE_OUT="$(
+  cd "$NS_REPO" || exit 1
+  PATH="${NS_FAKE_BIN}:${PATH}" \
+  SLACK_WEBHOOK_URL="https://example.invalid/webhook" \
+  DEV_WORKFLOW_NOTIFY_SINK="$NS_RUNCOMPLETE_SINK" \
+  bash "$NS_SCRIPT" run-complete "全タスク完了" < /dev/null 2>&1
+)"
+NS_RUNCOMPLETE_EXIT=$?
+NS_RUNCOMPLETE_BODY="$(read_sink "$NS_RUNCOMPLETE_SINK")"
+
+assert_exit_code "run-complete: exit 0（既存挙動）" 0 "$NS_RUNCOMPLETE_EXIT"
+case "$NS_RUNCOMPLETE_BODY" in
+  *"完了 — 回帰テスト用ラベル"*) pass "run-complete: 見出しにラベルを含む（既存挙動）" ;;
+  *) fail "run-complete: 見出しにラベルを含む（既存挙動）" "$NS_RUNCOMPLETE_BODY" ;;
+esac
+case "$NS_RUNCOMPLETE_BODY" in
+  *"全タスク完了"*) pass "run-complete: サマリーを本文に含む（既存挙動）" ;;
+  *) fail "run-complete: サマリーを本文に含む（既存挙動）" "$NS_RUNCOMPLETE_BODY" ;;
+esac
+if [ -f "$NS_RUNSTART_MARKER_FILE" ]; then
+  fail "run-complete: マーカーを消す（既存挙動）" "マーカーが残っています"
+else
+  pass "run-complete: マーカーを消す（既存挙動）"
+fi
+
+# --- stop: マーカーがある状態は「自律実行が停止」として通知しマーカーを消す ---
+(
+  cd "$NS_REPO" || exit 1
+  SLACK_WEBHOOK_URL="https://example.invalid/webhook" \
+  DEV_WORKFLOW_NOTIFY_SINK="${NS_WORK}/run-start-2.json" \
+  bash "$NS_SCRIPT" run-start "中断テスト用ラベル" < /dev/null
+) >/dev/null 2>&1
+
+NS_STOP_SINK="${NS_WORK}/stop.json"
+NS_STOP_OUT="$(
+  cd "$NS_REPO" || exit 1
+  PATH="${NS_FAKE_BIN}:${PATH}" \
+  SLACK_WEBHOOK_URL="https://example.invalid/webhook" \
+  DEV_WORKFLOW_NOTIFY_SINK="$NS_STOP_SINK" \
+  bash "$NS_SCRIPT" stop <<< '{}' 2>&1
+)"
+NS_STOP_EXIT=$?
+NS_STOP_BODY="$(read_sink "$NS_STOP_SINK")"
+
+assert_exit_code "stop（マーカーあり）: exit 0（既存挙動）" 0 "$NS_STOP_EXIT"
+case "$NS_STOP_BODY" in
+  *"自律実行が停止 — 中断テスト用ラベル"*) pass "stop（マーカーあり）: 「自律実行が停止」の見出しを含む（既存挙動）" ;;
+  *) fail "stop（マーカーあり）: 「自律実行が停止」の見出しを含む（既存挙動）" "$NS_STOP_BODY" ;;
+esac
+if [ -f "$NS_RUNSTART_MARKER_FILE" ]; then
+  fail "stop（マーカーあり）: マーカーを消す（既存挙動）" "マーカーが残っています"
+else
+  pass "stop（マーカーあり）: マーカーを消す（既存挙動）"
+fi
+
+# --- notification: 承認待ちは既定でも通知される ---
+NS_NOTIF_SINK="${NS_WORK}/notification.json"
+NS_NOTIF_OUT="$(
+  cd "$NS_REPO" || exit 1
+  PATH="${NS_FAKE_BIN}:${PATH}" \
+  SLACK_WEBHOOK_URL="https://example.invalid/webhook" \
+  DEV_WORKFLOW_NOTIFY_SINK="$NS_NOTIF_SINK" \
+  DEV_WORKFLOW_NOTIFY_COOLDOWN=0 \
+  bash "$NS_SCRIPT" notification <<< '{"message":"Claude needs your permission to use Bash"}' 2>&1
+)"
+NS_NOTIF_EXIT=$?
+NS_NOTIF_BODY="$(read_sink "$NS_NOTIF_SINK")"
+
+assert_exit_code "notification（承認待ち）: exit 0（既存挙動）" 0 "$NS_NOTIF_EXIT"
+case "$NS_NOTIF_BODY" in
+  *"承認待ち"*) pass "notification（承認待ち）: 見出しを含む（既存挙動）" ;;
+  *) fail "notification（承認待ち）: 見出しを含む（既存挙動）" "$NS_NOTIF_BODY" ;;
+esac
+
+# --- 回帰確認の全呼び出しを通じてもcurlは一度も呼ばれていない ---
+if [ -s "$NS_CURL_LOG" ]; then
+  fail "notify-slack.sh: 既存イベントの検証中もcurlが呼ばれない" "$(read_sink "$NS_CURL_LOG")"
+else
+  pass "notify-slack.sh: 既存イベントの検証中もcurlが呼ばれない"
+fi
+
+# ---------------------------------------------------------------------------
 # 結果集計
 # ---------------------------------------------------------------------------
 
