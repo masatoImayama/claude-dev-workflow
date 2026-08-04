@@ -3216,6 +3216,81 @@ ML15_PORCELAIN_AFTER="$(cd "$ML_REPO15" && git status --porcelain)"
 assert_eq "ケース15: 未コミットのローカル変更（file.txt）がそのまま残っている（abort による破棄が起きていない）" \
   "$ML15_PORCELAIN_BEFORE" "$ML15_PORCELAIN_AFTER"
 
+# --- ケース16（Task #54）: --create 指定時に残骸 wave ブランチ（tip が --expected-base と
+#     不一致）が既に存在する場合、exit 1 で拒否され、呼び出し元でチェックアウトしていた
+#     ブランチ（epic ブランチ相当）も wave ブランチも一切動かないこと。出力に既存 tip・
+#     期待ベース・対処（WAVE_NO の採番し直し）が含まれること。 ---
+ML_REPO16="$(make_temp_repo)"
+ML16_DEFAULT_BRANCH="$(cd "$ML_REPO16" && git rev-parse --abbrev-ref HEAD)"
+ml_commit_file "$ML_REPO16" "base.txt" "wave base\n" "wave base commit"
+ML16_EXPECTED_BASE="$(ml_head_of "$ML_REPO16" HEAD)"
+
+# 前回セッションの残骸を模す: EXPECTED_BASE から分岐した別コミットを tip に持つ
+# wave ブランチ（checkout はしない。ml_branch_from を使うと現在のブランチが切り替わって
+# しまうため、直接 `git branch` で作る）
+ml_branch_from "$ML_REPO16" "stale-source" "$ML16_EXPECTED_BASE"
+ml_commit_file "$ML_REPO16" "stale.txt" "stale\n" "stale unrelated commit (previous session)"
+ML16_STALE_TIP="$(ml_head_of "$ML_REPO16" stale-source)"
+(cd "$ML_REPO16" && git branch "wave/epicT/1" "$ML16_STALE_TIP") >/dev/null 2>&1
+
+# 呼び出し元（epic ブランチ相当）へ戻し、この時点のHEADを記録する
+(cd "$ML_REPO16" && git checkout -q "$ML16_DEFAULT_BRANCH") >/dev/null 2>&1
+ML16_CALLER_HEAD_BEFORE="$(ml_head_of "$ML_REPO16" "$ML16_DEFAULT_BRANCH")"
+ML16_WAVE_HEAD_BEFORE="$(ml_head_of "$ML_REPO16" "wave/epicT/1")"
+
+ml_branch_from "$ML_REPO16" "lane-y" "$ML16_EXPECTED_BASE"
+ml_commit_file "$ML_REPO16" "y.txt" "lane y\n" "lane y change"
+
+ML16_OUT="$(run_merge_lane "$ML_REPO16" --wave-branch "wave/epicT/1" --expected-base "$ML16_EXPECTED_BASE" --lane-branch lane-y --task 54 --create 2>&1)"
+ML16_EXIT=$?
+assert_exit_code "ケース16: --create で tip 不一致の残骸 wave ブランチは exit 1" 1 "$ML16_EXIT"
+
+ML16_CALLER_HEAD_AFTER="$(ml_head_of "$ML_REPO16" "$ML16_DEFAULT_BRANCH")"
+ML16_WAVE_HEAD_AFTER="$(ml_head_of "$ML_REPO16" "wave/epicT/1")"
+assert_eq "ケース16: 呼び出し元ブランチ（epic ブランチ相当）の HEAD が動かない" "$ML16_CALLER_HEAD_BEFORE" "$ML16_CALLER_HEAD_AFTER"
+assert_eq "ケース16: wave ブランチの tip が動かない（残骸のまま）" "$ML16_WAVE_HEAD_BEFORE" "$ML16_WAVE_HEAD_AFTER"
+
+case "$ML16_OUT" in
+  *"$ML16_STALE_TIP"*) pass "ケース16: 出力に既存 wave ブランチの tip が含まれる" ;;
+  *) fail "ケース16: 出力に既存 wave ブランチの tip が含まれる" "output=[${ML16_OUT}]" ;;
+esac
+
+case "$ML16_OUT" in
+  *"$ML16_EXPECTED_BASE"*) pass "ケース16: 出力に期待していたベース（--expected-base）が含まれる" ;;
+  *) fail "ケース16: 出力に期待していたベース（--expected-base）が含まれる" "output=[${ML16_OUT}]" ;;
+esac
+
+case "$ML16_OUT" in
+  *"WAVE_NO"*) pass "ケース16: 出力に対処（WAVE_NO の採番し直し）が含まれる" ;;
+  *) fail "ケース16: 出力に対処（WAVE_NO の採番し直し）が含まれる" "output=[${ML16_OUT}]" ;;
+esac
+
+# --- ケース17（Task #54）: --create 指定時に既存 wave ブランチの tip が --expected-base と
+#     一致する場合（前回まさに --create で作っただけで、まだレーンを取り込んでいない状態）は
+#     残骸扱いにせず、従来どおり取り込みが成功すること（冪等性） ---
+ML_REPO17="$(make_temp_repo)"
+ml_commit_file "$ML_REPO17" "base.txt" "wave base\n" "wave base commit"
+ML17_EXPECTED_BASE="$(ml_head_of "$ML_REPO17" HEAD)"
+
+# 前回の --create で作られたが、まだ何も取り込んでいない wave ブランチ（tip = EXPECTED_BASE）
+(cd "$ML_REPO17" && git branch "wave/epicT/1" "$ML17_EXPECTED_BASE") >/dev/null 2>&1
+
+ml_branch_from "$ML_REPO17" "lane-z" "$ML17_EXPECTED_BASE"
+ml_commit_file "$ML_REPO17" "z.txt" "lane z\n" "lane z change"
+ML17_LANE_HEAD="$(ml_head_of "$ML_REPO17" lane-z)"
+
+ML17_OUT="$(run_merge_lane "$ML_REPO17" --wave-branch "wave/epicT/1" --expected-base "$ML17_EXPECTED_BASE" --lane-branch lane-z --task 54 --create)"
+ML17_EXIT=$?
+assert_exit_code "ケース17: --create で tip 一致の既存 wave ブランチは従来どおり exit 0（冪等性）" 0 "$ML17_EXIT"
+
+ML17_WAVE_HEAD="$(ml_head_of "$ML_REPO17" "wave/epicT/1")"
+assert_eq "ケース17: 冪等時は取り込みが成功し wave HEAD がレーンの HEAD と一致する" "$ML17_LANE_HEAD" "$ML17_WAVE_HEAD"
+
+case "$ML17_OUT" in
+  *"取り込み成功"*) pass "ケース17: 出力に取り込み成功のメッセージが含まれる" ;;
+  *) fail "ケース17: 出力に取り込み成功のメッセージが含まれる" "output=[${ML17_OUT}]" ;;
+esac
+
 # ---------------------------------------------------------------------------
 # adapters/codex/run-loop.sh: 統合ゲートが全テストを実行すること（回帰防止 #37）
 #
@@ -3688,6 +3763,71 @@ case "$RS_HANG_SECTION" in
 esac
 
 # ---------------------------------------------------------------------------
+# skills/run/SKILL.md: WAVE_NO の採番ロジックと中断→再開時の挙動の記述（Task #54）
+#
+# 中断→再開で WAVE_NO がセッションごとに 0 から始まると、前回の残骸 wave ブランチを
+# 誤って掴んでしまう事故が起きる（Epic #42 調査結果 7）。自律ループ冒頭で
+# 既存の wave ブランチの番号の最大値から数え直すロジックが明記されていること、
+# および再開時の挙動（残タスクの再計算・wave ブランチの採番し直し・取り込み済み
+# コミットは失われない）が明記されていることを grep ベースで検証する。
+# ---------------------------------------------------------------------------
+
+echo ""
+echo "== skills/run/SKILL.md（WAVE_NO 採番・中断→再開時の挙動の回帰防止 #54） =="
+
+RS_AUTONOMOUS_LOOP_HEADER="$(awk '/^## 自律ループ（YOLOモード、ウェーブ単位）/{f=1} /^### Step 1:/{f=0} f' "$RUN_SKILL")"
+
+case "$RS_AUTONOMOUS_LOOP_HEADER" in
+  *'for-each-ref'*'wave/${EPIC_NUM}/*'*)
+    pass "SKILL.md: 自律ループ冒頭に既存 wave ブランチを列挙する WAVE_NO 採番ロジックがある（#54）" ;;
+  *)
+    fail "SKILL.md: 自律ループ冒頭に既存 wave ブランチを列挙する WAVE_NO 採番ロジックがある（#54）" "$RS_AUTONOMOUS_LOOP_HEADER" ;;
+esac
+
+case "$RS_AUTONOMOUS_LOOP_HEADER" in
+  *'WAVE_NO="${WAVE_NO:-0}"'*)
+    pass "SKILL.md: WAVE_NO 採番ロジックが既存ブランチ無しの場合 0 にフォールバックする（#54）" ;;
+  *)
+    fail "SKILL.md: WAVE_NO 採番ロジックが既存ブランチ無しの場合 0 にフォールバックする（#54）" "$RS_AUTONOMOUS_LOOP_HEADER" ;;
+esac
+
+case "$RS_AUTONOMOUS_LOOP_HEADER" in
+  *'0 から始めてはならない'*)
+    pass "SKILL.md: WAVE_NO を 0 から始めてはならない旨の説明がある（#54）" ;;
+  *)
+    fail "SKILL.md: WAVE_NO を 0 から始めてはならない旨の説明がある（#54）" "$RS_AUTONOMOUS_LOOP_HEADER" ;;
+esac
+
+RS_RESUME_SECTION="$(awk '/^3\. \*\*再開する場合\*\*/{f=1} /^\*\*Claude Code 側では/{f=0} f' "$RUN_SKILL")"
+
+if [ -n "$RS_RESUME_SECTION" ]; then
+  pass "SKILL.md: 「再開する場合」の説明ブロックが存在する（#54）"
+else
+  fail "SKILL.md: 「再開する場合」の説明ブロックが存在する（#54）" "節が見つかりません"
+fi
+
+case "$RS_RESUME_SECTION" in
+  *'残タスクは open な Task issue'*'再計算される'*)
+    pass "SKILL.md: 再開時に残タスクが open な Task issue から再計算される旨の記述がある（#54）" ;;
+  *)
+    fail "SKILL.md: 再開時に残タスクが open な Task issue から再計算される旨の記述がある（#54）" "$RS_RESUME_SECTION" ;;
+esac
+
+case "$RS_RESUME_SECTION" in
+  *'wave ブランチは採番し直される'*)
+    pass "SKILL.md: 再開時に wave ブランチが採番し直される旨の記述がある（#54）" ;;
+  *)
+    fail "SKILL.md: 再開時に wave ブランチが採番し直される旨の記述がある（#54）" "$RS_RESUME_SECTION" ;;
+esac
+
+case "$RS_RESUME_SECTION" in
+  *'取り込み済みのコミットは失われない'*)
+    pass "SKILL.md: 再開時に取り込み済みのコミットが失われない旨の記述がある（#54）" ;;
+  *)
+    fail "SKILL.md: 再開時に取り込み済みのコミットが失われない旨の記述がある（#54）" "$RS_RESUME_SECTION" ;;
+esac
+
+# ---------------------------------------------------------------------------
 # skills-codex/dev-workflow-run/SKILL.md: 統合ゲートの記述が Claude 版と揃っていること
 # （回帰防止 #37）
 # ---------------------------------------------------------------------------
@@ -3827,6 +3967,70 @@ case "$CRS_FULL_SRC" in
   *)
     fail "SKILL.md(codex): 「アダプタ間に機能差を作らない」旨の記述がある（#53）" "" ;;
 esac
+
+# ---------------------------------------------------------------------------
+# skills-codex/dev-workflow-run/SKILL.md, adapters/codex/run-loop.sh:
+# WAVE_NO の採番ロジックと中断→再開時の挙動の記述（Task #54。skills/run/SKILL.md #54 の
+# Codex 側対応物。Codex は `--lanes 1` 固定で毎タスク --create を呼ぶため、この不具合の
+# 影響を Claude Code 版よりも強く受ける）
+# ---------------------------------------------------------------------------
+
+echo ""
+echo "== skills-codex/dev-workflow-run/SKILL.md・run-loop.sh（WAVE_NO 採番・中断→再開時の挙動の回帰防止 #54） =="
+
+CRS_AUTONOMOUS_LOOP_HEADER="$(awk '/^## 自律ループ（`lanes=1` 固定のウェーブ実行）/{f=1} /^### Step 1:/{f=0} f' "$CODEX_RUN_SKILL")"
+
+case "$CRS_AUTONOMOUS_LOOP_HEADER" in
+  *'for-each-ref'*'wave/${EPIC_NUM}/*'*)
+    pass "SKILL.md(codex): 自律ループ冒頭に既存 wave ブランチを列挙する WAVE_NO 採番ロジックがある（#54）" ;;
+  *)
+    fail "SKILL.md(codex): 自律ループ冒頭に既存 wave ブランチを列挙する WAVE_NO 採番ロジックがある（#54）" "$CRS_AUTONOMOUS_LOOP_HEADER" ;;
+esac
+
+case "$CRS_AUTONOMOUS_LOOP_HEADER" in
+  *'0 から始めてはならない'*)
+    pass "SKILL.md(codex): WAVE_NO を 0 から始めてはならない旨の説明がある（#54）" ;;
+  *)
+    fail "SKILL.md(codex): WAVE_NO を 0 から始めてはならない旨の説明がある（#54）" "$CRS_AUTONOMOUS_LOOP_HEADER" ;;
+esac
+
+CRS_RESUME_SECTION="$(awk '/^3\. \*\*再開する場合\*\*/{f=1} /^\*\*Codex 側でも/{f=0} f' "$CODEX_RUN_SKILL")"
+
+if [ -n "$CRS_RESUME_SECTION" ]; then
+  pass "SKILL.md(codex): 「再開する場合」の説明ブロックが存在する（#54）"
+else
+  fail "SKILL.md(codex): 「再開する場合」の説明ブロックが存在する（#54）" "節が見つかりません"
+fi
+
+case "$CRS_RESUME_SECTION" in
+  *'wave ブランチは採番し直される'*)
+    pass "SKILL.md(codex): 再開時に wave ブランチが採番し直される旨の記述がある（#54）" ;;
+  *)
+    fail "SKILL.md(codex): 再開時に wave ブランチが採番し直される旨の記述がある（#54）" "$CRS_RESUME_SECTION" ;;
+esac
+
+case "$CRS_RESUME_SECTION" in
+  *'取り込み済みのコミットは失われない'*)
+    pass "SKILL.md(codex): 再開時に取り込み済みのコミットが失われない旨の記述がある（#54）" ;;
+  *)
+    fail "SKILL.md(codex): 再開時に取り込み済みのコミットが失われない旨の記述がある（#54）" "$CRS_RESUME_SECTION" ;;
+esac
+
+# run-loop.sh 本体（実際に再実行されるスクリプト）でも同じ採番ロジックになっていること
+RUN_LOOP_WAVE_NO_BLOCK="$(awk '/^WAVE_NO=\$\(git -C "\$EPIC_WT" for-each-ref/{p=1} p{print} p && /WAVE_NO="\$\{WAVE_NO:-0\}"/{exit}' "$RUN_LOOP_SCRIPT")"
+
+if [ -n "$RUN_LOOP_WAVE_NO_BLOCK" ]; then
+  pass "run-loop.sh: WAVE_NO が既存 wave ブランチの番号の最大値から採番される（#54）"
+else
+  fail "run-loop.sh: WAVE_NO が既存 wave ブランチの番号の最大値から採番される（#54）" "ブロックが見つかりません"
+fi
+
+if grep -qE '^WAVE_NO=0$' "$RUN_LOOP_SCRIPT"; then
+  fail "run-loop.sh: WAVE_NO を 0 固定で初期化していない（残骸 wave ブランチを掴む回帰の再発防止 #54）" \
+    "$(grep -nE '^WAVE_NO=0$' "$RUN_LOOP_SCRIPT")"
+else
+  pass "run-loop.sh: WAVE_NO を 0 固定で初期化していない（残骸 wave ブランチを掴む回帰の再発防止 #54）"
+fi
 
 # ---------------------------------------------------------------------------
 # notify-slack.sh: watchdog イベント（stall / stall-recovered / sleep-gap / budget、Task #46）

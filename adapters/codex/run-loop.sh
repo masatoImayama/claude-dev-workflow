@@ -182,7 +182,16 @@ processed=0
 skipped=0
 SKIPPED_CSV=""
 PROPAGATED_CSV=""   # 依存先スキップにより伝播スキップ済みとして既にコメントしたタスク番号（重複コメント防止）
-WAVE_NO=0
+
+# WAVE_NO: wave ブランチ名（wave/${EPIC_NUM}/${WAVE_NO}）の通し番号。0 から始めてはならない
+# （Task #54）。中断→再開でこのスクリプトを再実行すると本変数はプロセスごと失われ 0 から
+# 数え直すことになるが、`wave/${EPIC_NUM}/*` ブランチはローカルに残り続ける（origin へ push
+# しない設計）。0 から始めると前回の残骸 wave ブランチをそのまま掴んでしまう。既存の
+# wave ブランチの番号の最大値から始めることで、再開時も必ず新しい wave ブランチが使われる
+# （残骸を掴んだ場合も `merge-lane.sh --create` が tip 不一致を検出し exit 1 で拒否する）。
+WAVE_NO=$(git -C "$EPIC_WT" for-each-ref --format='%(refname:short)' "refs/heads/wave/${EPIC_NUM}/*" \
+  | sed "s#^wave/${EPIC_NUM}/##" | sort -n | tail -1)
+WAVE_NO="${WAVE_NO:-0}"
 
 while [ "$processed" -lt "$MAX_TASKS" ]; do
   PLAN_ARGS=(--epic "$EPIC_NUMBER" --lanes 1)
