@@ -26,11 +26,27 @@
 #   watchdog（#45〜#47）はこの区別と最終更新時刻から、「どちらで止まっているか」
 #   （受け入れ条件2）と、無活動・スリープ復帰（受け入れ条件3）を判定する。
 #
+# 打ち切り（--abort）判定（#50。Epic #42 仕様書「5. 打ち切りの仕様」）:
+#   .dev-workflow-abort は人間が `watchdog.sh --abort` を明示的に叩いたときだけ作られる
+#   （このスクリプトは作らない。watchdog.sh のtick・検知フックも作らない）。
+#   pre（PreToolUse）呼び出しで、そのフラグが存在し、かつフック入力JSONの cwd が
+#   `.claude/worktrees/agent-` を含む場合（＝サブエージェントのisolation worktree）
+#   にのみ、このツール呼び出しを拒否する。run のメインループ（epic worktree・
+#   リポジトリルート）は cwd がこのパターンに一致しないため、絶対に拒否されない。
+#   post（PostToolUse）では拒否しない（後から止めても意味が無いため）。
+#   通知方法はCLIごとに契約が異なる（scripts/check-readability.sh と同じ出し分け）:
+#     - Claude Code … exit 2 + stderr にメッセージ
+#     - Codex CLI  … exit 0 + stdout に {"continue": false, ...} のJSON
+#   限界: API 応答待ちで固まっている間はツール呼び出しが発生しないため abort は効かない。
+#   効くのはエージェントが次のツールを呼んだ瞬間である。
+#
 # 非機能要件（Epic #42 仕様書「7. 非機能要件」）:
 #   - どんな異常があっても必ず exit 0 で終わる（生存信号の記録が run を止めてはならない。
 #     マーカールートが解決できない・.claude が無い・stdin が空・JSON が壊れている、
-#     いずれも黙って通す）
-#   - 外部プロセスを1つも起動しない（date / jq / sed / grep は使わない。mv のみ例外）
+#     いずれも黙って通す）。**例外は上記の打ち切り判定だけであり、これは異常系ではなく
+#     人間が明示的に指示した拒否である**（Claude契約ではexit 2で終わる）。
+#   - 外部プロセスを1つも起動しない（date / jq / sed / grep は使わない。mv のみ例外）。
+#     打ち切り判定・ベンダー判定・JSON組み立てもすべてbash組み込みだけで行う。
 #   - stdin が tty のときは読まない（手で叩いたときにブロックしないため）
 #
 # 並行書き込みへの対応:
@@ -64,6 +80,7 @@ CLAUDE_DIR="${MARKER_ROOT}/.claude"
 [ -d "$CLAUDE_DIR" ] || exit 0
 
 TARGET="${CLAUDE_DIR}/.dev-workflow-heartbeat"
+ABORT_FLAG="${CLAUDE_DIR}/.dev-workflow-abort"
 
 # ── フック入力の読み取り ─────────────────────────────────────────────
 # stdin が tty なら読まない（手で叩いたときにブロックしないため）。
@@ -101,6 +118,23 @@ TOOL="${TOOL//$'\n'/}"
 TOOL="${TOOL//$'\r'/}"
 [ -n "$TOOL" ] || TOOL="-"
 
+# ── cwd の抽出（打ち切り判定にのみ使う。#50。tool_nameと同じ抽出パターン） ──
+# 取り出せなくても記録自体は続ける（打ち切り判定だけが対象外になり、通常どおり動く）。
+CWD=""
+case "$INPUT" in
+  *'"cwd"'*)
+    _hb_cwd_rest="${INPUT#*\"cwd\"}"
+    _hb_cwd_rest="${_hb_cwd_rest#*:}"
+    _hb_cwd_rest="${_hb_cwd_rest#"${_hb_cwd_rest%%[![:space:]]*}"}"
+    case "$_hb_cwd_rest" in
+      \"*)
+        _hb_cwd_rest="${_hb_cwd_rest#\"}"
+        CWD="${_hb_cwd_rest%%\"*}"
+        ;;
+    esac
+    ;;
+esac
+
 # ── 時刻取得（dateプロセスを起動しない。bash組み込みの strftime） ────
 NOW=""
 printf -v NOW '%(%s)T' -1
@@ -109,5 +143,62 @@ printf -v NOW '%(%s)T' -1
 TMP_FILE="${TARGET}.tmp.$$.${RANDOM}"
 { printf '%s\t%s\t%s\n' "$NOW" "$MODE" "$TOOL" > "$TMP_FILE"; } 2>/dev/null || exit 0
 mv -f "$TMP_FILE" "$TARGET" 2>/dev/null || true
+
+# ── 打ち切り（--abort）判定（#50） ────────────────────────────────────
+# pre（PreToolUse）以外は対象外（postでは拒否しない）。cwdが isolation worktree
+# （.claude/worktrees/agent-）を含まない呼び出し（run のメインループ本体）は
+# ここで素通りする。この case のパターンマッチ自体は外部プロセスを起動しない。
+if [ "$MODE" = "pre" ]; then
+  case "$CWD" in
+    *'.claude/worktrees/agent-'*)
+      if [ -f "$ABORT_FLAG" ]; then
+        # 理由（1行目のみ）を読む。読めなくても拒否自体は行う。
+        ABORT_REASON=""
+        IFS= read -r ABORT_REASON < "$ABORT_FLAG" 2>/dev/null || true
+        ABORT_REASON="${ABORT_REASON%$'\r'}"
+        [ -n "$ABORT_REASON" ] || ABORT_REASON="(理由未記録)"
+
+        ABORT_MESSAGE="打ち切りが指示されました。直ちに作業を中止し、現時点の状況（実施済みの変更・未コミットの有無）を報告して終了してください。理由: ${ABORT_REASON}"
+
+        # フック契約の出し分け（scripts/check-readability.sh のベンダー判定と同じ方針）:
+        #   1. DEV_WORKFLOW_HOOK_VENDOR が明示されていればそれに従う
+        #   2. Codex はプラグインフックに PLUGIN_ROOT を設定する
+        #   3. 保険として、入力JSONに Codex 固有拡張の turn_id があれば Codex と判定する
+        _HB_VENDOR="${DEV_WORKFLOW_HOOK_VENDOR:-}"
+        if [ -z "$_HB_VENDOR" ]; then
+          if [ -n "${PLUGIN_ROOT:-}" ]; then
+            _HB_VENDOR="codex"
+          else
+            case "$INPUT" in
+              *'"turn_id"'*) _HB_VENDOR="codex" ;;
+              *)             _HB_VENDOR="claude" ;;
+            esac
+          fi
+        fi
+
+        if [ "$_HB_VENDOR" = "codex" ]; then
+          # JSON文字列リテラル化（jq非依存。check-readability.shのjson_stringと同じ実装）
+          _hb_json_string() {
+            local s="$1"
+            s="${s//\\/\\\\}"
+            s="${s//\"/\\\"}"
+            s="${s//$'\t'/\\t}"
+            s="${s//$'\r'/}"
+            s="${s//$'\n'/\\n}"
+            printf '"%s"' "$s"
+          }
+          printf '{"continue":false,"stopReason":%s,"systemMessage":%s}\n' \
+            "$(_hb_json_string '打ち切りが指示されました')" \
+            "$(_hb_json_string "$ABORT_MESSAGE")"
+          exit 0
+        fi
+
+        # Claude Code契約: exit 2 + stderr でツール呼び出しをブロックする
+        printf '%s\n' "$ABORT_MESSAGE" >&2
+        exit 2
+      fi
+      ;;
+  esac
+fi
 
 exit 0

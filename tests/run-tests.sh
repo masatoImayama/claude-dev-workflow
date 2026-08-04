@@ -3923,6 +3923,135 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+# scripts/heartbeat.sh: 打ち切り（--abort）判定（Task #50、Epic #42）
+#
+# .dev-workflow-abort は人間が watchdog.sh --abort を明示的に叩いたときだけ作られる
+# （Epic #42 仕様書「5. 打ち切りの仕様」）。heartbeat.sh pre はこのフラグと、フック入力
+# JSON の cwd が isolation worktree（.claude/worktrees/agent-）を含む場合にのみツール
+# 呼び出しを拒否する。run のメインループ（epic worktree・リポジトリルート）は
+# 絶対に拒否しない。
+# ---------------------------------------------------------------------------
+
+echo ""
+echo "== scripts/heartbeat.sh: 打ち切り（--abort）判定（Task #50） =="
+
+HBA_REPO="$(canon_root "$(make_temp_repo)")"
+mkdir -p "${HBA_REPO}/.claude"
+HBA_ABORT_FLAG="${HBA_REPO}/.claude/.dev-workflow-abort"
+HBA_AGENT_CWD="${HBA_REPO}/.claude/worktrees/agent-hba-test"
+HBA_EPIC_CWD="${HBA_REPO}/.claude/worktrees/epic99"
+HBA_ROOT_CWD="${HBA_REPO}"
+
+printf 'テスト用の打ち切り理由\n' > "$HBA_ABORT_FLAG"
+
+# --- フラグあり + cwdがagent worktree → 拒否される（Claude契約: exit 2 + stderr） ---
+HBA_JSON_AGENT=$'{\n  "cwd": "'"${HBA_AGENT_CWD}"'",\n  "tool_name": "Bash"\n}'
+HBA_AGENT_OUT="$(DEV_WORKFLOW_MARKER_ROOT="$HBA_REPO" DEV_WORKFLOW_HOOK_VENDOR=claude \
+  bash "$HEARTBEAT_SCRIPT" pre <<< "$HBA_JSON_AGENT" 2>&1)"
+assert_exit_code "heartbeat.sh: abortフラグあり・agent worktreeのcwd → exit 2で拒否" 2 $?
+case "$HBA_AGENT_OUT" in
+  *"テスト用の打ち切り理由"*) pass "heartbeat.sh: 拒否メッセージに--abortの理由が含まれる" ;;
+  *)                          fail "heartbeat.sh: 拒否メッセージに--abortの理由が含まれる" "$HBA_AGENT_OUT" ;;
+esac
+case "$HBA_AGENT_OUT" in
+  *"打ち切りが指示されました"*) pass "heartbeat.sh: 拒否メッセージに中止・報告の指示が含まれる" ;;
+  *)                            fail "heartbeat.sh: 拒否メッセージに中止・報告の指示が含まれる" "$HBA_AGENT_OUT" ;;
+esac
+
+# 拒否されても生存信号自体は記録される（打ち切り判定は書き込みの後に行う設計）
+if [ -f "${HBA_REPO}/.claude/.dev-workflow-heartbeat" ]; then
+  pass "heartbeat.sh: 拒否時も生存信号（heartbeatマーカー）は記録される"
+else
+  fail "heartbeat.sh: 拒否時も生存信号（heartbeatマーカー）は記録される" "マーカーファイルが無い"
+fi
+
+# --- フラグあり + cwdがepic worktree → 拒否されない（run本体を絶対に殺さない） ---
+HBA_JSON_EPIC=$'{\n  "cwd": "'"${HBA_EPIC_CWD}"'",\n  "tool_name": "Bash"\n}'
+HBA_EPIC_OUT="$(DEV_WORKFLOW_MARKER_ROOT="$HBA_REPO" DEV_WORKFLOW_HOOK_VENDOR=claude \
+  bash "$HEARTBEAT_SCRIPT" pre <<< "$HBA_JSON_EPIC" 2>&1)"
+assert_exit_code "heartbeat.sh: abortフラグあり・epic worktreeのcwd → 拒否されない（exit 0）" 0 $?
+assert_eq "heartbeat.sh: abortフラグあり・epic worktreeのcwd → 無出力" "" "$HBA_EPIC_OUT"
+
+# --- フラグあり + cwdがリポジトリルート → 拒否されない ---
+HBA_JSON_ROOT=$'{\n  "cwd": "'"${HBA_ROOT_CWD}"'",\n  "tool_name": "Bash"\n}'
+HBA_ROOT_OUT="$(DEV_WORKFLOW_MARKER_ROOT="$HBA_REPO" DEV_WORKFLOW_HOOK_VENDOR=claude \
+  bash "$HEARTBEAT_SCRIPT" pre <<< "$HBA_JSON_ROOT" 2>&1)"
+assert_exit_code "heartbeat.sh: abortフラグあり・リポジトリルートのcwd → 拒否されない（exit 0）" 0 $?
+assert_eq "heartbeat.sh: abortフラグあり・リポジトリルートのcwd → 無出力" "" "$HBA_ROOT_OUT"
+
+# --- フラグが無ければ、cwdがagent worktreeでも拒否されない ---
+HBA_NOFLAG_REPO="$(canon_root "$(make_temp_repo)")"
+mkdir -p "${HBA_NOFLAG_REPO}/.claude"
+HBA_NOFLAG_AGENT_CWD="${HBA_NOFLAG_REPO}/.claude/worktrees/agent-hba-noflag"
+HBA_JSON_NOFLAG=$'{\n  "cwd": "'"${HBA_NOFLAG_AGENT_CWD}"'",\n  "tool_name": "Bash"\n}'
+HBA_NOFLAG_OUT="$(DEV_WORKFLOW_MARKER_ROOT="$HBA_NOFLAG_REPO" DEV_WORKFLOW_HOOK_VENDOR=claude \
+  bash "$HEARTBEAT_SCRIPT" pre <<< "$HBA_JSON_NOFLAG" 2>&1)"
+assert_exit_code "heartbeat.sh: abortフラグが無ければagent worktreeでも拒否されない" 0 $?
+
+# --- Codex契約: exit 0 + stdoutに {"continue":false, ...} のJSON ---
+HBA_CODEX_OUT="$(DEV_WORKFLOW_MARKER_ROOT="$HBA_REPO" DEV_WORKFLOW_HOOK_VENDOR=codex \
+  bash "$HEARTBEAT_SCRIPT" pre <<< "$HBA_JSON_AGENT" 2>&1)"
+assert_exit_code "heartbeat.sh: Codex契約はexit 0で終わる" 0 $?
+case "$HBA_CODEX_OUT" in
+  *'"continue":false'*) pass "heartbeat.sh: Codex契約はstdoutに\"continue\":falseを含むJSONを出す" ;;
+  *)                     fail "heartbeat.sh: Codex契約はstdoutに\"continue\":falseを含むJSONを出す" "$HBA_CODEX_OUT" ;;
+esac
+case "$HBA_CODEX_OUT" in
+  *"テスト用の打ち切り理由"*) pass "heartbeat.sh: Codex契約のJSONにも--abortの理由が含まれる" ;;
+  *)                          fail "heartbeat.sh: Codex契約のJSONにも--abortの理由が含まれる" "$HBA_CODEX_OUT" ;;
+esac
+
+# --- postでは拒否しない（フラグあり・agent worktreeのcwdでも） ---
+HBA_POST_OUT="$(DEV_WORKFLOW_MARKER_ROOT="$HBA_REPO" DEV_WORKFLOW_HOOK_VENDOR=claude \
+  bash "$HEARTBEAT_SCRIPT" post <<< "$HBA_JSON_AGENT" 2>&1)"
+assert_exit_code "heartbeat.sh: postでは拒否しない（フラグ・agent cwdがあってもexit 0）" 0 $?
+assert_eq "heartbeat.sh: postでは無出力" "" "$HBA_POST_OUT"
+
+# --- watchdog.sh --abort / --clear との結合: 実際にwatchdog.shで作った/消したフラグで動く ---
+HBA_WD_SCRIPT="${REPO_ROOT}/scripts/watchdog.sh"
+HBA_INT_REPO="$(canon_root "$(make_temp_repo)")"
+mkdir -p "${HBA_INT_REPO}/.claude"
+HBA_INT_AGENT_CWD="${HBA_INT_REPO}/.claude/worktrees/agent-hba-integ"
+HBA_JSON_INT=$'{\n  "cwd": "'"${HBA_INT_AGENT_CWD}"'",\n  "tool_name": "Bash"\n}'
+
+DEV_WORKFLOW_MARKER_ROOT="$HBA_INT_REPO" bash "$HBA_WD_SCRIPT" --abort "結合テストの理由" >/dev/null 2>&1
+HBA_INT_OUT1="$(DEV_WORKFLOW_MARKER_ROOT="$HBA_INT_REPO" DEV_WORKFLOW_HOOK_VENDOR=claude \
+  bash "$HEARTBEAT_SCRIPT" pre <<< "$HBA_JSON_INT" 2>&1)"
+assert_exit_code "heartbeat.sh: watchdog.sh --abortで作ったフラグにより拒否される" 2 $?
+case "$HBA_INT_OUT1" in
+  *"結合テストの理由"*) pass "heartbeat.sh: watchdog.sh --abortの理由がそのまま拒否メッセージに載る" ;;
+  *)                     fail "heartbeat.sh: watchdog.sh --abortの理由がそのまま拒否メッセージに載る" "$HBA_INT_OUT1" ;;
+esac
+
+DEV_WORKFLOW_MARKER_ROOT="$HBA_INT_REPO" bash "$HBA_WD_SCRIPT" --abort --clear >/dev/null 2>&1
+if [ -f "${HBA_INT_REPO}/.claude/.dev-workflow-abort" ]; then
+  fail "watchdog.sh --abort --clear: フラグファイルが削除される"
+else
+  pass "watchdog.sh --abort --clear: フラグファイルが削除される"
+fi
+HBA_INT_OUT2="$(DEV_WORKFLOW_MARKER_ROOT="$HBA_INT_REPO" DEV_WORKFLOW_HOOK_VENDOR=claude \
+  bash "$HEARTBEAT_SCRIPT" pre <<< "$HBA_JSON_INT" 2>&1)"
+assert_exit_code "heartbeat.sh: --abort --clear の後は拒否されない" 0 $?
+assert_eq "heartbeat.sh: --abort --clear の後は無出力" "" "$HBA_INT_OUT2"
+
+# watchdog.sh --abort / --abort --clear のログ記録
+HBA_WD_LOG="${HBA_INT_REPO}/.claude/.dev-workflow-watchdog.log"
+if grep -q "$(printf '\tabort\t')" "$HBA_WD_LOG" 2>/dev/null; then
+  pass "watchdog.sh --abort: ログに記録される"
+else
+  fail "watchdog.sh --abort: ログに記録される" "$(cat "$HBA_WD_LOG" 2>&1)"
+fi
+if grep -q "$(printf '\tabort-clear\t')" "$HBA_WD_LOG" 2>/dev/null; then
+  pass "watchdog.sh --abort --clear: ログに記録される"
+else
+  fail "watchdog.sh --abort --clear: ログに記録される" "$(cat "$HBA_WD_LOG" 2>&1)"
+fi
+
+# watchdog.sh --abort: 理由もclearも指定しないとエラー（exit 64）
+DEV_WORKFLOW_MARKER_ROOT="$HBA_INT_REPO" bash "$HBA_WD_SCRIPT" --abort >/dev/null 2>&1
+assert_exit_code "watchdog.sh --abort: 理由未指定はエラー（exit 64）" 64 $?
+
+# ---------------------------------------------------------------------------
 # scripts/watchdog.sh（常駐監視の骨格とライフサイクル。Task #45、Epic #42）
 #
 # run のメインループはサブエージェント実行中に別処理を回せないため、監視は
@@ -4249,13 +4378,49 @@ else
   pass "watchdog.sh: エージェント/CLIプロセスのPIDを扱う変数が存在しない（受け入れ条件6）"
 fi
 
-# --abort（人間が明示的に叩く打ち切り。#50のスコープ）はまだ実装されておらず、
-# .dev-workflow-abort を自動で作る経路も存在しないこと
-if grep -q 'dev-workflow-abort' "$WD_SCRIPT"; then
-  fail "watchdog.sh: 現時点で .dev-workflow-abort を扱うコードが存在しない（#50のスコープ）" \
-    "$(grep -n 'dev-workflow-abort' "$WD_SCRIPT")"
+# --abort（人間が明示的に叩く打ち切り。#50）は実装されているが、tick処理・検知フック
+# （監視ループが自動的に回す経路。WD_HOOK_BLOCKは上でkillチェック用に抽出済み）からは
+# 一切参照されないこと（自動発火経路がここにも無いことの担保）
+if printf '%s' "$WD_HOOK_BLOCK" | grep -q 'dev-workflow-abort\|ABORT_FLAG_FILE'; then
+  fail "watchdog.sh: tick処理・検知フック（自動発火経路）に abort フラグの参照が存在しない（受け入れ条件6・#50）" \
+    "$WD_HOOK_BLOCK"
 else
-  pass "watchdog.sh: 現時点で .dev-workflow-abort を扱うコードが存在しない（#50のスコープ）"
+  pass "watchdog.sh: tick処理・検知フック（自動発火経路）に abort フラグの参照が存在しない（受け入れ条件6・#50）"
+fi
+
+# watchdog_abort関数が存在すること（人間が明示的に叩く経路。#50）
+WD_ABORT_FN_BODY="$(awk '/^watchdog_abort\(\) \{/{f=1} f{print} f&&/^}/{exit}' "$WD_SCRIPT")"
+if [ -z "$WD_ABORT_FN_BODY" ]; then
+  fail "watchdog.sh: watchdog_abort関数が存在する（#50）" "見つかりません"
+else
+  pass "watchdog.sh: watchdog_abort関数が存在する（#50）"
+fi
+
+# ABORT_FLAG_FILE（.dev-workflow-abort）を書き込む・削除するコードが、定義行・コメント行
+# を除いて watchdog_abort 関数の外に存在しないこと。これにより「自動でabortフラグを作る
+# 経路が存在しない」ことを、tick/検知フックだけでなくスクリプト全体で担保する。
+WD_ABORT_REF_LINES="$(grep -n 'ABORT_FLAG_FILE' "$WD_SCRIPT" \
+  | grep -vE '^[0-9]+:ABORT_FLAG_FILE=' \
+  | grep -vE '^[0-9]+:[[:space:]]*#' || true)"
+WD_ABORT_REF_OUTSIDE=""
+while IFS=: read -r wd_lno wd_rest; do
+  [ -n "$wd_lno" ] || continue
+  printf '%s\n' "$WD_ABORT_FN_BODY" | grep -qF -- "$wd_rest" \
+    || WD_ABORT_REF_OUTSIDE="${WD_ABORT_REF_OUTSIDE}${wd_lno}:${wd_rest}"$'\n'
+done <<< "$WD_ABORT_REF_LINES"
+if [ -n "$WD_ABORT_REF_OUTSIDE" ]; then
+  fail "watchdog.sh: ABORT_FLAG_FILEを扱うコードはwatchdog_abort関数の内側だけにある（自動発火経路が無いことの担保・#50）" \
+    "$WD_ABORT_REF_OUTSIDE"
+else
+  pass "watchdog.sh: ABORT_FLAG_FILEを扱うコードはwatchdog_abort関数の内側だけにある（自動発火経路が無いことの担保・#50）"
+fi
+
+# AUTO_ABORT等、自動発火用の環境変数・分岐が存在しないこと（#50: 環境変数による自動abortも設けない）
+if grep -qiE 'auto[_-]?abort' "$WD_SCRIPT"; then
+  fail "watchdog.sh: 自動発火用の環境変数・分岐（AUTO_ABORT等）が存在しない（#50）" \
+    "$(grep -inE 'auto[_-]?abort' "$WD_SCRIPT")"
+else
+  pass "watchdog.sh: 自動発火用の環境変数・分岐（AUTO_ABORT等）が存在しない（#50）"
 fi
 
 # --- テスト後始末: 生き残っているデーモンがあれば停止する ---

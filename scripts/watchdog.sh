@@ -19,6 +19,11 @@
 #     ウェーブ単位の予算状態（run-state）を書く。run がウェーブ開始時に呼ぶ（#48）。
 #     --budget-sec を省略すると、--tasks の各 issue 本文の `- 想定時間:` の最大値 × 2 + 900秒。
 #     どれも取れない・gh が使えない場合は既定5400秒（90分）。
+#   watchdog.sh --abort "<理由>"
+#     人間が明示的に打ち切りを指示する。.dev-workflow-abort に理由を書く（#50）。
+#     watchdog は自分でこれを呼ばない（下記「重要な決定事項」を参照）。
+#   watchdog.sh --abort --clear
+#     打ち切りフラグを解除する（人間が明示的に叩く）。
 #
 # 状態ファイル（マーカールート直下の .claude/。解決は scripts/lib/marker-root.sh を使う）:
 #   .dev-workflow-watchdog.pid    監視デーモンの "<pid> <開始epoch秒>"（1行）
@@ -28,6 +33,7 @@
 #   .dev-workflow-heartbeat       heartbeat.sh（#44）が書く生存信号（<epoch>\t<pre|post>\t<ツール名>）
 #   .dev-workflow-run-state       --wave が書くウェーブ予算の状態（key=value）:
 #                                  epic= wave= tasks= wave_started= budget_sec=
+#   .dev-workflow-abort           打ち切り理由（**人間が --abort を叩いたときだけ**作られる。#50）
 #
 # 環境変数:
 #   DEV_WORKFLOW_WATCHDOG_TICK_SEC      tick間隔（秒）。既定60
@@ -54,9 +60,16 @@
 # --stop を叩いたときだけ実行され、監視ループの内部（tick・検知処理）から
 # 自動的に呼ばれる経路は存在しない（受け入れ条件6）。
 #
+# 打ち切り（--abort。#50）も同じ原則に従う。.dev-workflow-abort は
+# watchdog_abort（人間が --abort を明示的に叩いたときだけ通る関数）だけが書き・消す。
+# ストール判定・ウェーブ予算超過・スリープ抑止の各フック（「監視ループのフック点」
+# セクション）からは一切参照しない。しきい値を超えても通知するだけで、遅いだけの
+# タスクを勝手に打ち切ることはしない。フラグを見てツール呼び出しを実際に拒否するのは
+# heartbeat.sh（#44・PreToolUse）の役割であり、このスクリプトはフラグの作成・解除にしか
+# 関与しない。
+#
 # ストール判定・エスカレーション・スリープギャップ補正は #47、ウェーブ予算の監視は #48、
-# スリープ抑止は #49 で実装済み（本ファイル）。人間が明示的に叩く打ち切り（--abort）は
-# #50 のスコープでまだ実装していない。
+# スリープ抑止は #49、人間が明示的に叩く打ち切り（--abort）は #50 で実装済み（本ファイル）。
 
 set -u
 
@@ -76,6 +89,7 @@ RUN_MARKER="${STATE_DIR}/.dev-workflow-run"
 STALL_STATE_FILE="${STATE_DIR}/.dev-workflow-watchdog-state"
 HEARTBEAT_FILE="${STATE_DIR}/.dev-workflow-heartbeat"
 RUN_STATE_FILE="${STATE_DIR}/.dev-workflow-run-state"
+ABORT_FLAG_FILE="${STATE_DIR}/.dev-workflow-abort"
 
 # ---------------------------------------------------------------------------
 # 引数解析
@@ -87,6 +101,8 @@ LABEL=""
 WAVE_NO=""
 TASKS=""
 BUDGET_SEC=""
+ABORT_REASON=""
+ABORT_CLEAR=0
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -97,6 +113,19 @@ while [ $# -gt 0 ]; do
     --wave)        ACTION="wave"; shift ;;
     # --daemon-loop は内部専用。--start が自己デタッチして再実行するときにだけ使う。
     --daemon-loop) ACTION="daemon-loop"; shift ;;
+    --abort)
+      # --epic 等と違い、次のトークンが必ずしも存在するとは限らない
+      # （`watchdog.sh --abort` だけで理由未指定エラーにしたい）。`shift 2` は
+      # 残り引数が1個しか無いとシフトに失敗し無限ループの原因になるため、
+      # 1個ずつ確認しながらshiftする。
+      ACTION="abort"
+      shift
+      case "${1:-}" in
+        --clear) ABORT_CLEAR=1; shift ;;
+        "")      ;;
+        *)       ABORT_REASON="$1"; shift ;;
+      esac
+      ;;
     --epic)        EPIC="${2:-}"; shift 2 ;;
     --label)       LABEL="${2:-}"; shift 2 ;;
     --wave-no)     WAVE_NO="${2:-}"; shift 2 ;;
@@ -104,7 +133,7 @@ while [ $# -gt 0 ]; do
     --budget-sec)  BUDGET_SEC="${2:-}"; shift 2 ;;
     *)
       echo "watchdog.sh: 不明な引数: $1" >&2
-      echo "usage: watchdog.sh --start|--stop|--status|--tick-once|--wave [--epic N] [--label LABEL]" >&2
+      echo "usage: watchdog.sh --start|--stop|--status|--tick-once|--wave|--abort [--epic N] [--label LABEL]" >&2
       exit 64
       ;;
   esac
@@ -833,6 +862,37 @@ watchdog_wave() {
 }
 
 # ---------------------------------------------------------------------------
+# --abort（人間が明示的に叩く打ち切り。#50。Epic #42 仕様書「5. 打ち切りの仕様」）
+#
+# ここが .dev-workflow-abort を書く・消す唯一の場所である。人間が --abort を
+# コマンドラインから明示的に実行したときにしか到達しない（監視ループの
+# tick・検知フックから呼ばれる経路は存在しない。受け入れ条件6の延長）。
+# フラグを見てツール呼び出しを実際に拒否するのは heartbeat.sh（#44）の役割であり、
+# このスクリプトはフラグの作成・解除と、その事実をログに残すことだけを行う。
+# ---------------------------------------------------------------------------
+
+watchdog_abort() {
+  mkdir -p "$STATE_DIR"
+
+  if [ "$ABORT_CLEAR" -eq 1 ]; then
+    rm -f "$ABORT_FLAG_FILE"
+    _watchdog_log "abort-clear" "human cleared the abort flag"
+    echo "watchdog: abort flag cleared"
+    return 0
+  fi
+
+  if [ -z "$ABORT_REASON" ]; then
+    echo "watchdog.sh --abort: 理由の文字列を指定してください（または --abort --clear）" >&2
+    return 64
+  fi
+
+  printf '%s\n' "$ABORT_REASON" > "$ABORT_FLAG_FILE"
+  _watchdog_log "abort" "reason=${ABORT_REASON}"
+  echo "watchdog: abort flag created (reason=${ABORT_REASON})"
+  return 0
+}
+
+# ---------------------------------------------------------------------------
 # --daemon-loop（内部専用。--start が自己デタッチして実行する常駐ループ本体）
 # ---------------------------------------------------------------------------
 
@@ -891,9 +951,10 @@ case "$ACTION" in
   status)      watchdog_status ;;
   tick-once)   watchdog_tick_once ;;
   wave)        watchdog_wave ;;
+  abort)       watchdog_abort ;;
   daemon-loop) watchdog_daemon_loop ;;
   "")
-    echo "usage: watchdog.sh --start|--stop|--status|--tick-once|--wave [--epic N] [--label LABEL]" >&2
+    echo "usage: watchdog.sh --start|--stop|--status|--tick-once|--wave|--abort [--epic N] [--label LABEL]" >&2
     exit 64
     ;;
 esac
