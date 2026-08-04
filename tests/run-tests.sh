@@ -4555,6 +4555,235 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+# scripts/watchdog.sh: ウェーブ予算の監視と `- 想定時間:` 宣言（Task #48、Epic #42）
+#
+# DEV_WORKFLOW_WATCHDOG_NOW で時刻を注入し --wave / --tick-once を組み合わせて、実時間を
+# 一切待たずに「run-state書き込み → 予算内は無通知 → 超過で1回だけ通知 → 次のwaveでリセット」
+# を検証する。`- 想定時間:` の解析は、実際の `gh issue view` を呼ばず、PATHに差し込んだ
+# 偽ghスクリプト（環境変数で指定したディレクトリのファイルを本文として返すだけ）を使い、
+# ネットワーク・GitHub 認証に一切依存しない（完了条件: 「gh に依存しないよう、issue本文の
+# 入力を差し替えられるようにする」）。通知はTask #47と同じくnotify-slack.shのsink機構で検証する。
+# ---------------------------------------------------------------------------
+
+echo ""
+echo "== scripts/watchdog.sh: ウェーブ予算の監視と - 想定時間: 宣言（Task #48） =="
+
+WB_WORK="$(mktemp -d "${TMPDIR:-/tmp}/dw-test-watchdog-budget.XXXXXX")"
+
+# --- --wave: run-stateを期待どおりの形式で書く ---
+
+WB_ROOT1="$(wd_new_root)"
+WB_T0=1700400000
+DEV_WORKFLOW_MARKER_ROOT="$WB_ROOT1" DEV_WORKFLOW_WATCHDOG_NOW="$WB_T0" \
+  bash "$WD_SCRIPT" --wave --epic 48 --wave-no 2 --tasks "44,45,46" --budget-sec 5000 \
+  > /dev/null 2>&1
+WB_STATE_FILE1="${WB_ROOT1}/.claude/.dev-workflow-run-state"
+WB_EXPECTED1=$'epic=48\nwave=2\ntasks=44,45,46\nwave_started=1700400000\nbudget_sec=5000'
+WB_ACTUAL1="$(cat "$WB_STATE_FILE1" 2>/dev/null)"
+assert_eq "watchdog.sh --wave: run-stateを期待どおりの形式(key=value)で書く" \
+  "$WB_EXPECTED1" "$WB_ACTUAL1"
+
+# --- 予算監視: 予算内は無通知・超過で1回だけ通知される・次の --wave でリセットされる ---
+
+WB_ROOT2="$(wd_new_root)"
+WB_LOG2="${WB_ROOT2}/.claude/.dev-workflow-watchdog.log"
+
+# wb_tick <root> <now> <tick_sec> [sink_file]  （wds_tickと同じ作法。偽curlはWDS_FAKE_BINを再利用する）
+wb_tick() {
+  local root="$1" now="$2" tick_sec="$3" sink="${4:-${WB_WORK}/unused-sink.json}"
+  DEV_WORKFLOW_MARKER_ROOT="$root" \
+  DEV_WORKFLOW_WATCHDOG_NOW="$now" \
+  DEV_WORKFLOW_WATCHDOG_TICK_SEC="$tick_sec" \
+  SLACK_WEBHOOK_URL="https://example.invalid/webhook" \
+  DEV_WORKFLOW_NOTIFY_SINK="$sink" \
+  PATH="${WDS_FAKE_BIN}:${PATH}" \
+  bash "$WD_SCRIPT" --tick-once --epic 48 --label "Epic #48 test" > /dev/null 2>&1
+}
+
+WB_T0_BUDGET=1700500000
+WB_BUDGET=3600
+DEV_WORKFLOW_MARKER_ROOT="$WB_ROOT2" DEV_WORKFLOW_WATCHDOG_NOW="$WB_T0_BUDGET" \
+  bash "$WD_SCRIPT" --wave --epic 48 --wave-no 1 --tasks "44" --budget-sec "$WB_BUDGET" \
+  > /dev/null 2>&1
+
+# 予算内（30分 < 60分）: 無通知
+WB_SINK_WITHIN="${WB_WORK}/within-budget.json"
+wb_tick "$WB_ROOT2" "$((WB_T0_BUDGET + 1800))" 3600 "$WB_SINK_WITHIN"
+if [ -f "$WB_SINK_WITHIN" ]; then
+  fail "watchdog.sh: ウェーブ予算内では通知されない" "$(wds_read_sink "$WB_SINK_WITHIN")"
+else
+  pass "watchdog.sh: ウェーブ予算内では通知されない"
+fi
+
+# 予算超過（61分 > 60分）: 1回通知される
+WB_OVER_AT=$((WB_T0_BUDGET + 3700))
+WB_SINK_OVER="${WB_WORK}/over-budget.json"
+wb_tick "$WB_ROOT2" "$WB_OVER_AT" 3600 "$WB_SINK_OVER"
+WB_BODY_OVER="$(wds_read_sink "$WB_SINK_OVER")"
+case "$WB_BODY_OVER" in
+  *"想定時間超過"*) pass "watchdog.sh: ウェーブ予算超過で通知される" ;;
+  *)                fail "watchdog.sh: ウェーブ予算超過で通知される" "$WB_BODY_OVER" ;;
+esac
+case "$WB_BODY_OVER" in
+  *"ウェーブ1"*) pass "watchdog.sh: 予算超過の通知本文にウェーブ番号を含む" ;;
+  *)             fail "watchdog.sh: 予算超過の通知本文にウェーブ番号を含む" "$WB_BODY_OVER" ;;
+esac
+
+# 超過後さらにtickしても再通知されない（1回だけ）
+WB_SINK_OVER_AGAIN="${WB_WORK}/over-budget-again.json"
+wb_tick "$WB_ROOT2" "$((WB_OVER_AT + 100))" 3600 "$WB_SINK_OVER_AGAIN"
+if [ -f "$WB_SINK_OVER_AGAIN" ]; then
+  fail "watchdog.sh: ウェーブ予算超過の通知は1回だけ（再通知されない）" \
+    "$(wds_read_sink "$WB_SINK_OVER_AGAIN")"
+else
+  pass "watchdog.sh: ウェーブ予算超過の通知は1回だけ（再通知されない）"
+fi
+
+WB_BUDGET_LOG_COUNT1="$(grep -c "$(printf '\tbudget\t')" "$WB_LOG2" 2>/dev/null || true)"
+assert_eq "watchdog.sh: 予算超過ログはウェーブ1で1件" "1" "${WB_BUDGET_LOG_COUNT1:-0}"
+
+# 次の --wave の後に再び超過すると、また1回通知される（通知済みフラグがリセットされる）
+WB_T1=$((WB_OVER_AT + 200))
+DEV_WORKFLOW_MARKER_ROOT="$WB_ROOT2" DEV_WORKFLOW_WATCHDOG_NOW="$WB_T1" \
+  bash "$WD_SCRIPT" --wave --epic 48 --wave-no 2 --tasks "44" --budget-sec 1800 > /dev/null 2>&1
+
+WB_SINK_WAVE2_WITHIN="${WB_WORK}/wave2-within.json"
+wb_tick "$WB_ROOT2" "$((WB_T1 + 100))" 3600 "$WB_SINK_WAVE2_WITHIN"
+if [ -f "$WB_SINK_WAVE2_WITHIN" ]; then
+  fail "watchdog.sh: 新しいウェーブの予算内では通知されない" "$(wds_read_sink "$WB_SINK_WAVE2_WITHIN")"
+else
+  pass "watchdog.sh: 新しいウェーブの予算内では通知されない"
+fi
+
+WB_WAVE2_OVER_AT=$((WB_T1 + 1900))
+WB_SINK_WAVE2_OVER="${WB_WORK}/wave2-over.json"
+wb_tick "$WB_ROOT2" "$WB_WAVE2_OVER_AT" 3600 "$WB_SINK_WAVE2_OVER"
+WB_BODY_WAVE2_OVER="$(wds_read_sink "$WB_SINK_WAVE2_OVER")"
+case "$WB_BODY_WAVE2_OVER" in
+  *"想定時間超過"*"ウェーブ2"*)
+    pass "watchdog.sh: 次の--waveの後に再び超過すると、また1回通知される" ;;
+  *)
+    fail "watchdog.sh: 次の--waveの後に再び超過すると、また1回通知される" "$WB_BODY_WAVE2_OVER" ;;
+esac
+
+WB_BUDGET_LOG_COUNT2="$(grep -c "$(printf '\tbudget\t')" "$WB_LOG2" 2>/dev/null || true)"
+assert_eq "watchdog.sh: 予算超過ログは合計2件（ウェーブ1で1件・ウェーブ2で1件）" \
+  "2" "${WB_BUDGET_LOG_COUNT2:-0}"
+
+# --- run-stateが無い場合: 予算監視をスキップし、他の監視（ストール検知）は動き続ける ---
+
+WB_ROOT3="$(wd_new_root)"
+WB_T0_NOSTATE=1700600000
+wds_write_heartbeat "$WB_ROOT3" "$WB_T0_NOSTATE" "post" "Bash"
+
+WB_TICK3_OK=1
+wb_tick "$WB_ROOT3" "$WB_T0_NOSTATE" 3600 || WB_TICK3_OK=0
+assert_eq "watchdog.sh: run-stateが無くてもtick-onceはexit 0で返る" "1" "$WB_TICK3_OK"
+
+WB_SINK_STALL_NOSTATE="${WB_WORK}/stall-no-run-state.json"
+wb_tick "$WB_ROOT3" "$((WB_T0_NOSTATE + 16 * 60))" 3600 "$WB_SINK_STALL_NOSTATE"
+WB_BODY_STALL_NOSTATE="$(wds_read_sink "$WB_SINK_STALL_NOSTATE")"
+case "$WB_BODY_STALL_NOSTATE" in
+  *"応答なし"*) pass "watchdog.sh: run-stateが無くてもストール監視は動き続ける" ;;
+  *)            fail "watchdog.sh: run-stateが無くてもストール監視は動き続ける" "$WB_BODY_STALL_NOSTATE" ;;
+esac
+
+WB_LOG3="${WB_ROOT3}/.claude/.dev-workflow-watchdog.log"
+if grep -q "$(printf '\tbudget\t')" "$WB_LOG3" 2>/dev/null; then
+  fail "watchdog.sh: run-stateが無い場合に予算監視をスキップする" "$(cat "$WB_LOG3" 2>&1)"
+else
+  pass "watchdog.sh: run-stateが無い場合に予算監視をスキップする"
+fi
+
+# --- `- 想定時間:` の解析: 30m / 2h / 90 / 不正値 / 宣言なし / 複数タスクの最大値 ---
+#
+# gh には一切依存しない。PATHに差し込む偽ghは `gh issue view <番号> --json body -q .body`
+# だけを模倣し、WB_GH_BODY_DIR/<番号>.txt の中身をそのまま本文として返す（無ければ失敗する）。
+
+WB_GH_BODY_DIR="${WB_WORK}/gh-bodies"
+mkdir -p "$WB_GH_BODY_DIR"
+WB_FAKE_GH_BIN="${WB_WORK}/gh-bin"
+mkdir -p "$WB_FAKE_GH_BIN"
+cat > "${WB_FAKE_GH_BIN}/gh" <<'FAKE_GH_EOF'
+#!/bin/bash
+# テスト用の偽gh。`gh issue view <番号> --json body -q .body` だけを模倣する。
+if [ "$1" = "issue" ] && [ "$2" = "view" ]; then
+  num="$3"
+  file="${WB_GH_BODY_DIR}/${num}.txt"
+  if [ -f "$file" ]; then
+    cat "$file"
+    exit 0
+  fi
+  exit 1
+fi
+exit 1
+FAKE_GH_EOF
+chmod +x "${WB_FAKE_GH_BIN}/gh"
+
+# wb_set_gh_body <issue番号> <本文>
+wb_set_gh_body() {
+  printf '%s\n' "$2" > "${WB_GH_BODY_DIR}/$1.txt"
+}
+
+# wb_wave_budget_sec <root> <tasks_csv>
+# --budget-sec なしで --wave を呼び、書かれたrun-stateのbudget_secを返す
+wb_wave_budget_sec() {
+  local root="$1" tasks="$2"
+  DEV_WORKFLOW_MARKER_ROOT="$root" DEV_WORKFLOW_WATCHDOG_NOW=1700700000 \
+  WB_GH_BODY_DIR="$WB_GH_BODY_DIR" PATH="${WB_FAKE_GH_BIN}:${PATH}" \
+    bash "$WD_SCRIPT" --wave --epic 48 --wave-no 1 --tasks "$tasks" > /dev/null 2>&1
+  grep '^budget_sec=' "${root}/.claude/.dev-workflow-run-state" | cut -d= -f2
+}
+
+WB_ROOT_EST="$(wd_new_root)"
+
+wb_set_gh_body 201 '- 想定時間: 30m'
+assert_eq "watchdog.sh: - 想定時間: 30m → 予算=(30分*2+900秒)=4500秒" \
+  "4500" "$(wb_wave_budget_sec "$WB_ROOT_EST" "201")"
+
+wb_set_gh_body 202 '- 想定時間: 2h'
+assert_eq "watchdog.sh: - 想定時間: 2h → 予算=(120分*2+900秒)=15300秒" \
+  "15300" "$(wb_wave_budget_sec "$WB_ROOT_EST" "202")"
+
+wb_set_gh_body 203 '- 想定時間: 90'
+assert_eq "watchdog.sh: - 想定時間: 90（単位なし=分）→ 予算=(90分*2+900秒)=11700秒" \
+  "11700" "$(wb_wave_budget_sec "$WB_ROOT_EST" "203")"
+
+wb_set_gh_body 204 '- 想定時間: abc'
+assert_eq "watchdog.sh: - 想定時間: 不正値は無視され既定5400秒になる" \
+  "5400" "$(wb_wave_budget_sec "$WB_ROOT_EST" "204")"
+
+# タスク205は本文ファイルを作らない（宣言なし）
+assert_eq "watchdog.sh: - 想定時間: 宣言が無いタスクは既定5400秒になる" \
+  "5400" "$(wb_wave_budget_sec "$WB_ROOT_EST" "205")"
+
+wb_set_gh_body 206 '- 想定時間: 30m'
+wb_set_gh_body 207 '- 想定時間: 2h'
+assert_eq "watchdog.sh: 複数タスクの - 想定時間: は最大値を使う（2hが優先）→ 15300秒" \
+  "15300" "$(wb_wave_budget_sec "$WB_ROOT_EST" "206,207")"
+
+# ghが使えない場合（常に失敗する偽gh）も既定5400秒になる
+WB_FAKE_GH_FAIL_BIN="${WB_WORK}/gh-fail-bin"
+mkdir -p "$WB_FAKE_GH_FAIL_BIN"
+printf '#!/bin/bash\nexit 1\n' > "${WB_FAKE_GH_FAIL_BIN}/gh"
+chmod +x "${WB_FAKE_GH_FAIL_BIN}/gh"
+WB_ROOT_NOGH="$(wd_new_root)"
+DEV_WORKFLOW_MARKER_ROOT="$WB_ROOT_NOGH" DEV_WORKFLOW_WATCHDOG_NOW=1700700000 \
+  PATH="${WB_FAKE_GH_FAIL_BIN}:${PATH}" \
+  bash "$WD_SCRIPT" --wave --epic 48 --wave-no 1 --tasks "999" > /dev/null 2>&1
+WB_BUDGET_NOGH="$(grep '^budget_sec=' "${WB_ROOT_NOGH}/.claude/.dev-workflow-run-state" \
+  | cut -d= -f2)"
+assert_eq "watchdog.sh --wave: ghが使えない場合は既定5400秒になる" "5400" "$WB_BUDGET_NOGH"
+
+# --- curlが一度も実行されていないこと（本セクションの通知もsink経由でのみ検証する） ---
+if [ -s "$WDS_CURL_LOG" ]; then
+  fail "watchdog.sh: ウェーブ予算の通知でもcurlが呼ばれない（実送信しない）" \
+    "$(wds_read_sink "$WDS_CURL_LOG")"
+else
+  pass "watchdog.sh: ウェーブ予算の通知でもcurlが呼ばれない（実送信しない）"
+fi
+
+# ---------------------------------------------------------------------------
 # 結果集計
 # ---------------------------------------------------------------------------
 

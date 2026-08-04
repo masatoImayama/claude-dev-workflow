@@ -15,12 +15,19 @@
 #     running / stopped と PID・稼働時間を出力する（running なら exit 0、stopped なら exit 1）。
 #   watchdog.sh --tick-once
 #     常駐せず、監視ループを1周だけ回して exit 0 で返る（テスト・デバッグ用）。
+#   watchdog.sh --wave --epic N --wave-no W --tasks 44,45,46 [--budget-sec N]
+#     ウェーブ単位の予算状態（run-state）を書く。run がウェーブ開始時に呼ぶ（#48）。
+#     --budget-sec を省略すると、--tasks の各 issue 本文の `- 想定時間:` の最大値 × 2 + 900秒。
+#     どれも取れない・gh が使えない場合は既定5400秒（90分）。
 #
 # 状態ファイル（マーカールート直下の .claude/。解決は scripts/lib/marker-root.sh を使う）:
 #   .dev-workflow-watchdog.pid    監視デーモンの "<pid> <開始epoch秒>"（1行）
 #   .dev-workflow-watchdog.log    検知イベントの追記ログ（人間可読TSV: <時刻>\t<イベント>\t<詳細>）
-#   .dev-workflow-watchdog-state  ストール判定・スリープギャップ補正の内部状態（key=value、1行1項目）
+#   .dev-workflow-watchdog-state  ストール判定・スリープギャップ補正・予算通知済みフラグの
+#                                  内部状態（key=value、1行1項目）
 #   .dev-workflow-heartbeat       heartbeat.sh（#44）が書く生存信号（<epoch>\t<pre|post>\t<ツール名>）
+#   .dev-workflow-run-state       --wave が書くウェーブ予算の状態（key=value）:
+#                                  epic= wave= tasks= wave_started= budget_sec=
 #
 # 環境変数:
 #   DEV_WORKFLOW_WATCHDOG_TICK_SEC      tick間隔（秒）。既定60
@@ -43,9 +50,9 @@
 # --stop を叩いたときだけ実行され、監視ループの内部（tick・検知処理）から
 # 自動的に呼ばれる経路は存在しない（受け入れ条件6）。
 #
-# ストール判定・エスカレーション・スリープギャップ補正は #47 で実装済み（本ファイル）。
-# ウェーブ予算は #48、スリープ抑止は #49、人間が明示的に叩く打ち切り（--abort）は #50 の
-# スコープ。それらはまだ no-op のフック関数（_watchdog_check_wave_budget 等）のままである。
+# ストール判定・エスカレーション・スリープギャップ補正は #47、ウェーブ予算の監視は #48 で
+# 実装済み（本ファイル）。スリープ抑止は #49、人間が明示的に叩く打ち切り（--abort）は #50 の
+# スコープ。それらはまだ no-op のフック関数（_watchdog_sleep_inhibit_tick）のままである。
 
 set -u
 
@@ -64,6 +71,7 @@ LOG_FILE="${STATE_DIR}/.dev-workflow-watchdog.log"
 RUN_MARKER="${STATE_DIR}/.dev-workflow-run"
 STALL_STATE_FILE="${STATE_DIR}/.dev-workflow-watchdog-state"
 HEARTBEAT_FILE="${STATE_DIR}/.dev-workflow-heartbeat"
+RUN_STATE_FILE="${STATE_DIR}/.dev-workflow-run-state"
 
 # ---------------------------------------------------------------------------
 # 引数解析
@@ -72,6 +80,9 @@ HEARTBEAT_FILE="${STATE_DIR}/.dev-workflow-heartbeat"
 ACTION=""
 EPIC=""
 LABEL=""
+WAVE_NO=""
+TASKS=""
+BUDGET_SEC=""
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -79,13 +90,17 @@ while [ $# -gt 0 ]; do
     --stop)        ACTION="stop"; shift ;;
     --status)      ACTION="status"; shift ;;
     --tick-once)   ACTION="tick-once"; shift ;;
+    --wave)        ACTION="wave"; shift ;;
     # --daemon-loop は内部専用。--start が自己デタッチして再実行するときにだけ使う。
     --daemon-loop) ACTION="daemon-loop"; shift ;;
     --epic)        EPIC="${2:-}"; shift 2 ;;
     --label)       LABEL="${2:-}"; shift 2 ;;
+    --wave-no)     WAVE_NO="${2:-}"; shift 2 ;;
+    --tasks)       TASKS="${2:-}"; shift 2 ;;
+    --budget-sec)  BUDGET_SEC="${2:-}"; shift 2 ;;
     *)
       echo "watchdog.sh: 不明な引数: $1" >&2
-      echo "usage: watchdog.sh --start|--stop|--status|--tick-once [--epic N] [--label LABEL]" >&2
+      echo "usage: watchdog.sh --start|--stop|--status|--tick-once|--wave [--epic N] [--label LABEL]" >&2
       exit 64
       ;;
   esac
@@ -191,6 +206,7 @@ _watchdog_state_load() {
   WD_STATE_STALL_NOTIFIED_AT=0
   WD_STATE_SLEEP_GAP_SEC=0
   WD_STATE_LAST_TICK=0
+  WD_STATE_BUDGET_NOTIFIED=0
 
   if [ -f "$STALL_STATE_FILE" ]; then
     local key val
@@ -201,6 +217,7 @@ _watchdog_state_load() {
         WD_STATE_STALL_NOTIFIED_AT) WD_STATE_STALL_NOTIFIED_AT="$val" ;;
         WD_STATE_SLEEP_GAP_SEC)     WD_STATE_SLEEP_GAP_SEC="$val" ;;
         WD_STATE_LAST_TICK)         WD_STATE_LAST_TICK="$val" ;;
+        WD_STATE_BUDGET_NOTIFIED)   WD_STATE_BUDGET_NOTIFIED="$val" ;;
       esac
     done < "$STALL_STATE_FILE"
   fi
@@ -210,6 +227,7 @@ _watchdog_state_load() {
   case "$WD_STATE_STALL_NOTIFIED_AT" in ''|*[!0-9]*) WD_STATE_STALL_NOTIFIED_AT=0 ;; esac
   case "$WD_STATE_SLEEP_GAP_SEC"     in ''|*[!0-9]*) WD_STATE_SLEEP_GAP_SEC=0 ;; esac
   case "$WD_STATE_LAST_TICK"         in ''|*[!0-9]*) WD_STATE_LAST_TICK=0 ;; esac
+  case "$WD_STATE_BUDGET_NOTIFIED"   in ''|*[!0-9]*) WD_STATE_BUDGET_NOTIFIED=0 ;; esac
 }
 
 # _watchdog_state_save  現在のWD_STATE_*変数を$STALL_STATE_FILEへ原子的に書き出す
@@ -223,6 +241,7 @@ _watchdog_state_save() {
     printf 'WD_STATE_STALL_NOTIFIED_AT=%s\n' "$WD_STATE_STALL_NOTIFIED_AT"
     printf 'WD_STATE_SLEEP_GAP_SEC=%s\n' "$WD_STATE_SLEEP_GAP_SEC"
     printf 'WD_STATE_LAST_TICK=%s\n' "$WD_STATE_LAST_TICK"
+    printf 'WD_STATE_BUDGET_NOTIFIED=%s\n' "$WD_STATE_BUDGET_NOTIFIED"
   } > "$tmp"
   mv -f "$tmp" "$STALL_STATE_FILE"
 }
@@ -368,8 +387,127 @@ _watchdog_check_stall() {
   fi
 }
 
-# フック: ウェーブ予算超過の監視（#48）。現時点では何もしない。
-_watchdog_check_wave_budget() { :; }
+# ---- ウェーブ予算（#48） ----
+#
+# run-state（$RUN_STATE_FILE。--wave が書く key=value）が無ければ予算監視は行わない
+# （run-state は run が --wave を結線するまで実運用では存在しない。他の監視には影響しない）。
+# 動的なパスを source すると _watchdog_state_load と同じ理由で事故りうるため、
+# ここでも source はせず自前でパースする。
+
+# _watchdog_parse_estimate_sec <value>
+# `- 想定時間:` の値（コロンの後ろ、前後の空白は呼び出し側でtrim済み）を秒に変換する。
+# 書式は "30m"（分）/ "2h"（時間）/ "90"（単位なし=分）。解釈できない値は非0で返し、
+# 呼び出し側はその宣言を無視する（仕様どおり）。
+_watchdog_parse_estimate_sec() {
+  local value="$1" num sec
+  case "$value" in
+    *m)
+      num="${value%m}"
+      case "$num" in ''|*[!0-9]*) return 1 ;; esac
+      sec=$(( num * 60 ))
+      ;;
+    *h)
+      num="${value%h}"
+      case "$num" in ''|*[!0-9]*) return 1 ;; esac
+      sec=$(( num * 3600 ))
+      ;;
+    *)
+      case "$value" in ''|*[!0-9]*) return 1 ;; esac
+      sec=$(( value * 60 ))
+      ;;
+  esac
+  printf '%s' "$sec"
+  return 0
+}
+
+# _watchdog_estimate_sec_from_body <issue本文>
+# 本文中の最初の "- 想定時間:" 行を取り出し、秒へ変換する。行が無い・値が
+# 解釈できない場合は非0で返す（宣言なし・不正値のどちらも「取れなかった」として扱う）。
+_watchdog_estimate_sec_from_body() {
+  local body="$1" line value
+  line="$(printf '%s\n' "$body" | grep -m1 '^- 想定時間:')" || return 1
+  value="${line#*:}"
+  value="$(printf '%s' "$value" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+  _watchdog_parse_estimate_sec "$value"
+}
+
+# _watchdog_wave_budget_sec <tasks_csv>
+# --tasks の各issue番号を `gh issue view --json body -q .body` で読み、`- 想定時間:` の
+# 最大値 × 2 + 900秒を返す。1件も取れない・ghが使えない場合は既定5400秒（Epic #42仕様書
+# 「4.2 ウェーブ予算超過」）。
+_watchdog_wave_budget_sec() {
+  local tasks_csv="$1" default_sec=5400
+  local max_sec=0 found=0
+  local t body sec
+  local IFS=','
+  for t in $tasks_csv; do
+    t="$(printf '%s' "$t" | tr -d '[:space:]')"
+    [ -n "$t" ] || continue
+    body="$(gh issue view "$t" --json body -q .body 2>/dev/null)" || continue
+    [ -n "$body" ] || continue
+    sec="$(_watchdog_estimate_sec_from_body "$body")" || continue
+    case "$sec" in ''|*[!0-9]*) continue ;; esac
+    found=1
+    [ "$sec" -gt "$max_sec" ] && max_sec="$sec"
+  done
+  if [ "$found" -eq 1 ]; then
+    printf '%s' $(( max_sec * 2 + 900 ))
+  else
+    printf '%s' "$default_sec"
+  fi
+}
+
+# _watchdog_run_state_load  $RUN_STATE_FILE を読み、WB_* 変数へ反映する。
+# ファイルが無ければ非0で返す（呼び出し側は予算監視をスキップする）。
+_watchdog_run_state_load() {
+  [ -f "$RUN_STATE_FILE" ] || return 1
+  WB_EPIC="" WB_WAVE="" WB_TASKS="" WB_WAVE_STARTED="" WB_BUDGET_SEC=""
+  local key val
+  while IFS='=' read -r key val; do
+    case "$key" in
+      epic)         WB_EPIC="$val" ;;
+      wave)         WB_WAVE="$val" ;;
+      tasks)        WB_TASKS="$val" ;;
+      wave_started) WB_WAVE_STARTED="$val" ;;
+      budget_sec)   WB_BUDGET_SEC="$val" ;;
+    esac
+  done < "$RUN_STATE_FILE"
+  return 0
+}
+
+# _watchdog_notify_budget <wave> <elapsed> <budget> <epic> <tasks>
+# budget通知を1回送り、ログへ記録する
+_watchdog_notify_budget() {
+  local wave="$1" elapsed="$2" budget="$3" epic="$4" tasks="$5" detail
+  detail="ウェーブ${wave} / 経過$(( elapsed / 60 ))分 / 予算$(( budget / 60 ))分$(_watchdog_context_suffix)"
+  bash "${WATCHDOG_DIR}/notify-slack.sh" budget "$detail" >/dev/null 2>&1 || true
+  _watchdog_log "budget" "epic=${epic} wave=${wave} tasks=${tasks} elapsed=${elapsed}s budget_sec=${budget}s"
+}
+
+# フック: ウェーブ予算超過の監視（#48）。
+#
+# run-stateが無ければ何もしない（他の監視は続く）。wave_started/budget_secが数値として
+# 読めない場合も同様にスキップする。経過が予算を超えていて、かつまだこのウェーブで
+# 通知していなければ1回だけ通知する（活動していても通知する。ストールとは別の事象）。
+# 通知済みフラグは --wave（watchdog_wave）が新しいウェーブを書くたびにリセットされる。
+_watchdog_check_wave_budget() {
+  local now="$1"
+
+  _watchdog_run_state_load || return 0
+
+  case "$WB_WAVE_STARTED" in ''|*[!0-9]*) return 0 ;; esac
+  case "$WB_BUDGET_SEC"   in ''|*[!0-9]*) return 0 ;; esac
+
+  local elapsed=$(( now - WB_WAVE_STARTED ))
+  [ "$elapsed" -ge "$WB_BUDGET_SEC" ] || return 0
+
+  _watchdog_state_load
+  [ "$WD_STATE_BUDGET_NOTIFIED" -eq 1 ] && return 0
+
+  _watchdog_notify_budget "$WB_WAVE" "$elapsed" "$WB_BUDGET_SEC" "$WB_EPIC" "$WB_TASKS"
+  WD_STATE_BUDGET_NOTIFIED=1
+  _watchdog_state_save
+}
 
 # フック: スリープ抑止のtick呼び出し（#49）。現時点では何もしない。
 _watchdog_sleep_inhibit_tick() { :; }
@@ -498,6 +636,53 @@ watchdog_tick_once() {
 }
 
 # ---------------------------------------------------------------------------
+# --wave（run-stateの更新。runがウェーブ開始時に呼ぶ。#48）
+# ---------------------------------------------------------------------------
+
+watchdog_wave() {
+  mkdir -p "$STATE_DIR"
+
+  if [ -z "$EPIC" ] || [ -z "$WAVE_NO" ] || [ -z "$TASKS" ]; then
+    echo "watchdog.sh --wave: --epic, --wave-no, --tasks は必須です" >&2
+    return 64
+  fi
+
+  local now budget
+  now="$(_watchdog_now)"
+  if [ -n "$BUDGET_SEC" ]; then
+    case "$BUDGET_SEC" in
+      ''|*[!0-9]*)
+        echo "watchdog.sh --wave: --budget-sec は数値で指定してください" >&2
+        return 64
+        ;;
+    esac
+    budget="$BUDGET_SEC"
+  else
+    budget="$(_watchdog_wave_budget_sec "$TASKS")"
+  fi
+
+  local tmp="${RUN_STATE_FILE}.tmp.$$.${RANDOM}"
+  {
+    printf 'epic=%s\n' "$EPIC"
+    printf 'wave=%s\n' "$WAVE_NO"
+    printf 'tasks=%s\n' "$TASKS"
+    printf 'wave_started=%s\n' "$now"
+    printf 'budget_sec=%s\n' "$budget"
+  } > "$tmp"
+  mv -f "$tmp" "$RUN_STATE_FILE"
+
+  # 新しいウェーブを書いたので、前のウェーブで超過通知済みでも次は未通知から始める
+  # （受け入れ条件: 次の --wave で状態が更新されたら通知済みフラグをリセットする）
+  _watchdog_state_load
+  WD_STATE_BUDGET_NOTIFIED=0
+  _watchdog_state_save
+
+  _watchdog_log "wave" "epic=${EPIC} wave=${WAVE_NO} tasks=${TASKS} wave_started=${now} budget_sec=${budget}"
+  echo "watchdog: wave state updated (epic=${EPIC} wave=${WAVE_NO} budget_sec=${budget}s)"
+  return 0
+}
+
+# ---------------------------------------------------------------------------
 # --daemon-loop（内部専用。--start が自己デタッチして実行する常駐ループ本体）
 # ---------------------------------------------------------------------------
 
@@ -555,9 +740,10 @@ case "$ACTION" in
   stop)        watchdog_stop ;;
   status)      watchdog_status ;;
   tick-once)   watchdog_tick_once ;;
+  wave)        watchdog_wave ;;
   daemon-loop) watchdog_daemon_loop ;;
   "")
-    echo "usage: watchdog.sh --start|--stop|--status|--tick-once [--epic N] [--label LABEL]" >&2
+    echo "usage: watchdog.sh --start|--stop|--status|--tick-once|--wave [--epic N] [--label LABEL]" >&2
     exit 64
     ;;
 esac
