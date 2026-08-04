@@ -668,7 +668,11 @@ Slack に `:rotating_light: 応答なし` が届いたら、人間が次の手�
 2. **打ち切る場合**: `bash "${CLAUDE_PLUGIN_ROOT}/scripts/watchdog.sh" --abort "理由"` を実行する。
    **これはエージェントが次にツールを呼んだ瞬間に効く**（`heartbeat.sh pre` がフラグを見て
    拒否する経路のため）。**応答待ちの最中には効かない。** 即座に止めたい場合は Claude Code 側の
-   セッションを中断する
+   セッションを中断する。**セッションを中断した場合は Stop フックが走らず run マーカー
+   （`.dev-workflow-run`）が削除されないまま残るため、続けて
+   `bash "${CLAUDE_PLUGIN_ROOT}/scripts/watchdog.sh" --stop` を実行して watchdog を止めること。**
+   放置すると watchdog は打ち切りに気付かず無活動検知（15分）・エスカレーション（30分ごと最大3回）を
+   続け、既に打ち切ったはずの run について「応答なし」の通知が届き続ける
 3. **再開する場合**: `/dev-workflow:run #<epic番号>` を再実行する。次の3点により、中断→再開でも
    安全に途中から続けられる（Task #54）。
    - **残タスクは open な Task issue から再計算される。** クローズ済みのタスクは

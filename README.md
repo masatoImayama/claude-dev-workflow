@@ -772,7 +772,7 @@ echo ".claude/.dev-workflow-*" >> .gitignore
    - `ツール実行中` → Docker側を疑う。`bash "${CLAUDE_PLUGIN_ROOT}/scripts/sandbox-exec.sh" --ls` でコンテナの状態を確認する
    - `モデル応答待ち` → API側を疑う
 2. **待つか打ち切るかを人間が判断する。** watchdog は自動では止めない
-3. **打ち切る場合**: `bash "${CLAUDE_PLUGIN_ROOT}/scripts/watchdog.sh" --abort "理由"` を実行する。これはエージェントが次にツールを呼んだ瞬間に効く（`heartbeat.sh pre` がフラグを見て拒否する経路のため）。**応答待ちの最中には効かない。** 即座に止めたい場合は Claude Code 側のセッションを中断する
+3. **打ち切る場合**: `bash "${CLAUDE_PLUGIN_ROOT}/scripts/watchdog.sh" --abort "理由"` を実行する。これはエージェントが次にツールを呼んだ瞬間に効く（`heartbeat.sh pre` がフラグを見て拒否する経路のため）。**応答待ちの最中には効かない。** 即座に止めたい場合は Claude Code 側のセッションを中断する。**セッションを中断した場合は Stop フックが走らず run マーカー（`.dev-workflow-run`）が削除されないまま残るため、続けて `bash "${CLAUDE_PLUGIN_ROOT}/scripts/watchdog.sh" --stop` を実行して watchdog を止めること。** 放置すると watchdog は打ち切りに気付かず無活動検知・エスカレーション通知を続けてしまう
 4. **再開する場合**: `/dev-workflow:run #<epic番号>` を再実行する。残タスクは open な Task issue から再計算され（クローズ済みタスクはやり直さない）、wave ブランチは残骸ブランチの番号から採番し直され、統合ゲートを通過済みのコミットは Epic ブランチ上に残り続ける（失われない）
 
 ### スリープ抑止

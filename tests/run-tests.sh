@@ -3762,6 +3762,23 @@ case "$RS_HANG_SECTION" in
     fail "SKILL.md: 「自動で打ち切って再投入することはできない」旨の記述がある（#51）" "$RS_HANG_SECTION" ;;
 esac
 
+# セッション中断後は watchdog.sh --stop を実行する旨の記述が存在すること（レビュー#62）。
+# セッションをプロセスごと中断するとStopフックが発火せずrunマーカーが残り続け、
+# watchdogが打ち切りに気付かないまま無活動検知・エスカレーション通知を出し続けるため。
+case "$RS_HANG_SECTION" in
+  *'watchdog.sh" --stop'*)
+    pass "SKILL.md: ハング時の節にセッション中断後の watchdog.sh --stop の指示がある（#62）" ;;
+  *)
+    fail "SKILL.md: ハング時の節にセッション中断後の watchdog.sh --stop の指示がある（#62）" "$RS_HANG_SECTION" ;;
+esac
+
+case "$RS_HANG_SECTION" in
+  *'Stop フックが走らず'*'run マーカー'*)
+    pass "SKILL.md: セッション中断時にStopフックが走らずrunマーカーが残る旨の説明がある（#62）" ;;
+  *)
+    fail "SKILL.md: セッション中断時にStopフックが走らずrunマーカーが残る旨の説明がある（#62）" "$RS_HANG_SECTION" ;;
+esac
+
 # ---------------------------------------------------------------------------
 # skills/run/SKILL.md: WAVE_NO の採番ロジックと中断→再開時の挙動の記述（Task #54）
 #
@@ -3967,6 +3984,23 @@ case "$CRS_HANG_SECTION" in
     pass "SKILL.md(codex): 「自動で打ち切って再投入することは実装しない」旨の記述がある（#53）" ;;
   *)
     fail "SKILL.md(codex): 「自動で打ち切って再投入することは実装しない」旨の記述がある（#53）" "$CRS_HANG_SECTION" ;;
+esac
+
+# セッション中断後は watchdog.sh --stop を実行する旨の記述が存在すること（レビュー#62）。
+# セッションをプロセスごと中断するとStopフックが発火せずrunマーカーが残り続け、
+# watchdogが打ち切りに気付かないまま無活動検知・エスカレーション通知を出し続けるため。
+case "$CRS_HANG_SECTION" in
+  *'watchdog.sh" --stop'*)
+    pass "SKILL.md(codex): ハング時の節にセッション中断後の watchdog.sh --stop の指示がある（#62）" ;;
+  *)
+    fail "SKILL.md(codex): ハング時の節にセッション中断後の watchdog.sh --stop の指示がある（#62）" "$CRS_HANG_SECTION" ;;
+esac
+
+case "$CRS_HANG_SECTION" in
+  *'Stop フックが走らず'*'run マーカー'*)
+    pass "SKILL.md(codex): セッション中断時にStopフックが走らずrunマーカーが残る旨の説明がある（#62）" ;;
+  *)
+    fail "SKILL.md(codex): セッション中断時にStopフックが走らずrunマーカーが残る旨の説明がある（#62）" "$CRS_HANG_SECTION" ;;
 esac
 
 # Claude Code版と挙動が同じ（アダプタ間に機能差を作らない）旨の記述が
@@ -6135,6 +6169,33 @@ if grep -Fq 'DEV_WORKFLOW_WATCHDOG_IDLE_SEC' "$DOC55_README" \
 else
   fail "README.md: watchdogの環境変数一覧がある"
 fi
+
+# セッション中断後は watchdog.sh --stop を実行する旨の記述が存在すること（レビュー#62）。
+# セッションをプロセスごと中断するとStopフックが発火せずrunマーカーが残り続け、
+# watchdogが打ち切りに気付かないまま無活動検知・エスカレーション通知を出し続けるため。
+DOC62_README_HANG_SECTION="$(awk '/^### ハングしたときの対処/{f=1} /^### スリープ抑止/{f=0} f' "$DOC55_README")"
+
+if [ -n "$DOC62_README_HANG_SECTION" ]; then
+  pass "README.md: 「ハングしたときの対処」の節が存在する（#62）"
+else
+  fail "README.md: 「ハングしたときの対処」の節が存在する（#62）" "節が見つかりません"
+fi
+
+case "$DOC62_README_HANG_SECTION" in
+  *'watchdog.sh" --stop'*)
+    pass "README.md: ハング時の節にセッション中断後の watchdog.sh --stop の指示がある（#62）" ;;
+  *)
+    fail "README.md: ハング時の節にセッション中断後の watchdog.sh --stop の指示がある（#62）" \
+      "$DOC62_README_HANG_SECTION" ;;
+esac
+
+case "$DOC62_README_HANG_SECTION" in
+  *'Stop フックが走らず'*'run マーカー'*)
+    pass "README.md: セッション中断時にStopフックが走らずrunマーカーが残る旨の説明がある（#62）" ;;
+  *)
+    fail "README.md: セッション中断時にStopフックが走らずrunマーカーが残る旨の説明がある（#62）" \
+      "$DOC62_README_HANG_SECTION" ;;
+esac
 
 # --- 生成物（agents/generator.md 等）に正本の追記内容が反映されている ---
 
