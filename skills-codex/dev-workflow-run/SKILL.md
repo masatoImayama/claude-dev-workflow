@@ -155,6 +155,21 @@ services:
 bash "${CLAUDE_PLUGIN_ROOT}/scripts/notify-slack.sh" run-start "Epic #<epic番号>"
 ```
 
+run マーカーが置かれた直後に、ハング・スリープを検知する watchdog を起動する（`--start`
+自体は自己デタッチして**即座に返る**。監視ループはプロセス外で動く常駐プロセスに移る）。
+watchdog は run マーカー（`.claude/.dev-workflow-run`）の消失を自己終了条件の1つにしているため、
+**マーカーより後に起動すること**（先に起動するとマーカーがまだ無い一瞬で誤って自己終了しうる）:
+
+```bash
+bash "${CLAUDE_PLUGIN_ROOT}/scripts/watchdog.sh" --start --epic "$EPIC_NUM" --label "Epic #<epic番号>"
+```
+
+**Claude Code 版（`skills/run/SKILL.md`）と挙動は完全に同じである。** watchdog は無活動・
+ウェーブ予算超過を検知して通知するだけで、**自動でエージェントを打ち切ることはしない**
+（Epic #42「決定事項」参照。`codex exec` はプロセス外から中断できる技術的余地はあるが、
+Claude Code のサブエージェントには同じことが原理的にできないため、**アダプタ間に機能差を
+作らない**方針で両者とも「検知して通知するだけ」に揃えている）。
+
 ## 自律ループ（`lanes=1` 固定のウェーブ実行）
 
 **ユーザー確認なしで**、以下のサイクルをタスクが無くなるまで繰り返す。
@@ -162,7 +177,17 @@ bash "${CLAUDE_PLUGIN_ROOT}/scripts/notify-slack.sh" run-start "Epic #<epic番�
 
 ```bash
 SKIPPED_CSV=""   # 3回失敗して見送ったタスク番号のカンマ区切り。ループを回すうちに積み上げる
-WAVE_NO=0        # wave ブランチ名に使う通し番号。1タスク=1レーン=1ウェーブとして扱う
+
+# WAVE_NO: wave ブランチ名（wave/${EPIC_NUM}/${WAVE_NO}）の通し番号。1タスク=1レーン=1ウェーブ
+# として扱う。0 から始めてはならない（Task #54）。中断→再開（このスキルの再実行）では
+# セッション変数が失われるため 0 から数え直すことになるが、`wave/${EPIC_NUM}/*` ブランチは
+# ローカルに残り続ける（origin へ push しない設計）。0 から始めると前回の残骸 wave ブランチを
+# そのまま掴んでしまう。既存の wave ブランチの番号の最大値から始めることで、再開時も必ず
+# 新しい wave ブランチが使われる（残骸を掴んだ場合も Step 4 の `merge-lane.sh --create` が
+# tip 不一致を検出し exit 1 で拒否する）。
+WAVE_NO=$(git for-each-ref --format='%(refname:short)' "refs/heads/wave/${EPIC_NUM}/*" \
+  | sed "s#^wave/${EPIC_NUM}/##" | sort -n | tail -1)
+WAVE_NO="${WAVE_NO:-0}"
 ```
 
 ### Step 1: 次のタスクを依存グラフから選定する
@@ -202,6 +227,14 @@ git checkout -B "$LANE_BRANCH" "$WAVE_BASE"
 ```
 
 `WAVE_BASE` は、このタスク（＝このウェーブ唯一のレーン）が分岐する唯一の正しい起点である。
+
+ウェーブ予算の監視（watchdog）に、このウェーブの内訳を伝える（generator を起動する前に）。
+**Codex は `lanes=1` 固定の縮退版なので、1タスク = 1ウェーブとして扱う**:
+
+```bash
+bash "${CLAUDE_PLUGIN_ROOT}/scripts/watchdog.sh" --wave --epic "$EPIC_NUM" \
+  --wave-no "$WAVE_NO" --tasks "<番号>"
+```
 
 ### Step 3: generator サブエージェントで実装
 
@@ -325,7 +358,14 @@ issue にその旨をコメントする（推移的に伝播する）。**`plan-
 ```bash
 # 常駐コンテナの削除（epic 単位。キャッシュ volume は次の Epic のために残す）
 bash "${CLAUDE_PLUGIN_ROOT}/scripts/sandbox-exec.sh" --epic "$EPIC_NUM" --down
+
+# watchdog の停止（正常終了・異常終了を問わず必ず実行する。--down と同じ強さで必須）
+bash "${CLAUDE_PLUGIN_ROOT}/scripts/watchdog.sh" --stop
 ```
+
+watchdog は run マーカーの消失でも自己終了するが、消失までに1 tick分のタイムラグがある
+（既定60秒）ため、後続処理へ進む前に `--stop` で確実に止める。**これを怠ると、run が
+終了した後も無活動を検知し続けて的外れな stall 通知が届く。**
 
 **キャッシュ volume は削除しない。** 次の Epic でそのまま効くのが利点である。明示的に消したい
 場合のみ `--reset-cache` を使う（**作用範囲は epic ではなくリポジトリ全体**。同一リポジトリの
@@ -337,6 +377,49 @@ bash "${CLAUDE_PLUGIN_ROOT}/scripts/sandbox-exec.sh" --epic "$EPIC_NUM" --down
 bash "${CLAUDE_PLUGIN_ROOT}/scripts/sandbox-exec.sh" --ls          # 管理コンテナを一覧表示（他リポジトリ分も含む）
 bash "${CLAUDE_PLUGIN_ROOT}/scripts/sandbox-exec.sh" --down --all   # 現在のリポジトリに属する管理コンテナを全て削除
 ```
+
+## ハングしたときに人間がすること
+
+watchdog は無活動を検知しても**自動では打ち切らない**（Epic #42「決定事項」参照）。
+Slack に `:rotating_light: 応答なし` が届いたら、人間が次の手順で判断・対処する。
+
+1. **通知本文の `state` を見る**（`scripts/watchdog.sh` の通知文言がそのまま切り分けの根拠になる）
+   - `ツール実行中に停止` → サンドボックス（Docker）側を疑う。
+     `bash "${CLAUDE_PLUGIN_ROOT}/scripts/sandbox-exec.sh" --ls` でコンテナの状態を確認する
+   - `モデルの応答待ちで停止` → API 側のスロットリングの疑い。待つか、打ち切るかを判断する
+2. **打ち切る場合**: `bash "${CLAUDE_PLUGIN_ROOT}/scripts/watchdog.sh" --abort "理由"` を実行する。
+   **Claude Code版とは異なり、これはツール呼び出しを強制的にブロックしない。** Codex の
+   `PreToolUse` フックは `systemMessage` のみに対応し `continue` は読まないため
+   （`docs/dev-workflow-multi-vendor-guide.md` §3.5.2）、`heartbeat.sh pre` が次にツールを
+   呼んだ瞬間に打ち切り理由入りの `systemMessage` を返しても、そのツール呼び出し自体は
+   そのまま実行される。**モデルがそのメッセージを読んで自発的に停止することを期待する
+   ソフトな打ち切り依頼にとどまる。** 確実に・即座に止めたい場合は Codex 側の
+   セッション（`codex exec` プロセス。無人ループなら `run-loop.sh` ごと）を人間が中断する。
+   **セッションを中断した場合は Stop フックが走らず run マーカー（`.dev-workflow-run`）が
+   削除されないまま残るため、続けて
+   `bash "${CLAUDE_PLUGIN_ROOT}/scripts/watchdog.sh" --stop` を実行して watchdog を止めること。**
+   放置すると watchdog は打ち切りに気付かず無活動検知（15分）・エスカレーション（30分ごと最大3回）を
+   続け、既に打ち切ったはずの run について「応答なし」の通知が届き続ける
+3. **再開する場合**: `dev-workflow-run` スキルを再実行する。次の3点により、中断→再開でも
+   安全に途中から続けられる（Task #54）。
+   - **残タスクは open な Task issue から再計算される。** クローズ済みのタスクは
+     `plan-waves.sh` の対象から自然に外れるため、完了分をやり直すことはない
+   - **wave ブランチは採番し直される。** `WAVE_NO` はセッション変数のため再実行のたびに
+     失われるが、上記「自律ループ」節のとおり既存の `wave/${EPIC_NUM}/*` ブランチの番号の
+     最大値から数え直すため、前回の残骸ブランチを再利用しない。万一 Step 4 の
+     `merge-lane.sh --create` が残骸 wave ブランチ（tip が `--expected-base` と不一致）を
+     掴んだ場合は exit 1 で拒否され、Epic ブランチ・wave ブランチのどちらも変更されない
+   - **取り込み済みのコミットは失われない。** 統合ゲートを通過して Epic ブランチへ
+     `git merge --ff-only` 済みのコミットは Epic ブランチ上に残り続ける
+
+**Codex 側でも「自動で打ち切って再投入する」ことは実装しない。** `adapters/codex/run-loop.sh`
+は `codex exec` を子プロセスとして起動しているため、プロセス外から TERM/KILL を送るハード
+タイムアウトと自動再投入は技術的には実装できる。しかし Claude Code 側ではサブエージェントが
+同一プロセス内の API 呼び出しであり、**同じことが原理的にできない**（Epic #42「2. サブ
+エージェントを外部から中断する手段は無い」参照）。Codex だけに自動打ち切りを入れると
+「どちらの CLI で回したか」で挙動と運用手順が変わってしまうため、**アダプタ間に機能差を
+作らない**方針であえて実装しない。watchdog にできるのは検知して通知することまでであり、
+打ち切りの主体は常に人間である。
 
 ## Epic一括レビュー（全タスク完了後・PR作成前）
 

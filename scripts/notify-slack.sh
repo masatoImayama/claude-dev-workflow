@@ -7,6 +7,18 @@
 #   stop                      — hook用。ターン終了時。自律実行中なら「中断」として通知
 #   run-start   <ラベル>      — skill用。自律実行の開始を記録（通知はしない）
 #   run-complete <サマリー>   — skill用。自律実行の完全な完了を通知
+#   stall            <詳細>   — watchdog用。無活動しきい値を超えた（メンション付き）
+#   stall-recovered  <詳細>   — watchdog用。ストール後に活動が戻った
+#   sleep-gap        <詳細>   — watchdog用。tickの実経過が異常に飛んだ（スリープ痕跡）
+#   budget           <詳細>   — watchdog用。ウェーブが予算を超えた（メンション付き）
+#   sleep-inhibit-warn <詳細> — watchdog用。スリープ抑止に失敗、または対応する手段が無い
+#                               （run中でもPCがスリープしうる状態。初回のみ通知される）
+#
+# watchdogイベントの<詳細>は呼び出し側（watchdog.sh）が組み立てた文字列をそのまま本文に載せる。
+# ストール警告では「ツール実行中に停止（state=pre）」「モデルの応答待ちで停止（state=post）」を
+# 呼び出し側が文言に含めることで、原因の切り分けができる本文にする（Epic #42 受け入れ条件2）。
+# sleep-gapはstallとは別イベントなので、スリープ復帰をストールとして誤報することはない
+# （Epic #42 受け入れ条件3）。
 #
 # 自律実行中は .claude/.dev-workflow-run をマーカーとして置き、
 # run-complete に到達せずStopした場合を「中断」として区別する。
@@ -22,8 +34,14 @@
 #   DEV_WORKFLOW_NOTIFY_COOLDOWN — 同じ通知を抑止する秒数（既定: 600、0で無効）
 #   DEV_WORKFLOW_NOTIFY_DEBUG    — "1" で受け取ったNotificationのpayloadを
 #                                  .claude/.dev-workflow-notify.log に記録する
+#   DEV_WORKFLOW_NOTIFY_SINK     — 設定されていればcurlを呼ばず、組み立てた本文(JSON)を
+#                                  このパスへ書き出す（テスト用。Slackへは送信しない）
 
 set -u
+
+NOTIFY_SLACK_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=./lib/marker-root.sh
+. "${NOTIFY_SLACK_DIR}/lib/marker-root.sh"
 
 EVENT="${1:-unknown}"
 ARG="${2:-}"
@@ -76,18 +94,9 @@ CWD="$(json_field cwd)"
 # 自律実行中であることを示すマーカー。
 # skillはworktree（.claude/worktrees/<epicN>）内から実行されるが、hookのcwdはメインリポの
 # ルートなので、両者が同じファイルを見るようメインリポのルートに固定する
-MARKER_ROOT="$CWD"
-GIT_COMMON="$(git -C "$CWD" rev-parse --git-common-dir 2>/dev/null || true)"
-if [ -n "$GIT_COMMON" ]; then
-  case "$GIT_COMMON" in
-    /*|[A-Za-z]:*) ;;                       # 絶対パスならそのまま
-    *) GIT_COMMON="$CWD/$GIT_COMMON" ;;     # 相対パスならcwd基準で解決
-  esac
-  if ! MAIN_ROOT="$(cd "$GIT_COMMON/.." 2>/dev/null && pwd)"; then
-    MAIN_ROOT=""
-  fi
-  [ -n "$MAIN_ROOT" ] && MARKER_ROOT="$MAIN_ROOT"
-fi
+# （解決処理は scripts/lib/marker-root.sh に共通化してある）
+MARKER_ROOT="$(dev_workflow_marker_root "$CWD")"
+[ -n "$MARKER_ROOT" ] || MARKER_ROOT="$CWD"
 RUN_MARKER="$MARKER_ROOT/.claude/.dev-workflow-run"
 
 # 通知が多すぎるときに、実際どのpayloadで発火しているかを追えるようにする
@@ -188,6 +197,33 @@ $(last_assistant_message 2>/dev/null || true)"
       DETAIL="$(last_assistant_message 2>/dev/null || true)"
     fi
     ;;
+  stall)
+    # 無活動しきい値超過。呼び出し側（watchdog.sh）が「ツール実行中に停止」
+    # 「モデルの応答待ちで停止」のどちらかを詳細文字列に含めて渡す
+    HEADLINE=":rotating_light: 応答なし"
+    DETAIL="$ARG"
+    ;;
+  stall-recovered)
+    HEADLINE=":arrow_forward: 応答が再開"
+    DETAIL="$ARG"
+    ;;
+  sleep-gap)
+    # スリープ復帰の痕跡。stallとは別イベントなので、通知を見ればストールとの誤報と
+    # 区別できる
+    HEADLINE=":zzz: スリープ痕跡"
+    DETAIL="$ARG"
+    ;;
+  budget)
+    HEADLINE=":hourglass_flowing_sand: 想定時間超過"
+    DETAIL="$ARG"
+    ;;
+  sleep-inhibit-warn)
+    # スリープ抑止に失敗した、または対応する手段が無い場合の警告。同じ警告を毎tick
+    # 送るとSlackを埋めるため、初回のみ呼び出す（watchdog.sh側でWD_STATE_INHIBIT_WARNEDを
+    # 見て制御している。ここでは受け取った通知をそのまま送るだけ）
+    HEADLINE=":warning: スリープ抑止に失敗"
+    DETAIL="$ARG"
+    ;;
   *)
     HEADLINE=":information_source: $EVENT"
     ;;
@@ -221,14 +257,29 @@ $DETAIL}")}},
   {\"type\":\"context\",\"elements\":[{\"type\":\"mrkdwn\",\"text\":$(json_escape "$CONTEXT")}]}
 ]}"
 
-# 本文は必ずファイル経由で渡す。
-# Git for Windows の curl はネイティブビルドのため、コマンドライン引数として渡した
-# UTF-8 の日本語が cp932 に変換されて壊れる（--data は使わない）。
-BODY_FILE="$(mktemp -t slack-notify.XXXXXX)" || exit 0
-trap 'rm -f "$BODY_FILE"' EXIT
-printf '%s' "$BODY" > "$BODY_FILE"
+# 実送信は1箇所に閉じ込める。DEV_WORKFLOW_NOTIFY_SINK（ファイルパス）が設定されていれば
+# curlを呼ばず、組み立てた本文をそのファイルへ書き出すだけにする。
+# これによりテストがSlackへ実送信せずペイロードを検証できる。
+send_to_slack() {
+  local body="$1"
 
-curl -sS -m 10 -X POST -H 'Content-Type: application/json; charset=utf-8' \
-  --data-binary @"$BODY_FILE" "$WEBHOOK_URL" > /dev/null 2>&1
+  if [ -n "${DEV_WORKFLOW_NOTIFY_SINK:-}" ]; then
+    printf '%s' "$body" > "$DEV_WORKFLOW_NOTIFY_SINK"
+    return 0
+  fi
+
+  # 本文は必ずファイル経由で渡す。
+  # Git for Windows の curl はネイティブビルドのため、コマンドライン引数として渡した
+  # UTF-8 の日本語が cp932 に変換されて壊れる（--data は使わない）。
+  local body_file
+  body_file="$(mktemp -t slack-notify.XXXXXX)" || return 0
+  trap 'rm -f "$body_file"' RETURN
+  printf '%s' "$body" > "$body_file"
+
+  curl -sS -m 10 -X POST -H 'Content-Type: application/json; charset=utf-8' \
+    --data-binary @"$body_file" "$WEBHOOK_URL" > /dev/null 2>&1
+}
+
+send_to_slack "$BODY"
 
 exit 0

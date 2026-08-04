@@ -23,6 +23,8 @@
 # --lane-branch: 取り込むレーンのブランチ名。
 # --task: ログ表示用（省略可）。呼び出し側の issue 番号をメッセージに出すだけで、動作は変えない。
 # --create: wave ブランチが存在しなければ --expected-base から作成する。
+#           既に存在する場合、その tip が --expected-base と一致すれば冪等に続行し、
+#           一致しなければ前回の残骸とみなして exit 1 で拒否する（Task #54）。
 #
 # 実行前提: 呼び出し側の cwd は epic worktree を想定する（実行中に wave ブランチを checkout する）。
 #
@@ -132,6 +134,22 @@ if ! git rev-parse --verify -q "refs/heads/${WAVE_BRANCH}" >/dev/null 2>&1; then
     echo "wave ブランチを作成しました: ${WAVE_BRANCH} (${EXPECTED_BASE_SHA})"
   else
     echo "ERROR: wave ブランチが見つかりません: ${WAVE_BRANCH}（--create で作成できます）" >&2
+    exit 1
+  fi
+elif [ "$CREATE_MODE" -eq 1 ]; then
+  # --create 指定で wave ブランチが既に存在するケース。中断→再開で WAVE_NO が
+  # 採番し直されず、前回の残骸 wave ブランチを掴んでしまう事故を防ぐ（Task #54）。
+  # tip が --expected-base と一致するなら「これから取り込む前の正しい状態」なので
+  # 冪等に続行する。一致しなければ前回の残骸として拒否し、epic/wave どちらのブランチも
+  # 変更せずに終了する。
+  WAVE_BRANCH_TIP_SHA="$(git rev-parse --verify -q "refs/heads/${WAVE_BRANCH}")"
+  if [ "$WAVE_BRANCH_TIP_SHA" != "$EXPECTED_BASE_SHA" ]; then
+    echo "ERROR: wave ブランチが前回の残骸として残っています（--create）: ${WAVE_BRANCH}" >&2
+    echo "  既存の wave ブランチ tip: ${WAVE_BRANCH_TIP_SHA}" >&2
+    git log -1 --oneline "$WAVE_BRANCH_TIP_SHA" >&2
+    echo "  期待していたベース（--expected-base）: ${EXPECTED_BASE_SHA}" >&2
+    git log -1 --oneline "$EXPECTED_BASE_SHA" >&2
+    echo "対処: run 側で WAVE_NO を採番し直し、新しい wave ブランチ名で再実行してください" >&2
     exit 1
   fi
 fi

@@ -526,6 +526,104 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+# ケース7c: dev_workflow_marker_root（マーカー置き場の解決・外部プロセス0、Task #43）
+#
+# heartbeat.sh（フックから高頻度に呼ばれる。Phase 2 で追加予定）の前提として、この関数は
+# 解決処理の中で外部プロセスを一切起動しない。worktree の .git は
+# `gitdir: <メインリポ>/.git/worktrees/<名前>` という1行ファイルなので bash の read だけで
+# 解析できる（Epic #42 仕様書「3. ファイルと責務」）。
+#
+# ---------------------------------------------------------------------------
+
+echo "== dev_workflow_marker_root（マーカー置き場の解決・外部プロセス0・Task #43） =="
+
+MARKER_ROOT_LIB="${REPO_ROOT}/scripts/lib/marker-root.sh"
+
+# shellcheck source=../scripts/lib/marker-root.sh
+. "$MARKER_ROOT_LIB"
+
+canon_root() {
+  # canon_root <dir>  ディレクトリの正規化された絶対パスを返す（pwd -W があれば使う）
+  (
+    cd "$1" 2>/dev/null || exit 1
+    pwd -W 2>/dev/null || pwd
+  )
+}
+
+# Windows では mktemp が /tmp 配下（MSYS のエイリアス）を返すことがあり、これは
+# dev_workflow_marker_root の -d .git 分岐（渡された表現をそのまま返す）と、
+# .git ファイル分岐（git 自身が書いた実パスを読む。Windows では常にドライブレター形式）とで
+# 表現が食い違う原因になる（実機で確認済み。ドライブレター形式どうしの揺れは
+# _dev_workflow_marker_root_normalize が吸収するが、/tmp エイリアスの実パスへの
+# 解決は対象外＝コマンド置換なしでは原理的にできない）。
+# そのため一時リポジトリのパスは最初に canon_root で実パスへ正規化してから使う。
+MR_REPO="$(canon_root "$(make_temp_repo)")"
+MR_EXPECTED="$MR_REPO"
+
+assert_eq "dev_workflow_marker_root: メインリポのルートで正しいパスを返す" \
+  "$MR_EXPECTED" "$(dev_workflow_marker_root "$MR_REPO")"
+
+mkdir -p "${MR_REPO}/sub/dir"
+assert_eq "dev_workflow_marker_root: メインリポのサブディレクトリから呼んでもルートを返す" \
+  "$MR_EXPECTED" "$(dev_workflow_marker_root "${MR_REPO}/sub/dir")"
+
+MR_EPIC_WT="${MR_REPO}/.claude/worktrees/epic9"
+make_worktree "$MR_REPO" "$MR_EPIC_WT" "mr-epic-branch"
+assert_eq "dev_workflow_marker_root: epic worktree（.claude/worktrees/epicN）からメインリポのルートを返す" \
+  "$MR_EXPECTED" "$(dev_workflow_marker_root "$MR_EPIC_WT")"
+
+MR_AGENT_WT="${MR_REPO}/.claude/worktrees/agent-x"
+make_worktree "$MR_REPO" "$MR_AGENT_WT" "mr-agent-branch"
+assert_eq "dev_workflow_marker_root: agent worktree（.claude/worktrees/agent-xxx）からメインリポのルートを返す" \
+  "$MR_EXPECTED" "$(dev_workflow_marker_root "$MR_AGENT_WT")"
+
+MR_NONGIT="$(mktemp -d "${TMPDIR:-/tmp}/dw-test-nongit.XXXXXX")"
+MR_NONGIT_OUT="$(dev_workflow_marker_root "$MR_NONGIT")"
+MR_NONGIT_EXIT=$?
+assert_eq "dev_workflow_marker_root: git 管理外のディレクトリでは空文字を返す" "" "$MR_NONGIT_OUT"
+assert_exit_code "dev_workflow_marker_root: git 管理外のディレクトリでは非0終了する" 1 "$MR_NONGIT_EXIT"
+
+MR_OVERRIDE_VALUE="/custom/marker/root/for/test"
+MR_OVERRIDE_OUT="$(DEV_WORKFLOW_MARKER_ROOT="$MR_OVERRIDE_VALUE" dev_workflow_marker_root "$MR_REPO")"
+assert_eq "dev_workflow_marker_root: DEV_WORKFLOW_MARKER_ROOT が最優先で使われる" \
+  "$MR_OVERRIDE_VALUE" "$MR_OVERRIDE_OUT"
+
+# CLAUDE_PROJECT_DIR はそのまま使う仕様（正規化しない）なので、既に実パス化済みの
+# $MR_REPO をそのまま渡す。
+MR_CLAUDE_PROJECT_OUT="$(CLAUDE_PROJECT_DIR="$MR_REPO" dev_workflow_marker_root "${MR_REPO}/sub/dir")"
+assert_eq "dev_workflow_marker_root: CLAUDE_PROJECT_DIR 直下に .git があればそれを使う" \
+  "$MR_EXPECTED" "$MR_CLAUDE_PROJECT_OUT"
+
+# --- 解決処理が外部コマンド・コマンド置換を一切起動していないことの静的確認 ---
+# コメント行は対象外にし、単語境界での一致だけを見る
+# （"gitdir:" 等の識別子内の "git" 部分文字列や、算術展開 $(( )) の "$(" を
+# 誤検知しないよう、"git "は後ろに空白を要求し、"$(" は直後が "(" でないものだけを見る）
+MR_FORBIDDEN_HITS="$(grep -v '^[[:space:]]*#' "$MARKER_ROOT_LIB" \
+  | grep -E '(^|[^A-Za-z0-9_])(git|sed|dirname|basename)[[:space:]]|\$\([^(]|`' || true)"
+if [ -z "$MR_FORBIDDEN_HITS" ]; then
+  pass "dev_workflow_marker_root: 解決処理が外部コマンド・コマンド置換を使っていない"
+else
+  fail "dev_workflow_marker_root: 解決処理が外部コマンド・コマンド置換を使っていない" "$MR_FORBIDDEN_HITS"
+fi
+
+# --- 性能: 100回呼び出しが十分速いこと（外部プロセス0の下地。受け入れ条件10） ---
+MR_PERF_START=""
+printf -v MR_PERF_START '%(%s)T' -1
+MR_PERF_I=0
+while [ "$MR_PERF_I" -lt 100 ]; do
+  dev_workflow_marker_root "$MR_EPIC_WT" >/dev/null
+  MR_PERF_I=$((MR_PERF_I + 1))
+done
+MR_PERF_END=""
+printf -v MR_PERF_END '%(%s)T' -1
+MR_PERF_ELAPSED=$((MR_PERF_END - MR_PERF_START))
+if [ "$MR_PERF_ELAPSED" -lt 2 ]; then
+  pass "dev_workflow_marker_root: 100回呼び出しが2秒未満（実測 ${MR_PERF_ELAPSED}s、外部プロセス0の下地・受け入れ条件10）"
+else
+  fail "dev_workflow_marker_root: 100回呼び出しが2秒未満" "実測 ${MR_PERF_ELAPSED}s"
+fi
+
+# ---------------------------------------------------------------------------
 # ケース8: --ls / --down --all（偽 docker で label・マウント元を注入し、実際の docker を起動せず検証する）
 #
 # 偽 docker は DW_TEST_MANIFEST（name|managed|repo|epic|image|status|created|mount_source|root_label
@@ -3118,6 +3216,81 @@ ML15_PORCELAIN_AFTER="$(cd "$ML_REPO15" && git status --porcelain)"
 assert_eq "ケース15: 未コミットのローカル変更（file.txt）がそのまま残っている（abort による破棄が起きていない）" \
   "$ML15_PORCELAIN_BEFORE" "$ML15_PORCELAIN_AFTER"
 
+# --- ケース16（Task #54）: --create 指定時に残骸 wave ブランチ（tip が --expected-base と
+#     不一致）が既に存在する場合、exit 1 で拒否され、呼び出し元でチェックアウトしていた
+#     ブランチ（epic ブランチ相当）も wave ブランチも一切動かないこと。出力に既存 tip・
+#     期待ベース・対処（WAVE_NO の採番し直し）が含まれること。 ---
+ML_REPO16="$(make_temp_repo)"
+ML16_DEFAULT_BRANCH="$(cd "$ML_REPO16" && git rev-parse --abbrev-ref HEAD)"
+ml_commit_file "$ML_REPO16" "base.txt" "wave base\n" "wave base commit"
+ML16_EXPECTED_BASE="$(ml_head_of "$ML_REPO16" HEAD)"
+
+# 前回セッションの残骸を模す: EXPECTED_BASE から分岐した別コミットを tip に持つ
+# wave ブランチ（checkout はしない。ml_branch_from を使うと現在のブランチが切り替わって
+# しまうため、直接 `git branch` で作る）
+ml_branch_from "$ML_REPO16" "stale-source" "$ML16_EXPECTED_BASE"
+ml_commit_file "$ML_REPO16" "stale.txt" "stale\n" "stale unrelated commit (previous session)"
+ML16_STALE_TIP="$(ml_head_of "$ML_REPO16" stale-source)"
+(cd "$ML_REPO16" && git branch "wave/epicT/1" "$ML16_STALE_TIP") >/dev/null 2>&1
+
+# 呼び出し元（epic ブランチ相当）へ戻し、この時点のHEADを記録する
+(cd "$ML_REPO16" && git checkout -q "$ML16_DEFAULT_BRANCH") >/dev/null 2>&1
+ML16_CALLER_HEAD_BEFORE="$(ml_head_of "$ML_REPO16" "$ML16_DEFAULT_BRANCH")"
+ML16_WAVE_HEAD_BEFORE="$(ml_head_of "$ML_REPO16" "wave/epicT/1")"
+
+ml_branch_from "$ML_REPO16" "lane-y" "$ML16_EXPECTED_BASE"
+ml_commit_file "$ML_REPO16" "y.txt" "lane y\n" "lane y change"
+
+ML16_OUT="$(run_merge_lane "$ML_REPO16" --wave-branch "wave/epicT/1" --expected-base "$ML16_EXPECTED_BASE" --lane-branch lane-y --task 54 --create 2>&1)"
+ML16_EXIT=$?
+assert_exit_code "ケース16: --create で tip 不一致の残骸 wave ブランチは exit 1" 1 "$ML16_EXIT"
+
+ML16_CALLER_HEAD_AFTER="$(ml_head_of "$ML_REPO16" "$ML16_DEFAULT_BRANCH")"
+ML16_WAVE_HEAD_AFTER="$(ml_head_of "$ML_REPO16" "wave/epicT/1")"
+assert_eq "ケース16: 呼び出し元ブランチ（epic ブランチ相当）の HEAD が動かない" "$ML16_CALLER_HEAD_BEFORE" "$ML16_CALLER_HEAD_AFTER"
+assert_eq "ケース16: wave ブランチの tip が動かない（残骸のまま）" "$ML16_WAVE_HEAD_BEFORE" "$ML16_WAVE_HEAD_AFTER"
+
+case "$ML16_OUT" in
+  *"$ML16_STALE_TIP"*) pass "ケース16: 出力に既存 wave ブランチの tip が含まれる" ;;
+  *) fail "ケース16: 出力に既存 wave ブランチの tip が含まれる" "output=[${ML16_OUT}]" ;;
+esac
+
+case "$ML16_OUT" in
+  *"$ML16_EXPECTED_BASE"*) pass "ケース16: 出力に期待していたベース（--expected-base）が含まれる" ;;
+  *) fail "ケース16: 出力に期待していたベース（--expected-base）が含まれる" "output=[${ML16_OUT}]" ;;
+esac
+
+case "$ML16_OUT" in
+  *"WAVE_NO"*) pass "ケース16: 出力に対処（WAVE_NO の採番し直し）が含まれる" ;;
+  *) fail "ケース16: 出力に対処（WAVE_NO の採番し直し）が含まれる" "output=[${ML16_OUT}]" ;;
+esac
+
+# --- ケース17（Task #54）: --create 指定時に既存 wave ブランチの tip が --expected-base と
+#     一致する場合（前回まさに --create で作っただけで、まだレーンを取り込んでいない状態）は
+#     残骸扱いにせず、従来どおり取り込みが成功すること（冪等性） ---
+ML_REPO17="$(make_temp_repo)"
+ml_commit_file "$ML_REPO17" "base.txt" "wave base\n" "wave base commit"
+ML17_EXPECTED_BASE="$(ml_head_of "$ML_REPO17" HEAD)"
+
+# 前回の --create で作られたが、まだ何も取り込んでいない wave ブランチ（tip = EXPECTED_BASE）
+(cd "$ML_REPO17" && git branch "wave/epicT/1" "$ML17_EXPECTED_BASE") >/dev/null 2>&1
+
+ml_branch_from "$ML_REPO17" "lane-z" "$ML17_EXPECTED_BASE"
+ml_commit_file "$ML_REPO17" "z.txt" "lane z\n" "lane z change"
+ML17_LANE_HEAD="$(ml_head_of "$ML_REPO17" lane-z)"
+
+ML17_OUT="$(run_merge_lane "$ML_REPO17" --wave-branch "wave/epicT/1" --expected-base "$ML17_EXPECTED_BASE" --lane-branch lane-z --task 54 --create)"
+ML17_EXIT=$?
+assert_exit_code "ケース17: --create で tip 一致の既存 wave ブランチは従来どおり exit 0（冪等性）" 0 "$ML17_EXIT"
+
+ML17_WAVE_HEAD="$(ml_head_of "$ML_REPO17" "wave/epicT/1")"
+assert_eq "ケース17: 冪等時は取り込みが成功し wave HEAD がレーンの HEAD と一致する" "$ML17_LANE_HEAD" "$ML17_WAVE_HEAD"
+
+case "$ML17_OUT" in
+  *"取り込み成功"*) pass "ケース17: 出力に取り込み成功のメッセージが含まれる" ;;
+  *) fail "ケース17: 出力に取り込み成功のメッセージが含まれる" "output=[${ML17_OUT}]" ;;
+esac
+
 # ---------------------------------------------------------------------------
 # adapters/codex/run-loop.sh: 統合ゲートが全テストを実行すること（回帰防止 #37）
 #
@@ -3238,6 +3411,228 @@ case "$RL_WARN_LOOP_ONELINE" in
 esac
 
 # ---------------------------------------------------------------------------
+# adapters/codex/run-loop.sh: watchdog / heartbeat の結線（Task #53）
+#
+# Epic #42 決定事項4: 両アダプタとも「検知して通知するだけ」に揃える（ハードタイムアウト・
+# 自動再投入は実装しない）。--start は run-start より後、--wave は generator 起動前、
+# --stop は正常終了・異常終了を問わず必ず通ること（trap ... EXIT）を検証する。
+# ---------------------------------------------------------------------------
+
+echo ""
+echo "== adapters/codex/run-loop.sh（watchdog結線・回帰防止 #53） =="
+
+RL_FULL_SRC="$(cat "$RUN_LOOP_SCRIPT")"
+
+# --start は notify-slack.sh run-start より後にあること（run マーカーより先に watchdog を
+# 起動すると自己終了条件を誤検知しうるため）
+RL_RUN_START_LINE="$(grep -n 'notify-slack.sh" run-start' "$RUN_LOOP_SCRIPT" | head -1 | cut -d: -f1)"
+RL_WD_START_LINE="$(grep -n 'watchdog.sh" --start' "$RUN_LOOP_SCRIPT" | head -1 | cut -d: -f1)"
+if [ -n "$RL_RUN_START_LINE" ] && [ -n "$RL_WD_START_LINE" ] && [ "$RL_WD_START_LINE" -gt "$RL_RUN_START_LINE" ]; then
+  pass "run-loop.sh: watchdog.sh --start の呼び出しが notify-slack.sh run-start より後にある（#53）"
+else
+  fail "run-loop.sh: watchdog.sh --start の呼び出しが notify-slack.sh run-start より後にある（#53）" \
+    "run-start行=${RL_RUN_START_LINE:-なし} --start行=${RL_WD_START_LINE:-なし}"
+fi
+
+# --wave は LANE_BRANCH 確定後・generator 起動（run_agent generator）前にあること
+RL_WD_WAVE_LINE="$(grep -n 'watchdog.sh" --wave' "$RUN_LOOP_SCRIPT" | head -1 | cut -d: -f1)"
+RL_LANE_BRANCH_LINE="$(grep -n 'LANE_BRANCH="task/' "$RUN_LOOP_SCRIPT" | head -1 | cut -d: -f1)"
+RL_RUN_AGENT_GEN_LINE="$(grep -n 'run_agent generator' "$RUN_LOOP_SCRIPT" | head -1 | cut -d: -f1)"
+if [ -n "$RL_WD_WAVE_LINE" ] && [ -n "$RL_LANE_BRANCH_LINE" ] && [ -n "$RL_RUN_AGENT_GEN_LINE" ] \
+   && [ "$RL_WD_WAVE_LINE" -gt "$RL_LANE_BRANCH_LINE" ] && [ "$RL_WD_WAVE_LINE" -lt "$RL_RUN_AGENT_GEN_LINE" ]; then
+  pass "run-loop.sh: watchdog.sh --wave の呼び出しが LANE_BRANCH確定後・generator起動前にある（#53）"
+else
+  fail "run-loop.sh: watchdog.sh --wave の呼び出しが LANE_BRANCH確定後・generator起動前にある（#53）" \
+    "--wave行=${RL_WD_WAVE_LINE:-なし} LANE_BRANCH行=${RL_LANE_BRANCH_LINE:-なし} run_agent行=${RL_RUN_AGENT_GEN_LINE:-なし}"
+fi
+
+# --stop は trap ... EXIT で結線され、正常終了・異常終了・途中の exit を問わず必ず通ること
+case "$RL_FULL_SRC" in
+  *"trap '_run_loop_watchdog_stop' EXIT"*)
+    pass "run-loop.sh: watchdog.sh --stop が trap ... EXIT で結線されている（#53）" ;;
+  *)
+    fail "run-loop.sh: watchdog.sh --stop が trap ... EXIT で結線されている（#53）" "" ;;
+esac
+
+case "$RL_FULL_SRC" in
+  *'watchdog.sh" --stop'*)
+    pass "run-loop.sh: watchdog.sh --stop の呼び出しが存在する（#53）" ;;
+  *)
+    fail "run-loop.sh: watchdog.sh --stop の呼び出しが存在する（#53）" "" ;;
+esac
+
+# trap は最初の `exit` より前（EPIC_NUMBER 未指定エラーより前）に仕掛けられていること
+# （引数エラーのような早期終了経路でも --stop が通ることを保証するため）
+RL_TRAP_LINE="$(grep -n "trap '_run_loop_watchdog_stop' EXIT" "$RUN_LOOP_SCRIPT" | head -1 | cut -d: -f1)"
+RL_FIRST_EXIT_LINE="$(grep -nE '^[[:space:]]*exit 1$' "$RUN_LOOP_SCRIPT" | head -1 | cut -d: -f1)"
+if [ -n "$RL_TRAP_LINE" ] && [ -n "$RL_FIRST_EXIT_LINE" ] && [ "$RL_TRAP_LINE" -lt "$RL_FIRST_EXIT_LINE" ]; then
+  pass "run-loop.sh: trap は最初の exit より前に仕掛けられている（早期終了経路もカバー・#53）"
+else
+  fail "run-loop.sh: trap は最初の exit より前に仕掛けられている（早期終了経路もカバー・#53）" \
+    "trap行=${RL_TRAP_LINE:-なし} 最初のexit行=${RL_FIRST_EXIT_LINE:-なし}"
+fi
+
+# watchdog.sh が無い・失敗する環境でもループを止めないよう、--start / --wave の呼び出しが
+# `|| true` で握りつぶされていること（--stop は trap 関数内部で握りつぶし済み）
+RL_WD_START_TAIL="$(sed -n "${RL_WD_START_LINE}p" "$RUN_LOOP_SCRIPT")"
+case "$RL_WD_START_TAIL" in
+  *'|| true'*)
+    pass "run-loop.sh: watchdog.sh --start の失敗はループを止めない（|| true・#53）" ;;
+  *)
+    fail "run-loop.sh: watchdog.sh --start の失敗はループを止めない（|| true・#53）" "$RL_WD_START_TAIL" ;;
+esac
+
+RL_WD_WAVE_BLOCK="$(sed -n "${RL_WD_WAVE_LINE},$((RL_WD_WAVE_LINE + 1))p" "$RUN_LOOP_SCRIPT")"
+case "$RL_WD_WAVE_BLOCK" in
+  *'|| true'*)
+    pass "run-loop.sh: watchdog.sh --wave の失敗はループを止めない（|| true・#53）" ;;
+  *)
+    fail "run-loop.sh: watchdog.sh --wave の失敗はループを止めない（|| true・#53）" "$RL_WD_WAVE_BLOCK" ;;
+esac
+
+# タイムアウトによる kill 経路が存在しないこと（Epic #42 決定事項4:
+# ハードタイムアウト・自動再投入は実装しない。両アダプタで機能差を作らない）
+for RL_FORBIDDEN in 'kill -TERM' 'kill -9' 'DEV_WORKFLOW_AGENT_TIMEOUT_SEC'; do
+  if grep -qF -- "$RL_FORBIDDEN" "$RUN_LOOP_SCRIPT"; then
+    fail "run-loop.sh: タイムアウトによる kill 経路が存在しない（${RL_FORBIDDEN} 不在・#53）" \
+      "$(grep -nF -- "$RL_FORBIDDEN" "$RUN_LOOP_SCRIPT")"
+  else
+    pass "run-loop.sh: タイムアウトによる kill 経路が存在しない（${RL_FORBIDDEN} 不在・#53）"
+  fi
+done
+
+# --- 動的検証: DEV_WORKFLOW_DRY_RUN=1 で --start → --wave → --stop がこの順で呼ばれる。
+#     watchdog.sh を差し替え可能なスタブ（呼び出し引数を記録するだけ）に置き換え、
+#     実際に run-loop.sh 全体を DRY_RUN で走らせて確認する（Docker・codex には触れない）。
+#     `${PLUGIN_ROOT_DIR}/scripts/watchdog.sh` は BASH_SOURCE から解決される絶対パスのため、
+#     run-loop.sh・scripts 一式を一時ディレクトリへ複製し、その中の watchdog.sh だけを
+#     差し替える（実リポジトリのファイルは一切変更しない）。
+rl_build_fixture() {
+  # rl_build_fixture <fixture_dir_var_prefix>
+  # 呼び出し側の変数 <prefix>_ROOT / <prefix>_PROJECT / <prefix>_GH_DIR / <prefix>_WD_LOG を埋める。
+  local prefix="$1"
+  local fake_root project origin gh_dir wd_log
+  fake_root="$(mktemp -d "${TMPDIR:-/tmp}/dw-test-rl-root.XXXXXX")"
+  mkdir -p "${fake_root}/adapters/codex" "${fake_root}/scripts"
+  cp "$RUN_LOOP_SCRIPT" "${fake_root}/adapters/codex/run-loop.sh"
+  cp -r "${REPO_ROOT}/scripts/." "${fake_root}/scripts/"
+
+  origin="$(mktemp -d "${TMPDIR:-/tmp}/dw-test-rl-origin.XXXXXX")"
+  (cd "$origin" && git init -q --bare) >/dev/null 2>&1
+
+  project="$(mktemp -d "${TMPDIR:-/tmp}/dw-test-rl-project.XXXXXX")"
+  (
+    cd "$project" || exit 1
+    git init -q
+    git config user.email "dev-workflow-test@example.com"
+    git config user.name "dev-workflow test"
+    git remote add origin "$origin"
+    printf 'test\n' > README.md
+    git add README.md
+    git commit -q -m init
+    git branch "epic/epic999/watchdog-wiring"
+    git push -q origin "epic/epic999/watchdog-wiring"
+    mkdir -p .codex/agents
+    printf 'name = "generator"\n' > .codex/agents/generator.toml
+    printf 'name = "evaluator"\n' > .codex/agents/evaluator.toml
+  ) >/dev/null 2>&1
+
+  gh_dir="$(mktemp -d "${TMPDIR:-/tmp}/dw-test-rl-ghfake.XXXXXX")"
+  cat > "${gh_dir}/gh" <<'FAKE_GH'
+#!/bin/bash
+case "$*" in
+  "issue view 999 --json body -q .body")
+    printf 'ブランチ: epic/epic999/watchdog-wiring\n'
+    ;;
+  *"issue list --label task --state open"*)
+    printf '501\x1f- 前提: なし\x1f- Epic: #999\n'
+    ;;
+  *)
+    exit 0
+    ;;
+esac
+FAKE_GH
+  chmod +x "${gh_dir}/gh"
+
+  wd_log="$(mktemp "${TMPDIR:-/tmp}/dw-test-rl-wdlog.XXXXXX")"
+
+  eval "${prefix}_ROOT=\"\$fake_root\""
+  eval "${prefix}_PROJECT=\"\$project\""
+  eval "${prefix}_GH_DIR=\"\$gh_dir\""
+  eval "${prefix}_WD_LOG=\"\$wd_log\""
+}
+
+rl_build_fixture RL_FX
+
+# watchdog.sh を「呼び出し引数を1行ずつ記録するだけ」のスタブに差し替える
+# （DEV_WORKFLOW_TEST_WATCHDOG_LOG が指す先へ追記。実際の監視は一切行わない）
+cat > "${RL_FX_ROOT}/scripts/watchdog.sh" <<'FAKE_WD'
+#!/bin/bash
+echo "$*" >> "${DEV_WORKFLOW_TEST_WATCHDOG_LOG:?}"
+exit 0
+FAKE_WD
+chmod +x "${RL_FX_ROOT}/scripts/watchdog.sh"
+
+RL_DYN_OUT="$(
+  PATH="${RL_FX_GH_DIR}:${PATH}" \
+  DEV_WORKFLOW_DRY_RUN=1 \
+  DEV_WORKFLOW_TEST_CMD='true' \
+  DEV_WORKFLOW_MAX_TASKS=1 \
+  DEV_WORKFLOW_TEST_WATCHDOG_LOG="$RL_FX_WD_LOG" \
+  bash "${RL_FX_ROOT}/adapters/codex/run-loop.sh" 999 "$RL_FX_PROJECT" 2>&1
+)"
+RL_DYN_EXIT=$?
+
+assert_exit_code "run-loop.sh: DRY_RUN実行（watchdogスタブあり）は exit 0 で完走する（#53）" 0 "$RL_DYN_EXIT"
+
+RL_WD_CALLS="$(awk '{print $1}' "$RL_FX_WD_LOG" 2>/dev/null)"
+assert_eq "run-loop.sh: DRY_RUN実行時、watchdog.shが --start → --wave → --stop の順で呼ばれる（#53）" \
+  "$(printf -- '--start\n--wave\n--stop')" "$RL_WD_CALLS"
+
+if [ "$(grep -c '^--wave' "$RL_FX_WD_LOG" 2>/dev/null)" = "1" ]; then
+  pass "run-loop.sh: --wave はタスク1件（MAX_TASKS=1）につき1回だけ呼ばれる（#53）"
+else
+  fail "run-loop.sh: --wave はタスク1件（MAX_TASKS=1）につき1回だけ呼ばれる（#53）" "$(cat "$RL_FX_WD_LOG" 2>/dev/null)"
+fi
+
+case "$(grep '^--start' "$RL_FX_WD_LOG" 2>/dev/null)" in
+  *'--epic epic999'*'--label Epic #999'*)
+    pass "run-loop.sh: --start に --epic / --label が渡っている（#53）" ;;
+  *)
+    fail "run-loop.sh: --start に --epic / --label が渡っている（#53）" "$(grep '^--start' "$RL_FX_WD_LOG" 2>/dev/null)" ;;
+esac
+
+case "$(grep '^--wave' "$RL_FX_WD_LOG" 2>/dev/null)" in
+  *'--epic epic999'*'--wave-no 1'*'--tasks 501'*)
+    pass "run-loop.sh: --wave に --epic / --wave-no / --tasks が渡っている（#53）" ;;
+  *)
+    fail "run-loop.sh: --wave に --epic / --wave-no / --tasks が渡っている（#53）" "$(grep '^--wave' "$RL_FX_WD_LOG" 2>/dev/null)" ;;
+esac
+
+# --- watchdog.sh が無い環境でも run-loop 自体は継続すること ---
+rl_build_fixture RL_FX2
+# scripts/watchdog.sh を配置しない（「スクリプトが無い」環境の再現）
+rm -f "${RL_FX2_ROOT}/scripts/watchdog.sh"
+
+RL_MISSING_OUT="$(
+  PATH="${RL_FX2_GH_DIR}:${PATH}" \
+  DEV_WORKFLOW_DRY_RUN=1 \
+  DEV_WORKFLOW_TEST_CMD='true' \
+  DEV_WORKFLOW_MAX_TASKS=1 \
+  bash "${RL_FX2_ROOT}/adapters/codex/run-loop.sh" 999 "$RL_FX2_PROJECT" 2>&1
+)"
+RL_MISSING_EXIT=$?
+
+assert_exit_code "run-loop.sh: watchdog.sh が無くても run-loop 自体は exit 0 で継続する（#53）" 0 "$RL_MISSING_EXIT"
+
+case "$RL_MISSING_OUT" in
+  *"Epic一括レビュー"*)
+    pass "run-loop.sh: watchdog.sh が無くてもEpic一括レビューまで到達する（#53）" ;;
+  *)
+    fail "run-loop.sh: watchdog.sh が無くてもEpic一括レビューまで到達する（#53）" "$RL_MISSING_OUT" ;;
+esac
+
+# ---------------------------------------------------------------------------
 # skills/run/SKILL.md: 統合ゲート失敗時のリカバリと0レーン取り込みの分岐
 # （回帰防止 #38, #41）
 # ---------------------------------------------------------------------------
@@ -3283,6 +3678,170 @@ case "$RS_STEP6" in
     pass "SKILL.md: Step 6 冒頭に wave ブランチ存在確認のガードがある（#41）" ;;
   *)
     fail "SKILL.md: Step 6 冒頭に wave ブランチ存在確認のガードがある（#41）" "$RS_STEP6" ;;
+esac
+
+# ---------------------------------------------------------------------------
+# skills/run/SKILL.md: watchdog の結線（--start/--wave/--stop）とハング時の
+# 運用手順の記述（回帰防止 #51）
+# ---------------------------------------------------------------------------
+
+echo ""
+echo "== skills/run/SKILL.md（watchdog結線・ハング時運用手順の回帰防止 #51） =="
+
+# --start の呼び出しが run-start の記述より後にあること（run マーカーが立った後に
+# watchdogを起動する契約。マーカーより先に起動すると自己終了条件を誤検知しうる）
+RS_RUN_START_LINE="$(grep -n 'notify-slack.sh" run-start' "$RUN_SKILL" | head -1 | cut -d: -f1)"
+RS_WATCHDOG_START_LINE="$(grep -n 'watchdog.sh" --start' "$RUN_SKILL" | head -1 | cut -d: -f1)"
+
+if [ -n "$RS_RUN_START_LINE" ] && [ -n "$RS_WATCHDOG_START_LINE" ] && [ "$RS_WATCHDOG_START_LINE" -gt "$RS_RUN_START_LINE" ]; then
+  pass "SKILL.md: watchdog.sh --start の呼び出しが notify-slack.sh run-start より後にある（#51）"
+else
+  fail "SKILL.md: watchdog.sh --start の呼び出しが notify-slack.sh run-start より後にある（#51）" \
+    "run-start行=${RS_RUN_START_LINE:-なし} --start行=${RS_WATCHDOG_START_LINE:-なし}"
+fi
+
+# --wave の呼び出しが Step 2（WAVE_BASEを記録する節）にあること
+RS_STEP2="$(awk '/^### Step 2:/{f=1} /^### Step 3:/{f=0} f' "$RUN_SKILL")"
+
+case "$RS_STEP2" in
+  *'watchdog.sh" --wave'*)
+    pass "SKILL.md: watchdog.sh --wave の呼び出しが Step 2（WAVE_BASE）の節にある（#51）" ;;
+  *)
+    fail "SKILL.md: watchdog.sh --wave の呼び出しが Step 2（WAVE_BASE）の節にある（#51）" "$RS_STEP2" ;;
+esac
+
+# --stop の呼び出しが「正常終了・異常終了を問わず」と書かれた節の中にあり、
+# かつ完了通知（run-complete）より前の位置にあること
+RS_CLEANUP="$(awk '/^## サンドボックスの後片付け（正常終了・異常終了を問わず必ず実行）/{f=1} /^## /{if (f && !/サンドボックスの後片付け/) f=0} f' "$RUN_SKILL")"
+
+case "$RS_CLEANUP" in
+  *'watchdog.sh" --stop'*)
+    pass "SKILL.md: watchdog.sh --stop の呼び出しが「正常終了・異常終了を問わず」の節にある（#51）" ;;
+  *)
+    fail "SKILL.md: watchdog.sh --stop の呼び出しが「正常終了・異常終了を問わず」の節にある（#51）" "$RS_CLEANUP" ;;
+esac
+
+RS_WATCHDOG_STOP_LINE="$(grep -n 'watchdog.sh" --stop' "$RUN_SKILL" | head -1 | cut -d: -f1)"
+RS_RUN_COMPLETE_LINE="$(grep -n 'notify-slack.sh" run-complete' "$RUN_SKILL" | head -1 | cut -d: -f1)"
+
+if [ -n "$RS_WATCHDOG_STOP_LINE" ] && [ -n "$RS_RUN_COMPLETE_LINE" ] && [ "$RS_WATCHDOG_STOP_LINE" -lt "$RS_RUN_COMPLETE_LINE" ]; then
+  pass "SKILL.md: watchdog.sh --stop の呼び出しが完了通知（run-complete）より前の位置にある（#51）"
+else
+  fail "SKILL.md: watchdog.sh --stop の呼び出しが完了通知（run-complete）より前の位置にある（#51）" \
+    "--stop行=${RS_WATCHDOG_STOP_LINE:-なし} run-complete行=${RS_RUN_COMPLETE_LINE:-なし}"
+fi
+
+# 「ハングしたときに人間がすること」の節が存在し、--abort の説明と再実行の手順を含むこと
+RS_HANG_SECTION="$(awk '/^## ハングしたときに人間がすること/{f=1} /^## 進捗表示/{f=0} f' "$RUN_SKILL")"
+
+if [ -n "$RS_HANG_SECTION" ]; then
+  pass "SKILL.md: 「ハングしたときに人間がすること」の節が存在する（#51）"
+else
+  fail "SKILL.md: 「ハングしたときに人間がすること」の節が存在する（#51）" "節が見つかりません"
+fi
+
+case "$RS_HANG_SECTION" in
+  *'watchdog.sh" --abort'*)
+    pass "SKILL.md: ハング時の節に watchdog.sh --abort の説明がある（#51）" ;;
+  *)
+    fail "SKILL.md: ハング時の節に watchdog.sh --abort の説明がある（#51）" "$RS_HANG_SECTION" ;;
+esac
+
+case "$RS_HANG_SECTION" in
+  *'/dev-workflow:run'*)
+    pass "SKILL.md: ハング時の節に再実行（/dev-workflow:run）の手順がある（#51）" ;;
+  *)
+    fail "SKILL.md: ハング時の節に再実行（/dev-workflow:run）の手順がある（#51）" "$RS_HANG_SECTION" ;;
+esac
+
+# 「自動で打ち切って再投入することはできない」旨の記述が存在すること
+case "$RS_HANG_SECTION" in
+  *'自動で打ち切って再投入する'*'原理的にできない'*)
+    pass "SKILL.md: 「自動で打ち切って再投入することはできない」旨の記述がある（#51）" ;;
+  *)
+    fail "SKILL.md: 「自動で打ち切って再投入することはできない」旨の記述がある（#51）" "$RS_HANG_SECTION" ;;
+esac
+
+# セッション中断後は watchdog.sh --stop を実行する旨の記述が存在すること（レビュー#62）。
+# セッションをプロセスごと中断するとStopフックが発火せずrunマーカーが残り続け、
+# watchdogが打ち切りに気付かないまま無活動検知・エスカレーション通知を出し続けるため。
+case "$RS_HANG_SECTION" in
+  *'watchdog.sh" --stop'*)
+    pass "SKILL.md: ハング時の節にセッション中断後の watchdog.sh --stop の指示がある（#62）" ;;
+  *)
+    fail "SKILL.md: ハング時の節にセッション中断後の watchdog.sh --stop の指示がある（#62）" "$RS_HANG_SECTION" ;;
+esac
+
+case "$RS_HANG_SECTION" in
+  *'Stop フックが走らず'*'run マーカー'*)
+    pass "SKILL.md: セッション中断時にStopフックが走らずrunマーカーが残る旨の説明がある（#62）" ;;
+  *)
+    fail "SKILL.md: セッション中断時にStopフックが走らずrunマーカーが残る旨の説明がある（#62）" "$RS_HANG_SECTION" ;;
+esac
+
+# ---------------------------------------------------------------------------
+# skills/run/SKILL.md: WAVE_NO の採番ロジックと中断→再開時の挙動の記述（Task #54）
+#
+# 中断→再開で WAVE_NO がセッションごとに 0 から始まると、前回の残骸 wave ブランチを
+# 誤って掴んでしまう事故が起きる（Epic #42 調査結果 7）。自律ループ冒頭で
+# 既存の wave ブランチの番号の最大値から数え直すロジックが明記されていること、
+# および再開時の挙動（残タスクの再計算・wave ブランチの採番し直し・取り込み済み
+# コミットは失われない）が明記されていることを grep ベースで検証する。
+# ---------------------------------------------------------------------------
+
+echo ""
+echo "== skills/run/SKILL.md（WAVE_NO 採番・中断→再開時の挙動の回帰防止 #54） =="
+
+RS_AUTONOMOUS_LOOP_HEADER="$(awk '/^## 自律ループ（YOLOモード、ウェーブ単位）/{f=1} /^### Step 1:/{f=0} f' "$RUN_SKILL")"
+
+case "$RS_AUTONOMOUS_LOOP_HEADER" in
+  *'for-each-ref'*'wave/${EPIC_NUM}/*'*)
+    pass "SKILL.md: 自律ループ冒頭に既存 wave ブランチを列挙する WAVE_NO 採番ロジックがある（#54）" ;;
+  *)
+    fail "SKILL.md: 自律ループ冒頭に既存 wave ブランチを列挙する WAVE_NO 採番ロジックがある（#54）" "$RS_AUTONOMOUS_LOOP_HEADER" ;;
+esac
+
+case "$RS_AUTONOMOUS_LOOP_HEADER" in
+  *'WAVE_NO="${WAVE_NO:-0}"'*)
+    pass "SKILL.md: WAVE_NO 採番ロジックが既存ブランチ無しの場合 0 にフォールバックする（#54）" ;;
+  *)
+    fail "SKILL.md: WAVE_NO 採番ロジックが既存ブランチ無しの場合 0 にフォールバックする（#54）" "$RS_AUTONOMOUS_LOOP_HEADER" ;;
+esac
+
+case "$RS_AUTONOMOUS_LOOP_HEADER" in
+  *'0 から始めてはならない'*)
+    pass "SKILL.md: WAVE_NO を 0 から始めてはならない旨の説明がある（#54）" ;;
+  *)
+    fail "SKILL.md: WAVE_NO を 0 から始めてはならない旨の説明がある（#54）" "$RS_AUTONOMOUS_LOOP_HEADER" ;;
+esac
+
+RS_RESUME_SECTION="$(awk '/^3\. \*\*再開する場合\*\*/{f=1} /^\*\*Claude Code 側では/{f=0} f' "$RUN_SKILL")"
+
+if [ -n "$RS_RESUME_SECTION" ]; then
+  pass "SKILL.md: 「再開する場合」の説明ブロックが存在する（#54）"
+else
+  fail "SKILL.md: 「再開する場合」の説明ブロックが存在する（#54）" "節が見つかりません"
+fi
+
+case "$RS_RESUME_SECTION" in
+  *'残タスクは open な Task issue'*'再計算される'*)
+    pass "SKILL.md: 再開時に残タスクが open な Task issue から再計算される旨の記述がある（#54）" ;;
+  *)
+    fail "SKILL.md: 再開時に残タスクが open な Task issue から再計算される旨の記述がある（#54）" "$RS_RESUME_SECTION" ;;
+esac
+
+case "$RS_RESUME_SECTION" in
+  *'wave ブランチは採番し直される'*)
+    pass "SKILL.md: 再開時に wave ブランチが採番し直される旨の記述がある（#54）" ;;
+  *)
+    fail "SKILL.md: 再開時に wave ブランチが採番し直される旨の記述がある（#54）" "$RS_RESUME_SECTION" ;;
+esac
+
+case "$RS_RESUME_SECTION" in
+  *'取り込み済みのコミットは失われない'*)
+    pass "SKILL.md: 再開時に取り込み済みのコミットが失われない旨の記述がある（#54）" ;;
+  *)
+    fail "SKILL.md: 再開時に取り込み済みのコミットが失われない旨の記述がある（#54）" "$RS_RESUME_SECTION" ;;
 esac
 
 # ---------------------------------------------------------------------------
@@ -3333,6 +3892,2348 @@ else
   else
     pass "SKILL.md(codex): 未定義変数 \$EPIC_NUMBER を参照していない"
   fi
+fi
+
+# ---------------------------------------------------------------------------
+# skills-codex/dev-workflow-run/SKILL.md: watchdog の結線（--start/--wave/--stop）と
+# ハング時の運用手順の記述（回帰防止 #53。skills/run/SKILL.md #51 の Codex 側対応物）
+# ---------------------------------------------------------------------------
+
+echo ""
+echo "== skills-codex/dev-workflow-run/SKILL.md（watchdog結線・ハング時運用手順の回帰防止 #53） =="
+
+# --start の呼び出しが run-start の記述より後にあること
+CRS_RUN_START_LINE="$(grep -n 'notify-slack.sh" run-start' "$CODEX_RUN_SKILL" | head -1 | cut -d: -f1)"
+CRS_WATCHDOG_START_LINE="$(grep -n 'watchdog.sh" --start' "$CODEX_RUN_SKILL" | head -1 | cut -d: -f1)"
+
+if [ -n "$CRS_RUN_START_LINE" ] && [ -n "$CRS_WATCHDOG_START_LINE" ] && [ "$CRS_WATCHDOG_START_LINE" -gt "$CRS_RUN_START_LINE" ]; then
+  pass "SKILL.md(codex): watchdog.sh --start の呼び出しが notify-slack.sh run-start より後にある（#53）"
+else
+  fail "SKILL.md(codex): watchdog.sh --start の呼び出しが notify-slack.sh run-start より後にある（#53）" \
+    "run-start行=${CRS_RUN_START_LINE:-なし} --start行=${CRS_WATCHDOG_START_LINE:-なし}"
+fi
+
+# --wave の呼び出しが Step 2（WAVE_BASEを記録し、レーンを作る節）にあること
+CRS_STEP2="$(awk '/^### Step 2:/{f=1} /^### Step 3:/{f=0} f' "$CODEX_RUN_SKILL")"
+
+case "$CRS_STEP2" in
+  *'watchdog.sh" --wave'*)
+    pass "SKILL.md(codex): watchdog.sh --wave の呼び出しが Step 2（WAVE_BASE）の節にある（#53）" ;;
+  *)
+    fail "SKILL.md(codex): watchdog.sh --wave の呼び出しが Step 2（WAVE_BASE）の節にある（#53）" "$CRS_STEP2" ;;
+esac
+
+# --stop の呼び出しが「正常終了・異常終了を問わず」と書かれた節の中にあり、
+# かつ完了通知（run-complete）より前の位置にあること
+CRS_CLEANUP="$(awk '/^## サンドボックスの後片付け（正常終了・異常終了を問わず必ず実行）/{f=1} /^## /{if (f && !/サンドボックスの後片付け/) f=0} f' "$CODEX_RUN_SKILL")"
+
+case "$CRS_CLEANUP" in
+  *'watchdog.sh" --stop'*)
+    pass "SKILL.md(codex): watchdog.sh --stop の呼び出しが「正常終了・異常終了を問わず」の節にある（#53）" ;;
+  *)
+    fail "SKILL.md(codex): watchdog.sh --stop の呼び出しが「正常終了・異常終了を問わず」の節にある（#53）" "$CRS_CLEANUP" ;;
+esac
+
+CRS_WATCHDOG_STOP_LINE="$(grep -n 'watchdog.sh" --stop' "$CODEX_RUN_SKILL" | head -1 | cut -d: -f1)"
+CRS_RUN_COMPLETE_LINE="$(grep -n 'notify-slack.sh" run-complete' "$CODEX_RUN_SKILL" | head -1 | cut -d: -f1)"
+
+if [ -n "$CRS_WATCHDOG_STOP_LINE" ] && [ -n "$CRS_RUN_COMPLETE_LINE" ] && [ "$CRS_WATCHDOG_STOP_LINE" -lt "$CRS_RUN_COMPLETE_LINE" ]; then
+  pass "SKILL.md(codex): watchdog.sh --stop の呼び出しが完了通知（run-complete）より前の位置にある（#53）"
+else
+  fail "SKILL.md(codex): watchdog.sh --stop の呼び出しが完了通知（run-complete）より前の位置にある（#53）" \
+    "--stop行=${CRS_WATCHDOG_STOP_LINE:-なし} run-complete行=${CRS_RUN_COMPLETE_LINE:-なし}"
+fi
+
+# 「ハングしたときに人間がすること」の節が存在し、--abort の説明と再実行の手順を含むこと
+CRS_HANG_SECTION="$(awk '/^## ハングしたときに人間がすること/{f=1} /^## Epic一括レビュー/{f=0} f' "$CODEX_RUN_SKILL")"
+
+if [ -n "$CRS_HANG_SECTION" ]; then
+  pass "SKILL.md(codex): 「ハングしたときに人間がすること」の節が存在する（#53）"
+else
+  fail "SKILL.md(codex): 「ハングしたときに人間がすること」の節が存在する（#53）" "節が見つかりません"
+fi
+
+case "$CRS_HANG_SECTION" in
+  *'watchdog.sh" --abort'*)
+    pass "SKILL.md(codex): ハング時の節に watchdog.sh --abort の説明がある（#53）" ;;
+  *)
+    fail "SKILL.md(codex): ハング時の節に watchdog.sh --abort の説明がある（#53）" "$CRS_HANG_SECTION" ;;
+esac
+
+# --abort はCodexではツール呼び出しを強制ブロックしない（ソフトな打ち切り依頼にとどまる）
+# ことが明記されていること（レビュー#59。以前はClaude版と同一文面で「次のツール呼び出しで
+# 効く」と誤って書かれていた）
+case "$CRS_HANG_SECTION" in
+  *'ブロックしない'*'ソフトな打ち切り依頼'*)
+    pass "SKILL.md(codex): --abort がハードブロックではなくソフトな打ち切り依頼である旨が明記されている（#59）" ;;
+  *)
+    fail "SKILL.md(codex): --abort がハードブロックではなくソフトな打ち切り依頼である旨が明記されている（#59）" \
+      "$CRS_HANG_SECTION" ;;
+esac
+
+case "$CRS_HANG_SECTION" in
+  *'dev-workflow-run'*)
+    pass "SKILL.md(codex): ハング時の節に再実行（dev-workflow-run スキル）の手順がある（#53）" ;;
+  *)
+    fail "SKILL.md(codex): ハング時の節に再実行（dev-workflow-run スキル）の手順がある（#53）" "$CRS_HANG_SECTION" ;;
+esac
+
+# 「自動で打ち切って再投入することはできない」旨の記述が存在すること（Claude版と同一方針）
+case "$CRS_HANG_SECTION" in
+  *'自動で打ち切って再投入する'*'実装しない'*)
+    pass "SKILL.md(codex): 「自動で打ち切って再投入することは実装しない」旨の記述がある（#53）" ;;
+  *)
+    fail "SKILL.md(codex): 「自動で打ち切って再投入することは実装しない」旨の記述がある（#53）" "$CRS_HANG_SECTION" ;;
+esac
+
+# セッション中断後は watchdog.sh --stop を実行する旨の記述が存在すること（レビュー#62）。
+# セッションをプロセスごと中断するとStopフックが発火せずrunマーカーが残り続け、
+# watchdogが打ち切りに気付かないまま無活動検知・エスカレーション通知を出し続けるため。
+case "$CRS_HANG_SECTION" in
+  *'watchdog.sh" --stop'*)
+    pass "SKILL.md(codex): ハング時の節にセッション中断後の watchdog.sh --stop の指示がある（#62）" ;;
+  *)
+    fail "SKILL.md(codex): ハング時の節にセッション中断後の watchdog.sh --stop の指示がある（#62）" "$CRS_HANG_SECTION" ;;
+esac
+
+case "$CRS_HANG_SECTION" in
+  *'Stop フックが走らず'*'run マーカー'*)
+    pass "SKILL.md(codex): セッション中断時にStopフックが走らずrunマーカーが残る旨の説明がある（#62）" ;;
+  *)
+    fail "SKILL.md(codex): セッション中断時にStopフックが走らずrunマーカーが残る旨の説明がある（#62）" "$CRS_HANG_SECTION" ;;
+esac
+
+# Claude Code版と挙動が同じ（アダプタ間に機能差を作らない）旨の記述が
+# ハング節・自律実行開始節のいずれかに存在すること
+CRS_FULL_SRC="$(cat "$CODEX_RUN_SKILL")"
+case "$CRS_FULL_SRC" in
+  *'アダプタ間に機能差を'*'作らない'*)
+    pass "SKILL.md(codex): 「アダプタ間に機能差を作らない」旨の記述がある（#53）" ;;
+  *)
+    fail "SKILL.md(codex): 「アダプタ間に機能差を作らない」旨の記述がある（#53）" "" ;;
+esac
+
+# ---------------------------------------------------------------------------
+# skills-codex/dev-workflow-run/SKILL.md, adapters/codex/run-loop.sh:
+# WAVE_NO の採番ロジックと中断→再開時の挙動の記述（Task #54。skills/run/SKILL.md #54 の
+# Codex 側対応物。Codex は `--lanes 1` 固定で毎タスク --create を呼ぶため、この不具合の
+# 影響を Claude Code 版よりも強く受ける）
+# ---------------------------------------------------------------------------
+
+echo ""
+echo "== skills-codex/dev-workflow-run/SKILL.md・run-loop.sh（WAVE_NO 採番・中断→再開時の挙動の回帰防止 #54） =="
+
+CRS_AUTONOMOUS_LOOP_HEADER="$(awk '/^## 自律ループ（`lanes=1` 固定のウェーブ実行）/{f=1} /^### Step 1:/{f=0} f' "$CODEX_RUN_SKILL")"
+
+case "$CRS_AUTONOMOUS_LOOP_HEADER" in
+  *'for-each-ref'*'wave/${EPIC_NUM}/*'*)
+    pass "SKILL.md(codex): 自律ループ冒頭に既存 wave ブランチを列挙する WAVE_NO 採番ロジックがある（#54）" ;;
+  *)
+    fail "SKILL.md(codex): 自律ループ冒頭に既存 wave ブランチを列挙する WAVE_NO 採番ロジックがある（#54）" "$CRS_AUTONOMOUS_LOOP_HEADER" ;;
+esac
+
+case "$CRS_AUTONOMOUS_LOOP_HEADER" in
+  *'0 から始めてはならない'*)
+    pass "SKILL.md(codex): WAVE_NO を 0 から始めてはならない旨の説明がある（#54）" ;;
+  *)
+    fail "SKILL.md(codex): WAVE_NO を 0 から始めてはならない旨の説明がある（#54）" "$CRS_AUTONOMOUS_LOOP_HEADER" ;;
+esac
+
+CRS_RESUME_SECTION="$(awk '/^3\. \*\*再開する場合\*\*/{f=1} /^\*\*Codex 側でも/{f=0} f' "$CODEX_RUN_SKILL")"
+
+if [ -n "$CRS_RESUME_SECTION" ]; then
+  pass "SKILL.md(codex): 「再開する場合」の説明ブロックが存在する（#54）"
+else
+  fail "SKILL.md(codex): 「再開する場合」の説明ブロックが存在する（#54）" "節が見つかりません"
+fi
+
+case "$CRS_RESUME_SECTION" in
+  *'wave ブランチは採番し直される'*)
+    pass "SKILL.md(codex): 再開時に wave ブランチが採番し直される旨の記述がある（#54）" ;;
+  *)
+    fail "SKILL.md(codex): 再開時に wave ブランチが採番し直される旨の記述がある（#54）" "$CRS_RESUME_SECTION" ;;
+esac
+
+case "$CRS_RESUME_SECTION" in
+  *'取り込み済みのコミットは失われない'*)
+    pass "SKILL.md(codex): 再開時に取り込み済みのコミットが失われない旨の記述がある（#54）" ;;
+  *)
+    fail "SKILL.md(codex): 再開時に取り込み済みのコミットが失われない旨の記述がある（#54）" "$CRS_RESUME_SECTION" ;;
+esac
+
+# run-loop.sh 本体（実際に再実行されるスクリプト）でも同じ採番ロジックになっていること
+RUN_LOOP_WAVE_NO_BLOCK="$(awk '/^WAVE_NO=\$\(git -C "\$EPIC_WT" for-each-ref/{p=1} p{print} p && /WAVE_NO="\$\{WAVE_NO:-0\}"/{exit}' "$RUN_LOOP_SCRIPT")"
+
+if [ -n "$RUN_LOOP_WAVE_NO_BLOCK" ]; then
+  pass "run-loop.sh: WAVE_NO が既存 wave ブランチの番号の最大値から採番される（#54）"
+else
+  fail "run-loop.sh: WAVE_NO が既存 wave ブランチの番号の最大値から採番される（#54）" "ブロックが見つかりません"
+fi
+
+if grep -qE '^WAVE_NO=0$' "$RUN_LOOP_SCRIPT"; then
+  fail "run-loop.sh: WAVE_NO を 0 固定で初期化していない（残骸 wave ブランチを掴む回帰の再発防止 #54）" \
+    "$(grep -nE '^WAVE_NO=0$' "$RUN_LOOP_SCRIPT")"
+else
+  pass "run-loop.sh: WAVE_NO を 0 固定で初期化していない（残骸 wave ブランチを掴む回帰の再発防止 #54）"
+fi
+
+# ---------------------------------------------------------------------------
+# notify-slack.sh: watchdog イベント（stall / stall-recovered / sleep-gap / budget、Task #46）
+#
+# 実送信（curl）は使わず、DEV_WORKFLOW_NOTIFY_SINK にファイルパスを渡して
+# 組み立てた本文（JSON）をそのファイルへ書き出させて検証する。加えて PATH に
+# 偽 curl を差し込み、sink 経由では実際の curl が一度も呼ばれないことも確認する
+# （Slack へは実送信しない・Epic #42 完了条件）。
+# ---------------------------------------------------------------------------
+
+echo ""
+echo "== notify-slack.sh: watchdog イベント（Task #46） =="
+
+NS_SCRIPT="${REPO_ROOT}/scripts/notify-slack.sh"
+NS_REPO="$(make_temp_repo)"
+NS_WORK="$(mktemp -d "${TMPDIR:-/tmp}/dw-test-notify-work.XXXXXX")"
+
+# 偽curl。sink経路では呼ばれてはならない（呼ばれたら呼び出し内容をログへ残す）
+NS_FAKE_BIN="${NS_WORK}/bin"
+mkdir -p "$NS_FAKE_BIN"
+NS_CURL_LOG="${NS_WORK}/curl-calls.log"
+printf '#!/bin/bash\necho "called: $*" >> "%s"\nexit 0\n' "$NS_CURL_LOG" > "${NS_FAKE_BIN}/curl"
+chmod +x "${NS_FAKE_BIN}/curl"
+
+run_notify() {
+  # run_notify <event> <arg> <sink_file>
+  # Webhookはダミーの https URL・sinkはファイルパスを渡し、curlを呼ばせずに検証する。
+  (
+    cd "$NS_REPO" || exit 1
+    PATH="${NS_FAKE_BIN}:${PATH}" \
+    SLACK_WEBHOOK_URL="https://example.invalid/webhook" \
+    DEV_WORKFLOW_PROJECT_NAME="dwtest" \
+    DEV_WORKFLOW_NOTIFY_SINK="$3" \
+    bash "$NS_SCRIPT" "$1" "$2" < /dev/null
+  )
+}
+
+read_sink() {
+  [ -f "$1" ] && cat "$1" || printf ''
+}
+
+# --- stall: state=pre（ツール実行中に停止） ---
+NS_STALL_PRE_SINK="${NS_WORK}/stall-pre.json"
+run_notify "stall" "無活動920秒 / レーンA / 最後のツール: Bash（state=pre: ツール実行中に停止）" "$NS_STALL_PRE_SINK"
+NS_STALL_PRE_EXIT=$?
+NS_STALL_PRE_BODY="$(read_sink "$NS_STALL_PRE_SINK")"
+
+assert_exit_code "stall(state=pre): exit 0" 0 "$NS_STALL_PRE_EXIT"
+case "$NS_STALL_PRE_BODY" in
+  *"応答なし"*) pass "stall: 見出し «応答なし» を含む" ;;
+  *) fail "stall: 見出し «応答なし» を含む" "$NS_STALL_PRE_BODY" ;;
+esac
+case "$NS_STALL_PRE_BODY" in
+  *"ツール実行中に停止"*) pass "stall(state=pre): 本文に «ツール実行中に停止» を含む（受け入れ条件2）" ;;
+  *) fail "stall(state=pre): 本文に «ツール実行中に停止» を含む（受け入れ条件2）" "$NS_STALL_PRE_BODY" ;;
+esac
+case "$NS_STALL_PRE_BODY" in
+  *"モデルの応答待ちで停止"*) fail "stall(state=pre): «モデルの応答待ちで停止» を誤って含まない" "$NS_STALL_PRE_BODY" ;;
+  *) pass "stall(state=pre): «モデルの応答待ちで停止» を誤って含まない" ;;
+esac
+case "$NS_STALL_PRE_BODY" in
+  *"<!channel>"*) pass "stall: 既定のメンション <!channel> を含む" ;;
+  *) fail "stall: 既定のメンション <!channel> を含む" "$NS_STALL_PRE_BODY" ;;
+esac
+
+# --- stall: state=post（モデルの応答待ちで停止） ---
+NS_STALL_POST_SINK="${NS_WORK}/stall-post.json"
+run_notify "stall" "無活動920秒 / レーンB / 最後のツール: (なし)（state=post: モデルの応答待ちで停止）" "$NS_STALL_POST_SINK"
+NS_STALL_POST_EXIT=$?
+NS_STALL_POST_BODY="$(read_sink "$NS_STALL_POST_SINK")"
+
+assert_exit_code "stall(state=post): exit 0" 0 "$NS_STALL_POST_EXIT"
+case "$NS_STALL_POST_BODY" in
+  *"モデルの応答待ちで停止"*) pass "stall(state=post): 本文に «モデルの応答待ちで停止» を含む（受け入れ条件2）" ;;
+  *) fail "stall(state=post): 本文に «モデルの応答待ちで停止» を含む（受け入れ条件2）" "$NS_STALL_POST_BODY" ;;
+esac
+case "$NS_STALL_POST_BODY" in
+  *"ツール実行中に停止"*) fail "stall(state=post): «ツール実行中に停止» を誤って含まない" "$NS_STALL_POST_BODY" ;;
+  *) pass "stall(state=post): «ツール実行中に停止» を誤って含まない" ;;
+esac
+
+# --- stall-recovered ---
+NS_RECOVERED_SINK="${NS_WORK}/stall-recovered.json"
+run_notify "stall-recovered" "無活動980秒から復帰 / レーンA" "$NS_RECOVERED_SINK"
+NS_RECOVERED_EXIT=$?
+NS_RECOVERED_BODY="$(read_sink "$NS_RECOVERED_SINK")"
+
+assert_exit_code "stall-recovered: exit 0" 0 "$NS_RECOVERED_EXIT"
+case "$NS_RECOVERED_BODY" in
+  *"応答が再開"*"無活動980秒から復帰 / レーンA"*) pass "stall-recovered: 見出しと詳細を含む" ;;
+  *) fail "stall-recovered: 見出しと詳細を含む" "$NS_RECOVERED_BODY" ;;
+esac
+
+# --- sleep-gap: stallとは別イベントとして区別できる（受け入れ条件3） ---
+NS_SLEEPGAP_SINK="${NS_WORK}/sleep-gap.json"
+run_notify "sleep-gap" "tick間隔60秒に対し実経過620秒（スリープ復帰と判定・無活動時間から差し引き済み）" "$NS_SLEEPGAP_SINK"
+NS_SLEEPGAP_EXIT=$?
+NS_SLEEPGAP_BODY="$(read_sink "$NS_SLEEPGAP_SINK")"
+
+assert_exit_code "sleep-gap: exit 0" 0 "$NS_SLEEPGAP_EXIT"
+case "$NS_SLEEPGAP_BODY" in
+  *"スリープ痕跡"*"tick間隔60秒に対し実経過620秒"*) pass "sleep-gap: 見出しと詳細を含む" ;;
+  *) fail "sleep-gap: 見出しと詳細を含む" "$NS_SLEEPGAP_BODY" ;;
+esac
+case "$NS_SLEEPGAP_BODY" in
+  *"応答なし"*) fail "sleep-gap: stallの見出し «応答なし» を誤って含まない（受け入れ条件3）" "$NS_SLEEPGAP_BODY" ;;
+  *) pass "sleep-gap: stallの見出し «応答なし» を誤って含まない（受け入れ条件3）" ;;
+esac
+case "$NS_STALL_PRE_BODY" in
+  *"スリープ痕跡"*) fail "stall: sleep-gapの見出し «スリープ痕跡» を誤って含まない（受け入れ条件3）" "$NS_STALL_PRE_BODY" ;;
+  *) pass "stall: sleep-gapの見出し «スリープ痕跡» を誤って含まない（受け入れ条件3）" ;;
+esac
+
+# --- budget ---
+NS_BUDGET_SINK="${NS_WORK}/budget.json"
+run_notify "budget" "ウェーブ2 / 経過98分 / 予算90分" "$NS_BUDGET_SINK"
+NS_BUDGET_EXIT=$?
+NS_BUDGET_BODY="$(read_sink "$NS_BUDGET_SINK")"
+
+assert_exit_code "budget: exit 0" 0 "$NS_BUDGET_EXIT"
+case "$NS_BUDGET_BODY" in
+  *"想定時間超過"*"ウェーブ2 / 経過98分 / 予算90分"*) pass "budget: 見出しと詳細を含む" ;;
+  *) fail "budget: 見出しと詳細を含む" "$NS_BUDGET_BODY" ;;
+esac
+case "$NS_BUDGET_BODY" in
+  *"<!channel>"*) pass "budget: 既定のメンション <!channel> を含む" ;;
+  *) fail "budget: 既定のメンション <!channel> を含む" "$NS_BUDGET_BODY" ;;
+esac
+
+# --- curlが一度も実行されていないこと（sink経路でネットワークに出ない） ---
+if [ -s "$NS_CURL_LOG" ]; then
+  fail "notify-slack.sh: sink使用時にcurlが呼ばれない（実送信しない）" "$(read_sink "$NS_CURL_LOG")"
+else
+  pass "notify-slack.sh: sink使用時にcurlが呼ばれない（実送信しない）"
+fi
+
+# --- Webhook未設定: 何もせずexit 0、標準出力・標準エラーも空、sinkにも書かれない ---
+NS_NOWEBHOOK_SINK="${NS_WORK}/nowebhook.json"
+NS_NOWEBHOOK_OUT="$(
+  cd "$NS_REPO" || exit 1
+  unset SLACK_WEBHOOK_URL
+  PATH="${NS_FAKE_BIN}:${PATH}" \
+  DEV_WORKFLOW_NOTIFY_SINK="$NS_NOWEBHOOK_SINK" \
+  bash "$NS_SCRIPT" stall "無活動920秒" < /dev/null 2>&1
+)"
+NS_NOWEBHOOK_EXIT=$?
+
+assert_exit_code "Webhook未設定: stallイベントはexit 0（既存の挙動を維持）" 0 "$NS_NOWEBHOOK_EXIT"
+assert_eq "Webhook未設定: 標準出力・標準エラーが空" "" "$NS_NOWEBHOOK_OUT"
+if [ -f "$NS_NOWEBHOOK_SINK" ]; then
+  fail "Webhook未設定: sinkファイルが作られない" "sinkファイルが作成されました"
+else
+  pass "Webhook未設定: sinkファイルが作られない"
+fi
+
+# ---------------------------------------------------------------------------
+# notify-slack.sh: 既存イベント（run-start / run-complete / stop / notification）の
+# 挙動が変わっていないこと（Task #46 の回帰確認）
+# ---------------------------------------------------------------------------
+
+echo ""
+echo "== notify-slack.sh: 既存イベントの回帰確認（Task #46） =="
+
+# --- run-start: マーカーを作るだけで通知はしない ---
+NS_RUNSTART_SINK="${NS_WORK}/run-start.json"
+NS_RUNSTART_OUT="$(
+  cd "$NS_REPO" || exit 1
+  PATH="${NS_FAKE_BIN}:${PATH}" \
+  SLACK_WEBHOOK_URL="https://example.invalid/webhook" \
+  DEV_WORKFLOW_NOTIFY_SINK="$NS_RUNSTART_SINK" \
+  bash "$NS_SCRIPT" run-start "回帰テスト用ラベル" < /dev/null 2>&1
+)"
+NS_RUNSTART_EXIT=$?
+
+assert_exit_code "run-start: exit 0（既存挙動）" 0 "$NS_RUNSTART_EXIT"
+assert_eq "run-start: 標準出力・標準エラーが空（既存挙動）" "" "$NS_RUNSTART_OUT"
+if [ -f "$NS_RUNSTART_SINK" ]; then
+  fail "run-start: 通知しない（既存挙動）" "sinkに書き込みがありました"
+else
+  pass "run-start: 通知しない（既存挙動）"
+fi
+NS_RUNSTART_MARKER_FILE="${NS_REPO}/.claude/.dev-workflow-run"
+if [ -f "$NS_RUNSTART_MARKER_FILE" ]; then
+  assert_eq "run-start: マーカーにラベルを書く（既存挙動）" "回帰テスト用ラベル" "$(read_sink "$NS_RUNSTART_MARKER_FILE")"
+else
+  fail "run-start: マーカーが作られる（既存挙動）" "マーカーファイルがありません"
+fi
+
+# --- run-complete: マーカーを消し、ラベル入りの見出しで通知する ---
+NS_RUNCOMPLETE_SINK="${NS_WORK}/run-complete.json"
+NS_RUNCOMPLETE_OUT="$(
+  cd "$NS_REPO" || exit 1
+  PATH="${NS_FAKE_BIN}:${PATH}" \
+  SLACK_WEBHOOK_URL="https://example.invalid/webhook" \
+  DEV_WORKFLOW_NOTIFY_SINK="$NS_RUNCOMPLETE_SINK" \
+  bash "$NS_SCRIPT" run-complete "全タスク完了" < /dev/null 2>&1
+)"
+NS_RUNCOMPLETE_EXIT=$?
+NS_RUNCOMPLETE_BODY="$(read_sink "$NS_RUNCOMPLETE_SINK")"
+
+assert_exit_code "run-complete: exit 0（既存挙動）" 0 "$NS_RUNCOMPLETE_EXIT"
+case "$NS_RUNCOMPLETE_BODY" in
+  *"完了 — 回帰テスト用ラベル"*) pass "run-complete: 見出しにラベルを含む（既存挙動）" ;;
+  *) fail "run-complete: 見出しにラベルを含む（既存挙動）" "$NS_RUNCOMPLETE_BODY" ;;
+esac
+case "$NS_RUNCOMPLETE_BODY" in
+  *"全タスク完了"*) pass "run-complete: サマリーを本文に含む（既存挙動）" ;;
+  *) fail "run-complete: サマリーを本文に含む（既存挙動）" "$NS_RUNCOMPLETE_BODY" ;;
+esac
+if [ -f "$NS_RUNSTART_MARKER_FILE" ]; then
+  fail "run-complete: マーカーを消す（既存挙動）" "マーカーが残っています"
+else
+  pass "run-complete: マーカーを消す（既存挙動）"
+fi
+
+# --- stop: マーカーがある状態は「自律実行が停止」として通知しマーカーを消す ---
+(
+  cd "$NS_REPO" || exit 1
+  SLACK_WEBHOOK_URL="https://example.invalid/webhook" \
+  DEV_WORKFLOW_NOTIFY_SINK="${NS_WORK}/run-start-2.json" \
+  bash "$NS_SCRIPT" run-start "中断テスト用ラベル" < /dev/null
+) >/dev/null 2>&1
+
+NS_STOP_SINK="${NS_WORK}/stop.json"
+NS_STOP_OUT="$(
+  cd "$NS_REPO" || exit 1
+  PATH="${NS_FAKE_BIN}:${PATH}" \
+  SLACK_WEBHOOK_URL="https://example.invalid/webhook" \
+  DEV_WORKFLOW_NOTIFY_SINK="$NS_STOP_SINK" \
+  bash "$NS_SCRIPT" stop <<< '{}' 2>&1
+)"
+NS_STOP_EXIT=$?
+NS_STOP_BODY="$(read_sink "$NS_STOP_SINK")"
+
+assert_exit_code "stop（マーカーあり）: exit 0（既存挙動）" 0 "$NS_STOP_EXIT"
+case "$NS_STOP_BODY" in
+  *"自律実行が停止 — 中断テスト用ラベル"*) pass "stop（マーカーあり）: 「自律実行が停止」の見出しを含む（既存挙動）" ;;
+  *) fail "stop（マーカーあり）: 「自律実行が停止」の見出しを含む（既存挙動）" "$NS_STOP_BODY" ;;
+esac
+if [ -f "$NS_RUNSTART_MARKER_FILE" ]; then
+  fail "stop（マーカーあり）: マーカーを消す（既存挙動）" "マーカーが残っています"
+else
+  pass "stop（マーカーあり）: マーカーを消す（既存挙動）"
+fi
+
+# --- notification: 承認待ちは既定でも通知される ---
+NS_NOTIF_SINK="${NS_WORK}/notification.json"
+NS_NOTIF_OUT="$(
+  cd "$NS_REPO" || exit 1
+  PATH="${NS_FAKE_BIN}:${PATH}" \
+  SLACK_WEBHOOK_URL="https://example.invalid/webhook" \
+  DEV_WORKFLOW_NOTIFY_SINK="$NS_NOTIF_SINK" \
+  DEV_WORKFLOW_NOTIFY_COOLDOWN=0 \
+  bash "$NS_SCRIPT" notification <<< '{"message":"Claude needs your permission to use Bash"}' 2>&1
+)"
+NS_NOTIF_EXIT=$?
+NS_NOTIF_BODY="$(read_sink "$NS_NOTIF_SINK")"
+
+assert_exit_code "notification（承認待ち）: exit 0（既存挙動）" 0 "$NS_NOTIF_EXIT"
+case "$NS_NOTIF_BODY" in
+  *"承認待ち"*) pass "notification（承認待ち）: 見出しを含む（既存挙動）" ;;
+  *) fail "notification（承認待ち）: 見出しを含む（既存挙動）" "$NS_NOTIF_BODY" ;;
+esac
+
+# --- 回帰確認の全呼び出しを通じてもcurlは一度も呼ばれていない ---
+if [ -s "$NS_CURL_LOG" ]; then
+  fail "notify-slack.sh: 既存イベントの検証中もcurlが呼ばれない" "$(read_sink "$NS_CURL_LOG")"
+else
+  pass "notify-slack.sh: 既存イベントの検証中もcurlが呼ばれない"
+fi
+
+# ---------------------------------------------------------------------------
+# ケース: scripts/heartbeat.sh（フックから生存信号を記録・外部プロセス0、Task #44）
+#
+# PreToolUse / PostToolUse フックから高頻度に呼ばれるため、内部で date / jq / sed / grep
+# を一切呼ばない（唯一の例外は原子的な置き換えに使う mv）。マーカールートの解決は
+# scripts/lib/marker-root.sh（#43）に委譲する（Epic #42 仕様書「3. ファイルと責務」）。
+# ---------------------------------------------------------------------------
+
+echo "== scripts/heartbeat.sh（フックから生存信号を記録・外部プロセス0・Task #44） =="
+
+HEARTBEAT_SCRIPT="${REPO_ROOT}/scripts/heartbeat.sh"
+
+bash -n "$HEARTBEAT_SCRIPT" >/dev/null 2>&1
+assert_exit_code "heartbeat.sh: bash -n が通る（構文エラーなし）" 0 $?
+
+HB_MARKER_FILE=".dev-workflow-heartbeat"
+
+# --- 書式: pre 呼び出しは <epoch>\t<pre>\t<ツール名> の1行だけを書く ---
+HB_REPO="$(canon_root "$(make_temp_repo)")"
+mkdir -p "${HB_REPO}/.claude"
+HB_TARGET="${HB_REPO}/.claude/${HB_MARKER_FILE}"
+
+HB_JSON_PRE=$'{\n  "session_id": "abc",\n  "cwd": "'"${HB_REPO}"'",\n  "tool_name": "Bash",\n  "tool_input": {\n    "command": "echo hi"\n  }\n}'
+
+HB_PRE_OUT="$(DEV_WORKFLOW_MARKER_ROOT="$HB_REPO" bash "$HEARTBEAT_SCRIPT" pre <<< "$HB_JSON_PRE" 2>&1)"
+assert_exit_code "heartbeat.sh pre: exit 0 で終わる" 0 $?
+assert_eq "heartbeat.sh pre: 無出力" "" "$HB_PRE_OUT"
+
+if [ -f "$HB_TARGET" ]; then
+  HB_EPOCH="" HB_STATE="" HB_TOOL=""
+  IFS=$'\t' read -r HB_EPOCH HB_STATE HB_TOOL < "$HB_TARGET"
+  case "$HB_EPOCH" in
+    ''|*[!0-9]*) fail "heartbeat.sh pre: 1列目が epoch 秒（数字のみ）" "実際=[${HB_EPOCH}]" ;;
+    *)           pass "heartbeat.sh pre: 1列目が epoch 秒（数字のみ）" ;;
+  esac
+  assert_eq "heartbeat.sh pre: 2列目が pre（ツール実行中を示す）" "pre" "$HB_STATE"
+  assert_eq "heartbeat.sh pre: 3列目が複数行JSONからツール名を正しく抽出" "Bash" "$HB_TOOL"
+  HB_LINE_COUNT="$(wc -l < "$HB_TARGET" | tr -d ' ')"
+  assert_eq "heartbeat.sh pre: マーカーファイルは1行だけ" "1" "$HB_LINE_COUNT"
+else
+  fail "heartbeat.sh pre: マーカーファイルが書かれる" "存在しません: ${HB_TARGET}"
+fi
+
+# --- post 呼び出し: 別の state・別のツール名で上書き（追記ではなく置き換え） ---
+HB_JSON_POST=$'{\n  "cwd": "'"${HB_REPO}"'",\n  "tool_name": "mcp__foo__bar"\n}'
+HB_POST_OUT="$(DEV_WORKFLOW_MARKER_ROOT="$HB_REPO" bash "$HEARTBEAT_SCRIPT" post <<< "$HB_JSON_POST" 2>&1)"
+assert_exit_code "heartbeat.sh post: exit 0 で終わる" 0 $?
+assert_eq "heartbeat.sh post: 無出力" "" "$HB_POST_OUT"
+
+IFS=$'\t' read -r HB_EPOCH2 HB_STATE2 HB_TOOL2 < "$HB_TARGET"
+assert_eq "heartbeat.sh post: 2列目が post（モデル応答待ちを示す）" "post" "$HB_STATE2"
+assert_eq "heartbeat.sh post: 3列目がツール名(mcp形式)を正しく抽出" "mcp__foo__bar" "$HB_TOOL2"
+HB_LINE_COUNT2="$(wc -l < "$HB_TARGET" | tr -d ' ')"
+assert_eq "heartbeat.sh post: 上書き後もマーカーファイルは1行だけ（追記でない）" "1" "$HB_LINE_COUNT2"
+
+# --- ツール名が取れない入力でも "-" として記録し exit 0 ---
+HB_JSON_NOTOOL=$'{\n  "cwd": "'"${HB_REPO}"'"\n}'
+HB_NOTOOL_OUT="$(DEV_WORKFLOW_MARKER_ROOT="$HB_REPO" bash "$HEARTBEAT_SCRIPT" pre <<< "$HB_JSON_NOTOOL" 2>&1)"
+assert_exit_code "heartbeat.sh: tool_name が無いJSONでも exit 0" 0 $?
+IFS=$'\t' read -r HB_EPOCH3 HB_STATE3 HB_TOOL3 < "$HB_TARGET"
+assert_eq "heartbeat.sh: tool_name が無ければ '-' として記録" "-" "$HB_TOOL3"
+
+# --- 壊れたJSON（想定外の入力）でも exit 0、"-" として記録 ---
+HB_GARBAGE='not even json { [ garbage without any structure'
+HB_GARBAGE_OUT="$(DEV_WORKFLOW_MARKER_ROOT="$HB_REPO" bash "$HEARTBEAT_SCRIPT" post <<< "$HB_GARBAGE" 2>&1)"
+assert_exit_code "heartbeat.sh: 壊れたJSONでも exit 0" 0 $?
+assert_eq "heartbeat.sh: 壊れたJSONでも無出力" "" "$HB_GARBAGE_OUT"
+IFS=$'\t' read -r HB_EPOCH4 HB_STATE4 HB_TOOL4 < "$HB_TARGET"
+assert_eq "heartbeat.sh: 壊れたJSONでは '-' として記録" "-" "$HB_TOOL4"
+
+# --- 空のstdinでも exit 0（記録は続ける。マーカールート自体は解決できているため） ---
+HB_EMPTY_OUT="$(DEV_WORKFLOW_MARKER_ROOT="$HB_REPO" bash "$HEARTBEAT_SCRIPT" pre < /dev/null 2>&1)"
+assert_exit_code "heartbeat.sh: 空のstdinでも exit 0" 0 $?
+assert_eq "heartbeat.sh: 空のstdinでも無出力" "" "$HB_EMPTY_OUT"
+
+# --- 不正な引数（pre/post以外）は無出力・exit 0 ---
+HB_BADARG_OUT="$(DEV_WORKFLOW_MARKER_ROOT="$HB_REPO" bash "$HEARTBEAT_SCRIPT" bogus < /dev/null 2>&1)"
+assert_exit_code "heartbeat.sh: 不正な引数でも exit 0" 0 $?
+assert_eq "heartbeat.sh: 不正な引数では無出力" "" "$HB_BADARG_OUT"
+
+# --- git管理外のディレクトリでは exit 0 かつ無出力（マーカーは書かない） ---
+HB_NONGIT="$(mktemp -d "${TMPDIR:-/tmp}/dw-test-hb-nongit.XXXXXX")"
+HB_NONGIT_OUT_FILE="$(mktemp "${TMPDIR:-/tmp}/dw-test-hb-nongit-out.XXXXXX")"
+(
+  cd "$HB_NONGIT" || exit 1
+  unset DEV_WORKFLOW_MARKER_ROOT CLAUDE_PROJECT_DIR
+  bash "$HEARTBEAT_SCRIPT" pre < /dev/null > "$HB_NONGIT_OUT_FILE" 2>&1
+)
+HB_NONGIT_EXIT=$?
+HB_NONGIT_OUT="$(cat "$HB_NONGIT_OUT_FILE")"
+assert_exit_code "heartbeat.sh: git管理外のディレクトリでは exit 0" 0 "$HB_NONGIT_EXIT"
+assert_eq "heartbeat.sh: git管理外のディレクトリでは無出力" "" "$HB_NONGIT_OUT"
+
+# --- .claude が無いリポジトリでは exit 0 かつ無出力・マーカーは作られない ---
+HB_NOCLAUDE_REPO="$(canon_root "$(make_temp_repo)")"
+HB_NOCLAUDE_OUT_FILE="$(mktemp "${TMPDIR:-/tmp}/dw-test-hb-noclaude-out.XXXXXX")"
+DEV_WORKFLOW_MARKER_ROOT="$HB_NOCLAUDE_REPO" bash "$HEARTBEAT_SCRIPT" pre < /dev/null \
+  > "$HB_NOCLAUDE_OUT_FILE" 2>&1
+HB_NOCLAUDE_EXIT=$?
+HB_NOCLAUDE_OUT="$(cat "$HB_NOCLAUDE_OUT_FILE")"
+assert_exit_code "heartbeat.sh: .claude が無ければ exit 0" 0 "$HB_NOCLAUDE_EXIT"
+assert_eq "heartbeat.sh: .claude が無ければ無出力" "" "$HB_NOCLAUDE_OUT"
+if [ -e "${HB_NOCLAUDE_REPO}/.claude" ]; then
+  fail "heartbeat.sh: .claude が無ければ作成もマーカー書き込みもしない" ".claude が作られました"
+else
+  pass "heartbeat.sh: .claude が無ければ作成もマーカー書き込みもしない"
+fi
+
+# --- worktreeから呼んでもメインリポのルートに書かれる ---
+HB_WT_REPO="$(canon_root "$(make_temp_repo)")"
+mkdir -p "${HB_WT_REPO}/.claude"
+HB_WT_DIR="${HB_WT_REPO}/.claude/worktrees/agent-hbtest"
+make_worktree "$HB_WT_REPO" "$HB_WT_DIR" "hb-agent-branch"
+HB_WT_JSON=$'{\n  "cwd": "'"${HB_WT_DIR}"'",\n  "tool_name": "Write"\n}'
+(
+  cd "$HB_WT_DIR" || exit 1
+  unset DEV_WORKFLOW_MARKER_ROOT CLAUDE_PROJECT_DIR
+  bash "$HEARTBEAT_SCRIPT" post <<< "$HB_WT_JSON" > /dev/null 2>&1
+)
+HB_WT_TARGET="${HB_WT_REPO}/.claude/${HB_MARKER_FILE}"
+if [ -f "$HB_WT_TARGET" ]; then
+  IFS=$'\t' read -r HB_WT_EPOCH HB_WT_STATE HB_WT_TOOL < "$HB_WT_TARGET"
+  assert_eq "heartbeat.sh: worktreeから呼んでもメインリポのルートに書かれる" "Write" "$HB_WT_TOOL"
+else
+  fail "heartbeat.sh: worktreeから呼んでもメインリポのルートに書かれる" "存在しません: ${HB_WT_TARGET}"
+fi
+
+# --- 同時に複数プロセスから呼ばれても、常に「正しい1行」である（行の混在・破損が無い） ---
+HB_CONC_REPO="$(canon_root "$(make_temp_repo)")"
+mkdir -p "${HB_CONC_REPO}/.claude"
+HB_CONC_TARGET="${HB_CONC_REPO}/.claude/${HB_MARKER_FILE}"
+HB_CONC_JSON_A=$'{\n  "cwd": "'"${HB_CONC_REPO}"'",\n  "tool_name": "ToolA"\n}'
+HB_CONC_JSON_B=$'{\n  "cwd": "'"${HB_CONC_REPO}"'",\n  "tool_name": "ToolB"\n}'
+HB_CONC_JSON_C=$'{\n  "cwd": "'"${HB_CONC_REPO}"'",\n  "tool_name": "ToolC"\n}'
+(
+  DEV_WORKFLOW_MARKER_ROOT="$HB_CONC_REPO" bash "$HEARTBEAT_SCRIPT" pre  <<< "$HB_CONC_JSON_A" >/dev/null 2>&1 &
+  DEV_WORKFLOW_MARKER_ROOT="$HB_CONC_REPO" bash "$HEARTBEAT_SCRIPT" post <<< "$HB_CONC_JSON_B" >/dev/null 2>&1 &
+  DEV_WORKFLOW_MARKER_ROOT="$HB_CONC_REPO" bash "$HEARTBEAT_SCRIPT" pre  <<< "$HB_CONC_JSON_C" >/dev/null 2>&1 &
+  wait
+)
+HB_CONC_LINES="$(wc -l < "$HB_CONC_TARGET" | tr -d ' ')"
+assert_eq "heartbeat.sh: 並行3プロセスから呼ばれてもファイルは常に1行" "1" "$HB_CONC_LINES"
+IFS=$'\t' read -r HB_CONC_EPOCH HB_CONC_STATE HB_CONC_TOOL < "$HB_CONC_TARGET"
+case "$HB_CONC_STATE" in
+  pre|post) : ;;
+  *) HB_CONC_STATE="invalid" ;;
+esac
+case "$HB_CONC_TOOL" in
+  ToolA|ToolB|ToolC) : ;;
+  *) HB_CONC_TOOL="invalid" ;;
+esac
+if [ "$HB_CONC_STATE" != "invalid" ] && [ "$HB_CONC_TOOL" != "invalid" ]; then
+  pass "heartbeat.sh: 並行書き込みの結果は3者のいずれか1つの完全な行（破損・混在なし）"
+else
+  fail "heartbeat.sh: 並行書き込みの結果は3者のいずれか1つの完全な行（破損・混在なし）" \
+    "実際の内容: $(cat "$HB_CONC_TARGET" 2>/dev/null)"
+fi
+
+# --- stdinがttyのときは読まない設計になっていることの静的確認 ---
+if grep -qE '\[ ! -t 0 \]' "$HEARTBEAT_SCRIPT"; then
+  pass "heartbeat.sh: stdinがtty（対話実行）のときは読まないガードがある"
+else
+  fail "heartbeat.sh: stdinがtty（対話実行）のときは読まないガードがある" "[ ! -t 0 ] が見つかりません"
+fi
+
+# --- スクリプト本体が date / jq を呼んでいないことの静的確認（受け入れ条件10の前提） ---
+# コメント行は対象外にし、単語境界での一致だけを見る
+HB_FORBIDDEN_HITS="$(grep -v '^[[:space:]]*#' "$HEARTBEAT_SCRIPT" \
+  | grep -E '(^|[^A-Za-z0-9_])(date|jq)[[:space:]]' || true)"
+if [ -z "$HB_FORBIDDEN_HITS" ]; then
+  pass "heartbeat.sh: スクリプト本体が date / jq を呼んでいない"
+else
+  fail "heartbeat.sh: スクリプト本体が date / jq を呼んでいない" "$HB_FORBIDDEN_HITS"
+fi
+
+# --- 性能: 100回連続実行が「素のプロセス起動コスト」に対して過大でないこと（受け入れ条件10） ---
+# heartbeat.sh は毎回 bash プロセスとして spawn される（フック呼び出しの実態）ため、
+# 絶対時間には bind mount 越しのファイル open や git worktree 越しのサンドボックスなど
+# 実行環境固有のプロセス起動オーバーヘッドが乗る（実測: Docker Desktop on Windows の
+# bind mount 環境では、素の `bash -c 'exit 0'` を100回起動するだけで数秒かかることがある）。
+# 絶対時間を固定の秒数で決め打つと環境差でフレーキーになるため、同一環境で素のプロセス起動を
+# 100回行った基準時間（FLOOR）を測り、heartbeat.sh 自身のロジック（marker-root.sh の
+# source・stdin読み取り・tmp書き込み+mv）に許される予算をその上乗せ分として評価する。
+# 外部プロセス（date/jq等）を呼ぶ regression が入れば、その分だけ FLOOR に対して余分な
+# プロセス起動が積み増しされるため、この相対評価でも十分検出できる。
+HB_PERF_FLOOR_START=""
+printf -v HB_PERF_FLOOR_START '%(%s)T' -1
+HB_PERF_FLOOR_I=0
+while [ "$HB_PERF_FLOOR_I" -lt 100 ]; do
+  bash -c 'exit 0' >/dev/null 2>&1
+  HB_PERF_FLOOR_I=$((HB_PERF_FLOOR_I + 1))
+done
+HB_PERF_FLOOR_END=""
+printf -v HB_PERF_FLOOR_END '%(%s)T' -1
+HB_PERF_FLOOR=$((HB_PERF_FLOOR_END - HB_PERF_FLOOR_START))
+
+HB_PERF_REPO="$(canon_root "$(make_temp_repo)")"
+mkdir -p "${HB_PERF_REPO}/.claude"
+HB_PERF_JSON=$'{\n  "cwd": "'"${HB_PERF_REPO}"'",\n  "tool_name": "Bash"\n}'
+HB_PERF_START=""
+printf -v HB_PERF_START '%(%s)T' -1
+HB_PERF_I=0
+while [ "$HB_PERF_I" -lt 100 ]; do
+  DEV_WORKFLOW_MARKER_ROOT="$HB_PERF_REPO" bash "$HEARTBEAT_SCRIPT" pre <<< "$HB_PERF_JSON" >/dev/null 2>&1
+  HB_PERF_I=$((HB_PERF_I + 1))
+done
+HB_PERF_END=""
+printf -v HB_PERF_END '%(%s)T' -1
+HB_PERF_ELAPSED=$((HB_PERF_END - HB_PERF_START))
+
+# FLOOR + 5秒: heartbeat.sh 自身の純粋なbashロジック（外部プロセス無し）に許される予算。
+HB_PERF_BUDGET=$((HB_PERF_FLOOR + 5))
+if [ "$HB_PERF_ELAPSED" -le "$HB_PERF_BUDGET" ]; then
+  pass "heartbeat.sh: 100回連続実行がプロセス起動コストに対して過大でない（実測 ${HB_PERF_ELAPSED}s / floor ${HB_PERF_FLOOR}s+5s予算・受け入れ条件10）"
+else
+  fail "heartbeat.sh: 100回連続実行がプロセス起動コストに対して過大でない" \
+    "実測 ${HB_PERF_ELAPSED}s > floor ${HB_PERF_FLOOR}s + 5s予算"
+fi
+
+# ---------------------------------------------------------------------------
+# scripts/heartbeat.sh: 打ち切り（--abort）判定（Task #50、Epic #42。cwd拡張はレビュー#59, #61）
+#
+# .dev-workflow-abort は人間が watchdog.sh --abort を明示的に叩いたときだけ作られる
+# （Epic #42 仕様書「5. 打ち切りの仕様」）。heartbeat.sh pre はこのフラグと、フック入力
+# JSON の cwd が Claude のisolation worktree（.claude/worktrees/agent-）または
+# Codex のEpic共有worktree（.codex/worktrees/。Codexにはタスクごとのisolation worktreeが
+# 無いため代わりにこちらを対象にする）を含む場合にのみツール呼び出しを拒否する。
+# run のメインループ（Claude: epic worktree・リポジトリルート／Codex: run-loop.sh自体は
+# codexセッションではなくフックが発火しない）は絶対に拒否しない。
+# Codexのブロック契約はsystemMessageのみでcontinue非対応（後述）のため、実際にはハード
+# ブロックにならないソフトな打ち切り依頼になる点に注意（詳細はheartbeat.sh本体を参照）。
+# ---------------------------------------------------------------------------
+
+echo ""
+echo "== scripts/heartbeat.sh: 打ち切り（--abort）判定（Task #50） =="
+
+HBA_REPO="$(canon_root "$(make_temp_repo)")"
+mkdir -p "${HBA_REPO}/.claude"
+HBA_ABORT_FLAG="${HBA_REPO}/.claude/.dev-workflow-abort"
+HBA_AGENT_CWD="${HBA_REPO}/.claude/worktrees/agent-hba-test"
+HBA_EPIC_CWD="${HBA_REPO}/.claude/worktrees/epic99"
+HBA_ROOT_CWD="${HBA_REPO}"
+
+printf 'テスト用の打ち切り理由\n' > "$HBA_ABORT_FLAG"
+
+# --- フラグあり + cwdがagent worktree → 拒否される（Claude契約: exit 2 + stderr） ---
+HBA_JSON_AGENT=$'{\n  "cwd": "'"${HBA_AGENT_CWD}"'",\n  "tool_name": "Bash"\n}'
+HBA_AGENT_OUT="$(DEV_WORKFLOW_MARKER_ROOT="$HBA_REPO" DEV_WORKFLOW_HOOK_VENDOR=claude \
+  bash "$HEARTBEAT_SCRIPT" pre <<< "$HBA_JSON_AGENT" 2>&1)"
+assert_exit_code "heartbeat.sh: abortフラグあり・agent worktreeのcwd → exit 2で拒否" 2 $?
+case "$HBA_AGENT_OUT" in
+  *"テスト用の打ち切り理由"*) pass "heartbeat.sh: 拒否メッセージに--abortの理由が含まれる" ;;
+  *)                          fail "heartbeat.sh: 拒否メッセージに--abortの理由が含まれる" "$HBA_AGENT_OUT" ;;
+esac
+case "$HBA_AGENT_OUT" in
+  *"打ち切りが指示されました"*) pass "heartbeat.sh: 拒否メッセージに中止・報告の指示が含まれる" ;;
+  *)                            fail "heartbeat.sh: 拒否メッセージに中止・報告の指示が含まれる" "$HBA_AGENT_OUT" ;;
+esac
+
+# 拒否されても生存信号自体は記録される（打ち切り判定は書き込みの後に行う設計）
+if [ -f "${HBA_REPO}/.claude/.dev-workflow-heartbeat" ]; then
+  pass "heartbeat.sh: 拒否時も生存信号（heartbeatマーカー）は記録される"
+else
+  fail "heartbeat.sh: 拒否時も生存信号（heartbeatマーカー）は記録される" "マーカーファイルが無い"
+fi
+
+# --- フラグあり + cwdがepic worktree → 拒否されない（run本体を絶対に殺さない） ---
+HBA_JSON_EPIC=$'{\n  "cwd": "'"${HBA_EPIC_CWD}"'",\n  "tool_name": "Bash"\n}'
+HBA_EPIC_OUT="$(DEV_WORKFLOW_MARKER_ROOT="$HBA_REPO" DEV_WORKFLOW_HOOK_VENDOR=claude \
+  bash "$HEARTBEAT_SCRIPT" pre <<< "$HBA_JSON_EPIC" 2>&1)"
+assert_exit_code "heartbeat.sh: abortフラグあり・epic worktreeのcwd → 拒否されない（exit 0）" 0 $?
+assert_eq "heartbeat.sh: abortフラグあり・epic worktreeのcwd → 無出力" "" "$HBA_EPIC_OUT"
+
+# --- フラグあり + cwdがリポジトリルート → 拒否されない ---
+HBA_JSON_ROOT=$'{\n  "cwd": "'"${HBA_ROOT_CWD}"'",\n  "tool_name": "Bash"\n}'
+HBA_ROOT_OUT="$(DEV_WORKFLOW_MARKER_ROOT="$HBA_REPO" DEV_WORKFLOW_HOOK_VENDOR=claude \
+  bash "$HEARTBEAT_SCRIPT" pre <<< "$HBA_JSON_ROOT" 2>&1)"
+assert_exit_code "heartbeat.sh: abortフラグあり・リポジトリルートのcwd → 拒否されない（exit 0）" 0 $?
+assert_eq "heartbeat.sh: abortフラグあり・リポジトリルートのcwd → 無出力" "" "$HBA_ROOT_OUT"
+
+# --- フラグが無ければ、cwdがagent worktreeでも拒否されない ---
+HBA_NOFLAG_REPO="$(canon_root "$(make_temp_repo)")"
+mkdir -p "${HBA_NOFLAG_REPO}/.claude"
+HBA_NOFLAG_AGENT_CWD="${HBA_NOFLAG_REPO}/.claude/worktrees/agent-hba-noflag"
+HBA_JSON_NOFLAG=$'{\n  "cwd": "'"${HBA_NOFLAG_AGENT_CWD}"'",\n  "tool_name": "Bash"\n}'
+HBA_NOFLAG_OUT="$(DEV_WORKFLOW_MARKER_ROOT="$HBA_NOFLAG_REPO" DEV_WORKFLOW_HOOK_VENDOR=claude \
+  bash "$HEARTBEAT_SCRIPT" pre <<< "$HBA_JSON_NOFLAG" 2>&1)"
+assert_exit_code "heartbeat.sh: abortフラグが無ければagent worktreeでも拒否されない" 0 $?
+
+# --- Codex契約: exit 0 + stdoutに {"continue":false, ...} のJSON ---
+HBA_CODEX_OUT="$(DEV_WORKFLOW_MARKER_ROOT="$HBA_REPO" DEV_WORKFLOW_HOOK_VENDOR=codex \
+  bash "$HEARTBEAT_SCRIPT" pre <<< "$HBA_JSON_AGENT" 2>&1)"
+assert_exit_code "heartbeat.sh: Codex契約はexit 0で終わる" 0 $?
+case "$HBA_CODEX_OUT" in
+  *'"continue":false'*) pass "heartbeat.sh: Codex契約はstdoutに\"continue\":falseを含むJSONを出す" ;;
+  *)                     fail "heartbeat.sh: Codex契約はstdoutに\"continue\":falseを含むJSONを出す" "$HBA_CODEX_OUT" ;;
+esac
+case "$HBA_CODEX_OUT" in
+  *"テスト用の打ち切り理由"*) pass "heartbeat.sh: Codex契約のJSONにも--abortの理由が含まれる" ;;
+  *)                          fail "heartbeat.sh: Codex契約のJSONにも--abortの理由が含まれる" "$HBA_CODEX_OUT" ;;
+esac
+
+# --- フラグあり + cwdがCodexのEpic共有worktree（.codex/worktrees/<epic>）→ 打ち切り判定の
+#     対象になる（レビュー#59, #61）。Codexにはタスクごとのisolation worktreeという概念自体が
+#     無く、generator/evaluatorは常にこの共有worktreeで動くため、Claudeの
+#     `.claude/worktrees/agent-` と同じ役割をこのパターンが担う ---
+HBA_CODEX_WT_CWD="${HBA_REPO}/.codex/worktrees/42"
+HBA_JSON_CODEX_WT=$'{\n  "cwd": "'"${HBA_CODEX_WT_CWD}"'",\n  "tool_name": "Bash"\n}'
+HBA_CODEX_WT_OUT="$(DEV_WORKFLOW_MARKER_ROOT="$HBA_REPO" DEV_WORKFLOW_HOOK_VENDOR=codex \
+  bash "$HEARTBEAT_SCRIPT" pre <<< "$HBA_JSON_CODEX_WT" 2>&1)"
+assert_exit_code "heartbeat.sh: abortフラグあり・Codex共有worktree(.codex/worktrees/)のcwd → exit 0で終わる（Codex契約。#59, #61）" \
+  0 $?
+case "$HBA_CODEX_WT_OUT" in
+  *'"continue":false'*) pass "heartbeat.sh: Codex共有worktreeのcwdでもstdoutに\"continue\":falseを含むJSONを出す（#59, #61）" ;;
+  *)                     fail "heartbeat.sh: Codex共有worktreeのcwdでもstdoutに\"continue\":falseを含むJSONを出す（#59, #61）" \
+    "$HBA_CODEX_WT_OUT" ;;
+esac
+case "$HBA_CODEX_WT_OUT" in
+  *"テスト用の打ち切り理由"*) pass "heartbeat.sh: Codex共有worktreeのcwdでも--abortの理由がJSONに含まれる（#59, #61）" ;;
+  *)                          fail "heartbeat.sh: Codex共有worktreeのcwdでも--abortの理由がJSONに含まれる（#59, #61）" \
+    "$HBA_CODEX_WT_OUT" ;;
+esac
+
+# --- フラグが無ければ、cwdがCodex共有worktreeでも拒否されない ---
+HBA_CODEX_WT_NOFLAG_OUT="$(DEV_WORKFLOW_MARKER_ROOT="$HBA_NOFLAG_REPO" DEV_WORKFLOW_HOOK_VENDOR=codex \
+  bash "$HEARTBEAT_SCRIPT" pre <<< "$(printf '{\n  "cwd": "%s/.codex/worktrees/42",\n  "tool_name": "Bash"\n}' "$HBA_NOFLAG_REPO")" 2>&1)"
+assert_exit_code "heartbeat.sh: abortフラグが無ければCodex共有worktreeでも拒否されない" 0 $?
+
+# --- postでは拒否しない（フラグあり・agent worktreeのcwdでも） ---
+HBA_POST_OUT="$(DEV_WORKFLOW_MARKER_ROOT="$HBA_REPO" DEV_WORKFLOW_HOOK_VENDOR=claude \
+  bash "$HEARTBEAT_SCRIPT" post <<< "$HBA_JSON_AGENT" 2>&1)"
+assert_exit_code "heartbeat.sh: postでは拒否しない（フラグ・agent cwdがあってもexit 0）" 0 $?
+assert_eq "heartbeat.sh: postでは無出力" "" "$HBA_POST_OUT"
+
+# --- Windowsネイティブパス表現（バックスラッシュ、JSONでは二重エスケープ）のcwd正規化
+#     （レビュー#60）。scripts/check-readability.sh:220-221 と同じ「JSONエスケープ解除
+#     （\\ → \）+ Windowsパス正規化（\ → /）」がheartbeat.shにも入っていることを、
+#     cwdがバックスラッシュ表現で来た場合に確認する。 ---
+
+# フラグあり + cwdがWindows表現のagent worktree(.claude\worktrees\agent-) → 拒否される
+HBA_WIN_AGENT_CWD='C:\\Users\\hba-win\\.claude\\worktrees\\agent-hba-winpath'
+HBA_JSON_WIN_AGENT=$'{\n  "cwd": "'"${HBA_WIN_AGENT_CWD}"'",\n  "tool_name": "Bash"\n}'
+HBA_WIN_AGENT_OUT="$(DEV_WORKFLOW_MARKER_ROOT="$HBA_REPO" DEV_WORKFLOW_HOOK_VENDOR=claude \
+  bash "$HEARTBEAT_SCRIPT" pre <<< "$HBA_JSON_WIN_AGENT" 2>&1)"
+assert_exit_code "heartbeat.sh: abortフラグあり・Windows表現(バックスラッシュ)のagent worktreeのcwd → exit 2で拒否（#60）" \
+  2 $?
+case "$HBA_WIN_AGENT_OUT" in
+  *"テスト用の打ち切り理由"*) pass "heartbeat.sh: Windows表現のcwdでも拒否メッセージに--abortの理由が含まれる（#60）" ;;
+  *) fail "heartbeat.sh: Windows表現のcwdでも拒否メッセージに--abortの理由が含まれる（#60）" "$HBA_WIN_AGENT_OUT" ;;
+esac
+
+# フラグあり + cwdがWindows表現のCodex共有worktree(.codex\worktrees\) → 拒否される（Codex契約）
+HBA_WIN_CODEX_WT_CWD='C:\\Users\\hba-win\\.codex\\worktrees\\epic42'
+HBA_JSON_WIN_CODEX_WT=$'{\n  "cwd": "'"${HBA_WIN_CODEX_WT_CWD}"'",\n  "tool_name": "Bash"\n}'
+HBA_WIN_CODEX_WT_OUT="$(DEV_WORKFLOW_MARKER_ROOT="$HBA_REPO" DEV_WORKFLOW_HOOK_VENDOR=codex \
+  bash "$HEARTBEAT_SCRIPT" pre <<< "$HBA_JSON_WIN_CODEX_WT" 2>&1)"
+assert_exit_code "heartbeat.sh: abortフラグあり・Windows表現(バックスラッシュ)のCodex共有worktreeのcwd → exit 0で終わる（Codex契約。#60）" \
+  0 $?
+case "$HBA_WIN_CODEX_WT_OUT" in
+  *'"continue":false'*) pass "heartbeat.sh: Windows表現のCodex共有worktreeのcwdでもstdoutに\"continue\":falseを含むJSONを出す（#60）" ;;
+  *) fail "heartbeat.sh: Windows表現のCodex共有worktreeのcwdでもstdoutに\"continue\":falseを含むJSONを出す（#60）" \
+    "$HBA_WIN_CODEX_WT_OUT" ;;
+esac
+case "$HBA_WIN_CODEX_WT_OUT" in
+  *"テスト用の打ち切り理由"*) pass "heartbeat.sh: Windows表現のCodex共有worktreeのcwdでも--abortの理由がJSONに含まれる（#60）" ;;
+  *) fail "heartbeat.sh: Windows表現のCodex共有worktreeのcwdでも--abortの理由がJSONに含まれる（#60）" \
+    "$HBA_WIN_CODEX_WT_OUT" ;;
+esac
+
+# フラグあり + cwdがWindows表現のepic worktree(agent-プレフィックスなし) → 拒否されない
+# （正規化してもagent-パターン・.codex/worktrees/パターンいずれにも一致しないこと）
+HBA_WIN_EPIC_CWD='C:\\Users\\hba-win\\.claude\\worktrees\\epic99'
+HBA_JSON_WIN_EPIC=$'{\n  "cwd": "'"${HBA_WIN_EPIC_CWD}"'",\n  "tool_name": "Bash"\n}'
+HBA_WIN_EPIC_OUT="$(DEV_WORKFLOW_MARKER_ROOT="$HBA_REPO" DEV_WORKFLOW_HOOK_VENDOR=claude \
+  bash "$HEARTBEAT_SCRIPT" pre <<< "$HBA_JSON_WIN_EPIC" 2>&1)"
+assert_exit_code "heartbeat.sh: abortフラグあり・Windows表現のepic worktreeのcwd → 拒否されない（exit 0。#60）" \
+  0 $?
+assert_eq "heartbeat.sh: abortフラグあり・Windows表現のepic worktreeのcwd → 無出力（#60）" "" "$HBA_WIN_EPIC_OUT"
+
+# --- watchdog.sh --abort / --clear との結合: 実際にwatchdog.shで作った/消したフラグで動く ---
+HBA_WD_SCRIPT="${REPO_ROOT}/scripts/watchdog.sh"
+HBA_INT_REPO="$(canon_root "$(make_temp_repo)")"
+mkdir -p "${HBA_INT_REPO}/.claude"
+HBA_INT_AGENT_CWD="${HBA_INT_REPO}/.claude/worktrees/agent-hba-integ"
+HBA_JSON_INT=$'{\n  "cwd": "'"${HBA_INT_AGENT_CWD}"'",\n  "tool_name": "Bash"\n}'
+
+DEV_WORKFLOW_MARKER_ROOT="$HBA_INT_REPO" bash "$HBA_WD_SCRIPT" --abort "結合テストの理由" >/dev/null 2>&1
+HBA_INT_OUT1="$(DEV_WORKFLOW_MARKER_ROOT="$HBA_INT_REPO" DEV_WORKFLOW_HOOK_VENDOR=claude \
+  bash "$HEARTBEAT_SCRIPT" pre <<< "$HBA_JSON_INT" 2>&1)"
+assert_exit_code "heartbeat.sh: watchdog.sh --abortで作ったフラグにより拒否される" 2 $?
+case "$HBA_INT_OUT1" in
+  *"結合テストの理由"*) pass "heartbeat.sh: watchdog.sh --abortの理由がそのまま拒否メッセージに載る" ;;
+  *)                     fail "heartbeat.sh: watchdog.sh --abortの理由がそのまま拒否メッセージに載る" "$HBA_INT_OUT1" ;;
+esac
+
+DEV_WORKFLOW_MARKER_ROOT="$HBA_INT_REPO" bash "$HBA_WD_SCRIPT" --abort --clear >/dev/null 2>&1
+if [ -f "${HBA_INT_REPO}/.claude/.dev-workflow-abort" ]; then
+  fail "watchdog.sh --abort --clear: フラグファイルが削除される"
+else
+  pass "watchdog.sh --abort --clear: フラグファイルが削除される"
+fi
+HBA_INT_OUT2="$(DEV_WORKFLOW_MARKER_ROOT="$HBA_INT_REPO" DEV_WORKFLOW_HOOK_VENDOR=claude \
+  bash "$HEARTBEAT_SCRIPT" pre <<< "$HBA_JSON_INT" 2>&1)"
+assert_exit_code "heartbeat.sh: --abort --clear の後は拒否されない" 0 $?
+assert_eq "heartbeat.sh: --abort --clear の後は無出力" "" "$HBA_INT_OUT2"
+
+# watchdog.sh --abort / --abort --clear のログ記録
+HBA_WD_LOG="${HBA_INT_REPO}/.claude/.dev-workflow-watchdog.log"
+if grep -q "$(printf '\tabort\t')" "$HBA_WD_LOG" 2>/dev/null; then
+  pass "watchdog.sh --abort: ログに記録される"
+else
+  fail "watchdog.sh --abort: ログに記録される" "$(cat "$HBA_WD_LOG" 2>&1)"
+fi
+if grep -q "$(printf '\tabort-clear\t')" "$HBA_WD_LOG" 2>/dev/null; then
+  pass "watchdog.sh --abort --clear: ログに記録される"
+else
+  fail "watchdog.sh --abort --clear: ログに記録される" "$(cat "$HBA_WD_LOG" 2>&1)"
+fi
+
+# watchdog.sh --abort: 理由もclearも指定しないとエラー（exit 64）
+DEV_WORKFLOW_MARKER_ROOT="$HBA_INT_REPO" bash "$HBA_WD_SCRIPT" --abort >/dev/null 2>&1
+assert_exit_code "watchdog.sh --abort: 理由未指定はエラー（exit 64）" 64 $?
+
+# ---------------------------------------------------------------------------
+# scripts/watchdog.sh（常駐監視の骨格とライフサイクル。Task #45、Epic #42）
+#
+# run のメインループはサブエージェント実行中に別処理を回せないため、監視は
+# nohup で自己デタッチする常駐プロセスとして実装している（Epic #42 仕様書「2. 全体像」
+# 「5. デタッチした常駐プロセス」）。ここでは検知ロジック（#47〜#49）ではなく、
+# 起動・停止・状態確認・自己終了・二重起動防止・stale PID 検出のライフサイクルだけを
+# 検証する。実プロセスを扱うケースは合計10秒以内に収め、終了後にプロセスを残さない。
+# ---------------------------------------------------------------------------
+
+echo ""
+echo "== scripts/watchdog.sh（常駐監視の骨格とライフサイクル。Task #45） =="
+
+WD_SCRIPT="${REPO_ROOT}/scripts/watchdog.sh"
+
+# wd_new_root  一時マーカールート（.claude/ 付き）を作って絶対パスを返す
+wd_new_root() {
+  local dir
+  dir="$(mktemp -d "${TMPDIR:-/tmp}/dw-test-watchdog.XXXXXX")"
+  mkdir -p "${dir}/.claude"
+  printf '%s' "$dir"
+}
+
+# wd_pid_of <root>  PIDファイルに書かれたPID部分だけを返す（無ければ空文字）
+wd_pid_of() {
+  local root="$1" line=""
+  [ -f "${root}/.claude/.dev-workflow-watchdog.pid" ] || return 0
+  IFS= read -r line < "${root}/.claude/.dev-workflow-watchdog.pid" || true
+  printf '%s' "${line%% *}"
+}
+
+# wd_pid_alive <pid>  そのPIDが実際に稼働していれば0を返す
+#
+# `kill -0` だけではゾンビ（終了済みだが未回収のプロセス）にも成功してしまう
+# （POSIXの仕様どおり）。init を持たないこのサンドボックスコンテナでは孤児プロセスが
+# 永久にゾンビのまま残ることが実測で判明したため、watchdog.sh の
+# _watchdog_pid_alive と同じロジック（/proc の State 行でゾンビを除外する）を
+# テスト側でも使う。
+wd_pid_alive() {
+  local pid="$1"
+  case "$pid" in
+    ''|*[!0-9]*) return 1 ;;
+  esac
+  kill -0 "$pid" 2>/dev/null || return 1
+
+  if [ -r "/proc/${pid}/status" ]; then
+    local line
+    while IFS= read -r line; do
+      case "$line" in
+        State:*)
+          case "$line" in
+            *'(zombie)'*) return 1 ;;
+          esac
+          break
+          ;;
+      esac
+    done < "/proc/${pid}/status"
+  fi
+
+  return 0
+}
+
+# テストが途中で失敗しても、起動した監視デーモンを必ず後始末する
+# （ホストには他の作業が動いているため、無関係なプロセスには触れない。
+#   ここで kill するのはこのテストが自分で起動したPIDだけ）
+WD_CLEANUP_PIDS=()
+wd_cleanup_all() {
+  local p
+  for p in "${WD_CLEANUP_PIDS[@]:-}"; do
+    [ -n "$p" ] || continue
+    wd_pid_alive "$p" && kill "$p" 2>/dev/null
+  done
+}
+trap wd_cleanup_all EXIT
+
+# --- ライフサイクル: start（即時に返る・生存）→ status（running）→ 二重start（1プロセスのまま）
+#     → stop（確実に停止）→ status（stopped・PIDファイル消滅） ---
+
+WD_ROOT1="$(wd_new_root)"
+: > "${WD_ROOT1}/.claude/.dev-workflow-run"
+
+WD_T0=""
+printf -v WD_T0 '%(%s)T' -1
+WD_START_OUT="$(DEV_WORKFLOW_MARKER_ROOT="$WD_ROOT1" DEV_WORKFLOW_WATCHDOG_TICK_SEC=30 \
+  bash "$WD_SCRIPT" --start --epic 45 --label "Epic #45 test" 2>&1)"
+WD_T1=""
+printf -v WD_T1 '%(%s)T' -1
+WD_ELAPSED=$((WD_T1 - WD_T0))
+
+if [ "$WD_ELAPSED" -le 1 ]; then
+  pass "watchdog.sh --start: 呼び出しが1秒以内に返る（実測 ${WD_ELAPSED}s）"
+else
+  fail "watchdog.sh --start: 呼び出しが1秒以内に返る" "実測 ${WD_ELAPSED}s / 出力: ${WD_START_OUT}"
+fi
+
+WD_PID1="$(wd_pid_of "$WD_ROOT1")"
+WD_CLEANUP_PIDS+=("$WD_PID1")
+
+if [ -n "$WD_PID1" ] && wd_pid_alive "$WD_PID1"; then
+  pass "watchdog.sh --start: 起動したプロセスが親の呼び出し終了後も生存している（pid=${WD_PID1}）"
+else
+  fail "watchdog.sh --start: 起動したプロセスが親の呼び出し終了後も生存している" "pid=[${WD_PID1}]"
+fi
+
+WD_STATUS_OUT="$(DEV_WORKFLOW_MARKER_ROOT="$WD_ROOT1" bash "$WD_SCRIPT" --status)"
+WD_STATUS_EXIT=$?
+case "$WD_STATUS_OUT" in
+  running*) pass "watchdog.sh --status: running を返す（${WD_STATUS_OUT}）" ;;
+  *)        fail "watchdog.sh --status: running を返す" "$WD_STATUS_OUT" ;;
+esac
+assert_exit_code "watchdog.sh --status: running のときexit 0" 0 "$WD_STATUS_EXIT"
+
+case "$WD_STATUS_OUT" in
+  *"pid=${WD_PID1}"*) pass "watchdog.sh --status: PIDファイルのPIDと一致する" ;;
+  *)                  fail "watchdog.sh --status: PIDファイルのPIDと一致する" "$WD_STATUS_OUT" ;;
+esac
+
+# 二重に --start しても新しいプロセスは作らず、既存PIDのまま（監視プロセスは1つ）
+WD_START2_OUT="$(DEV_WORKFLOW_MARKER_ROOT="$WD_ROOT1" bash "$WD_SCRIPT" --start 2>&1)"
+WD_PID1_AFTER="$(wd_pid_of "$WD_ROOT1")"
+assert_eq "watchdog.sh --start: 二重起動してもPIDが変わらない（監視プロセスは1つ）" \
+  "$WD_PID1" "$WD_PID1_AFTER"
+case "$WD_START2_OUT" in
+  *"already running"*) pass "watchdog.sh --start: 二重起動時にその旨を出力する" ;;
+  *)                    fail "watchdog.sh --start: 二重起動時にその旨を出力する" "$WD_START2_OUT" ;;
+esac
+
+# --stop で確実に停止する
+WD_STOP_OUT="$(DEV_WORKFLOW_MARKER_ROOT="$WD_ROOT1" bash "$WD_SCRIPT" --stop 2>&1)"
+case "$WD_STOP_OUT" in
+  *"stopped"*) pass "watchdog.sh --stop: 停止メッセージを出す" ;;
+  *)           fail "watchdog.sh --stop: 停止メッセージを出す" "$WD_STOP_OUT" ;;
+esac
+
+if wd_pid_alive "$WD_PID1"; then
+  fail "watchdog.sh --stop: プロセスが実際に終了している" "pid=${WD_PID1} がまだ生存"
+else
+  pass "watchdog.sh --stop: プロセスが実際に終了している（pid=${WD_PID1}）"
+fi
+
+WD_STATUS_AFTER_STOP="$(DEV_WORKFLOW_MARKER_ROOT="$WD_ROOT1" bash "$WD_SCRIPT" --status)"
+WD_STATUS_AFTER_STOP_EXIT=$?
+assert_eq "watchdog.sh --status: --stop後はstoppedを返す" "stopped" "$WD_STATUS_AFTER_STOP"
+assert_exit_code "watchdog.sh --status: stoppedのときexit 1" 1 "$WD_STATUS_AFTER_STOP_EXIT"
+
+if [ -f "${WD_ROOT1}/.claude/.dev-workflow-watchdog.pid" ]; then
+  fail "watchdog.sh --stop: PIDファイルが残っていない（受け入れ条件8）"
+else
+  pass "watchdog.sh --stop: PIDファイルが残っていない（受け入れ条件8）"
+fi
+
+# --- stale PID: プロセスが存在しないPIDファイルが残っていても --start できる ---
+
+WD_ROOT2="$(wd_new_root)"
+: > "${WD_ROOT2}/.claude/.dev-workflow-run"
+
+# 確実に生存していないPIDを用意する（起動して即終了させ、waitで回収済みにする）
+bash -c 'exit 0' &
+WD_DEAD_PID=$!
+wait "$WD_DEAD_PID" 2>/dev/null
+printf '%s %s\n' "$WD_DEAD_PID" "1700000000" > "${WD_ROOT2}/.claude/.dev-workflow-watchdog.pid"
+
+DEV_WORKFLOW_MARKER_ROOT="$WD_ROOT2" DEV_WORKFLOW_WATCHDOG_TICK_SEC=30 \
+  bash "$WD_SCRIPT" --start > /dev/null 2>&1
+WD_PID2="$(wd_pid_of "$WD_ROOT2")"
+WD_CLEANUP_PIDS+=("$WD_PID2")
+
+if [ -n "$WD_PID2" ] && [ "$WD_PID2" != "$WD_DEAD_PID" ] && wd_pid_alive "$WD_PID2"; then
+  pass "watchdog.sh --start: 残骸PIDファイル（存在しないPID）があっても起動できる（新pid=${WD_PID2}）"
+else
+  fail "watchdog.sh --start: 残骸PIDファイル（存在しないPID）があっても起動できる" "pid=[${WD_PID2}] dead_pid=[${WD_DEAD_PID}]"
+fi
+
+if grep -q "stale-pid" "${WD_ROOT2}/.claude/.dev-workflow-watchdog.log" 2>/dev/null; then
+  pass "watchdog.sh --start: stale PID検出をログに記録する"
+else
+  fail "watchdog.sh --start: stale PID検出をログに記録する" "$(cat "${WD_ROOT2}/.claude/.dev-workflow-watchdog.log" 2>&1)"
+fi
+
+DEV_WORKFLOW_MARKER_ROOT="$WD_ROOT2" bash "$WD_SCRIPT" --stop > /dev/null 2>&1
+
+# --- --tick-once: 常駐せず1周だけ回してexit 0で返る ---
+
+WD_ROOT3="$(wd_new_root)"
+
+WD_TICK_T0=""
+printf -v WD_TICK_T0 '%(%s)T' -1
+DEV_WORKFLOW_MARKER_ROOT="$WD_ROOT3" bash "$WD_SCRIPT" --tick-once > /dev/null 2>&1
+WD_TICK_EXIT=$?
+WD_TICK_T1=""
+printf -v WD_TICK_T1 '%(%s)T' -1
+
+assert_exit_code "watchdog.sh --tick-once: exit 0で返る" 0 "$WD_TICK_EXIT"
+
+if [ $((WD_TICK_T1 - WD_TICK_T0)) -le 2 ]; then
+  pass "watchdog.sh --tick-once: 常駐せずすぐに返る"
+else
+  fail "watchdog.sh --tick-once: 常駐せずすぐに返る" "実測 $((WD_TICK_T1 - WD_TICK_T0))s"
+fi
+
+WD_TICK_LOG="${WD_ROOT3}/.claude/.dev-workflow-watchdog.log"
+if [ -f "$WD_TICK_LOG" ] && grep -q "$(printf '\ttick\t')" "$WD_TICK_LOG"; then
+  pass "watchdog.sh --tick-once: ログにtickイベントが1行追記される"
+else
+  fail "watchdog.sh --tick-once: ログにtickイベントが1行追記される" "$(cat "$WD_TICK_LOG" 2>&1)"
+fi
+
+if [ -f "${WD_ROOT3}/.claude/.dev-workflow-watchdog.pid" ]; then
+  fail "watchdog.sh --tick-once: 常駐しない（PIDファイルを作らない）"
+else
+  pass "watchdog.sh --tick-once: 常駐しない（PIDファイルを作らない）"
+fi
+
+# --- DEV_WORKFLOW_WATCHDOG_NOW を与えるとログの時刻がその値になる ---
+
+WD_ROOT4="$(wd_new_root)"
+WD_FIXED_NOW=1700000000
+WD_EXPECTED_TS=""
+printf -v WD_EXPECTED_TS '%(%Y-%m-%d %H:%M:%S)T' "$WD_FIXED_NOW"
+DEV_WORKFLOW_MARKER_ROOT="$WD_ROOT4" DEV_WORKFLOW_WATCHDOG_NOW="$WD_FIXED_NOW" \
+  bash "$WD_SCRIPT" --tick-once > /dev/null 2>&1
+WD_LOGGED_LINE="$(tail -1 "${WD_ROOT4}/.claude/.dev-workflow-watchdog.log" 2>/dev/null)"
+WD_LOGGED_TS="${WD_LOGGED_LINE%%$'\t'*}"
+assert_eq "watchdog.sh: DEV_WORKFLOW_WATCHDOG_NOW を与えるとログの時刻がその値になる" \
+  "$WD_EXPECTED_TS" "$WD_LOGGED_TS"
+
+# --- run マーカーを消すと（短いtick間隔で）自己終了する。受け入れ条件8 ---
+
+WD_ROOT5="$(wd_new_root)"
+: > "${WD_ROOT5}/.claude/.dev-workflow-run"
+
+DEV_WORKFLOW_MARKER_ROOT="$WD_ROOT5" DEV_WORKFLOW_WATCHDOG_TICK_SEC=1 \
+  bash "$WD_SCRIPT" --start > /dev/null 2>&1
+WD_PID5="$(wd_pid_of "$WD_ROOT5")"
+WD_CLEANUP_PIDS+=("$WD_PID5")
+
+rm -f "${WD_ROOT5}/.claude/.dev-workflow-run"
+
+WD_SELF_TERM_OK=0
+WD_WAIT_I=0
+while [ "$WD_WAIT_I" -lt 25 ]; do
+  if [ -n "$WD_PID5" ] && ! wd_pid_alive "$WD_PID5"; then
+    WD_SELF_TERM_OK=1
+    break
+  fi
+  sleep 0.2
+  WD_WAIT_I=$((WD_WAIT_I + 1))
+done
+
+if [ "$WD_SELF_TERM_OK" -eq 1 ]; then
+  pass "watchdog.sh: run マーカー消失で自己終了する（受け入れ条件8）"
+else
+  fail "watchdog.sh: run マーカー消失で自己終了する" "pid=${WD_PID5} が終了しなかった"
+fi
+
+if [ -f "${WD_ROOT5}/.claude/.dev-workflow-watchdog.pid" ]; then
+  fail "watchdog.sh: 自己終了後にPIDファイルが残っていない（受け入れ条件8）"
+else
+  pass "watchdog.sh: 自己終了後にPIDファイルが残っていない（受け入れ条件8）"
+fi
+
+if grep -q "exit-reason" "${WD_ROOT5}/.claude/.dev-workflow-watchdog.log" 2>/dev/null \
+  && grep -q "run marker missing" "${WD_ROOT5}/.claude/.dev-workflow-watchdog.log" 2>/dev/null; then
+  pass "watchdog.sh: 自己終了の理由がログに記録される"
+else
+  fail "watchdog.sh: 自己終了の理由がログに記録される" "$(cat "${WD_ROOT5}/.claude/.dev-workflow-watchdog.log" 2>&1)"
+fi
+
+# ---------------------------------------------------------------------------
+# scripts/watchdog.sh: エージェントを自動で打ち切る経路が存在しない（受け入れ条件6）
+#
+# 決定事項（Epic #42）: watchdog は検知して通知するだけであり、しきい値超過で
+# 自動的にツール呼び出しの拒否やプロセスkillを仕込む経路を持たない。
+# ここでは kill の使用箇所が watchdog_stop（人間が --stop を明示的に実行したときだけ
+# 通る経路）の1箇所に限られ、対象が監視デーモン自身のPIDであること、tick/検知フック
+# （自動発火の起点になり得る箇所）に kill が存在しないことを grep で証明する。
+#
+# `kill -0`（シグナル0=何も起こさない存在確認クエリ。POSIXの標準的なイディオム）は
+# ここでの「kill」から除外する。実際にプロセスを終了させないため、受け入れ条件6が
+# 問題にしている「自動打ち切り」には当たらない（_watchdog_pid_alive が
+# start/stop/status の生存確認に使っており、tick処理・検知フックからは呼ばれない）。
+# ---------------------------------------------------------------------------
+
+echo ""
+echo "== scripts/watchdog.sh: エージェントを自動で打ち切る経路が存在しない（受け入れ条件6） =="
+
+# コメント行を除いた実コード上で「実際に終了させる」kill（kill -0 は除く）が
+# 使われている箇所を数える
+WD_KILL_LINES="$(grep -v '^[[:space:]]*#' "$WD_SCRIPT" | grep -E '(^|[^A-Za-z0-9_])kill[[:space:]]' | grep -v -- '-0' || true)"
+WD_KILL_COUNT="$(printf '%s\n' "$WD_KILL_LINES" | grep -c . || true)"
+[ -z "$WD_KILL_LINES" ] && WD_KILL_COUNT=0
+
+assert_eq "watchdog.sh: 終了シグナルとしてのkillは1箇所だけ（--stop のみ・kill -0の存在確認は除く）" "1" "$WD_KILL_COUNT"
+
+case "$WD_KILL_LINES" in
+  *'kill "$pid"'*)
+    pass "watchdog.sh: kill は監視デーモン自身のPID（\$pid）だけを対象にする" ;;
+  *)
+    fail "watchdog.sh: kill は監視デーモン自身のPID（\$pid）だけを対象にする" "$WD_KILL_LINES" ;;
+esac
+
+# その1箇所が watchdog_stop（--stop の処理）の中に閉じていること
+WD_STOP_FN_BODY="$(awk '/^watchdog_stop\(\) \{/{f=1} f{print} f&&/^}/{exit}' "$WD_SCRIPT")"
+case "$WD_STOP_FN_BODY" in
+  *'kill "$pid"'*)
+    pass "watchdog.sh: kill は watchdog_stop（人間が --stop を叩いたときだけ）に閉じている" ;;
+  *)
+    fail "watchdog.sh: kill は watchdog_stop（人間が --stop を叩いたときだけ）に閉じている" "$WD_STOP_FN_BODY" ;;
+esac
+
+# tick処理・検知フック（監視ループが自動的に回す経路）に kill が存在しないこと
+WD_HOOK_BLOCK="$(awk '/^# 監視ループのフック点/{f=1} f&&/^# --start$/{exit} f' "$WD_SCRIPT")"
+if printf '%s' "$WD_HOOK_BLOCK" | grep -q 'kill'; then
+  fail "watchdog.sh: tick処理・検知フック（自動発火経路）にkillが存在しない（受け入れ条件6）" "$WD_HOOK_BLOCK"
+else
+  pass "watchdog.sh: tick処理・検知フック（自動発火経路）にkillが存在しない（受け入れ条件6）"
+fi
+
+# エージェント（Claude Code / Codex のCLIプロセスやサブエージェント）のPIDを扱う
+# 変数・識別子が存在しないこと（watchdogは監視デーモン自身のPIDしか知らない）
+if grep -qiE 'claude[_-]?pid|codex[_-]?pid|agent[_-]?pid|cli[_-]?pid' "$WD_SCRIPT"; then
+  fail "watchdog.sh: エージェント/CLIプロセスのPIDを扱う変数が存在しない（受け入れ条件6）" \
+    "$(grep -inE 'claude[_-]?pid|codex[_-]?pid|agent[_-]?pid|cli[_-]?pid' "$WD_SCRIPT")"
+else
+  pass "watchdog.sh: エージェント/CLIプロセスのPIDを扱う変数が存在しない（受け入れ条件6）"
+fi
+
+# --abort（人間が明示的に叩く打ち切り。#50）は実装されているが、tick処理・検知フック
+# （監視ループが自動的に回す経路。WD_HOOK_BLOCKは上でkillチェック用に抽出済み）からは
+# 一切参照されないこと（自動発火経路がここにも無いことの担保）
+if printf '%s' "$WD_HOOK_BLOCK" | grep -q 'dev-workflow-abort\|ABORT_FLAG_FILE'; then
+  fail "watchdog.sh: tick処理・検知フック（自動発火経路）に abort フラグの参照が存在しない（受け入れ条件6・#50）" \
+    "$WD_HOOK_BLOCK"
+else
+  pass "watchdog.sh: tick処理・検知フック（自動発火経路）に abort フラグの参照が存在しない（受け入れ条件6・#50）"
+fi
+
+# watchdog_abort関数が存在すること（人間が明示的に叩く経路。#50）
+WD_ABORT_FN_BODY="$(awk '/^watchdog_abort\(\) \{/{f=1} f{print} f&&/^}/{exit}' "$WD_SCRIPT")"
+if [ -z "$WD_ABORT_FN_BODY" ]; then
+  fail "watchdog.sh: watchdog_abort関数が存在する（#50）" "見つかりません"
+else
+  pass "watchdog.sh: watchdog_abort関数が存在する（#50）"
+fi
+
+# ABORT_FLAG_FILE（.dev-workflow-abort）を書き込む・削除するコードが、定義行・コメント行
+# を除いて watchdog_abort 関数の外に存在しないこと。これにより「自動でabortフラグを作る
+# 経路が存在しない」ことを、tick/検知フックだけでなくスクリプト全体で担保する。
+WD_ABORT_REF_LINES="$(grep -n 'ABORT_FLAG_FILE' "$WD_SCRIPT" \
+  | grep -vE '^[0-9]+:ABORT_FLAG_FILE=' \
+  | grep -vE '^[0-9]+:[[:space:]]*#' || true)"
+WD_ABORT_REF_OUTSIDE=""
+while IFS=: read -r wd_lno wd_rest; do
+  [ -n "$wd_lno" ] || continue
+  printf '%s\n' "$WD_ABORT_FN_BODY" | grep -qF -- "$wd_rest" \
+    || WD_ABORT_REF_OUTSIDE="${WD_ABORT_REF_OUTSIDE}${wd_lno}:${wd_rest}"$'\n'
+done <<< "$WD_ABORT_REF_LINES"
+if [ -n "$WD_ABORT_REF_OUTSIDE" ]; then
+  fail "watchdog.sh: ABORT_FLAG_FILEを扱うコードはwatchdog_abort関数の内側だけにある（自動発火経路が無いことの担保・#50）" \
+    "$WD_ABORT_REF_OUTSIDE"
+else
+  pass "watchdog.sh: ABORT_FLAG_FILEを扱うコードはwatchdog_abort関数の内側だけにある（自動発火経路が無いことの担保・#50）"
+fi
+
+# AUTO_ABORT等、自動発火用の環境変数・分岐が存在しないこと（#50: 環境変数による自動abortも設けない）
+if grep -qiE 'auto[_-]?abort' "$WD_SCRIPT"; then
+  fail "watchdog.sh: 自動発火用の環境変数・分岐（AUTO_ABORT等）が存在しない（#50）" \
+    "$(grep -inE 'auto[_-]?abort' "$WD_SCRIPT")"
+else
+  pass "watchdog.sh: 自動発火用の環境変数・分岐（AUTO_ABORT等）が存在しない（#50）"
+fi
+
+# --- テスト後始末: 生き残っているデーモンがあれば停止する ---
+wd_cleanup_all
+trap - EXIT
+
+# ---------------------------------------------------------------------------
+# scripts/watchdog.sh: ストール判定・エスカレーション・スリープギャップ補正（Task #47、Epic #42）
+#
+# DEV_WORKFLOW_WATCHDOG_NOW で時刻を注入し --tick-once を連続で叩くことで、実時間を
+# 一切待たずに「未検知→初回→エスカレーション→打ち止め→復帰→再ストール」の遷移を検証する。
+# 通知は notify-slack.sh の DEV_WORKFLOW_NOTIFY_SINK 経由で検証し、ネットワークには
+# 一切出ない（既存の notify-slack.sh テストと同じsink機構。PATHへ偽curlを差し込み、
+# 万一sink機構をバイパスしても実curlが呼ばれないことも確認する）。
+#
+# tick_sec は意図的に大きく（3600秒）取り、テストで注入する時刻ジャンプ（最大でも
+# 数千秒）がスリープギャップ（tick間隔の3倍超）として誤検知されないようにしている
+# （スリープギャップそのものの検証は専用のケース群で tick_sec=60 を使って別途行う）。
+# ---------------------------------------------------------------------------
+
+echo ""
+echo "== scripts/watchdog.sh: ストール判定・エスカレーション・スリープギャップ補正（Task #47） =="
+
+WDS_WORK="$(mktemp -d "${TMPDIR:-/tmp}/dw-test-watchdog-stall.XXXXXX")"
+WDS_FAKE_BIN="${WDS_WORK}/bin"
+mkdir -p "$WDS_FAKE_BIN"
+WDS_CURL_LOG="${WDS_WORK}/curl-calls.log"
+printf '#!/bin/bash\necho "called: $*" >> "%s"\nexit 0\n' "$WDS_CURL_LOG" > "${WDS_FAKE_BIN}/curl"
+chmod +x "${WDS_FAKE_BIN}/curl"
+
+# wds_write_heartbeat <root> <epoch> <state> <tool>
+wds_write_heartbeat() {
+  printf '%s\t%s\t%s\n' "$2" "$3" "$4" > "${1}/.claude/.dev-workflow-heartbeat"
+}
+
+# wds_tick <root> <now> <tick_sec> [sink_file]
+# --tick-once を1回叩く。SLACK_WEBHOOK_URL は常にダミーを設定し、sink未指定時は
+# 使い捨てのsinkへ書かせる（そのtickで通知が発火したかどうかをsinkファイルの
+# 有無だけで判定するため、ケースごとに新しいsinkパスを渡す）。
+wds_tick() {
+  local root="$1" now="$2" tick_sec="$3" sink="${4:-${WDS_WORK}/unused-sink.json}"
+  DEV_WORKFLOW_MARKER_ROOT="$root" \
+  DEV_WORKFLOW_WATCHDOG_NOW="$now" \
+  DEV_WORKFLOW_WATCHDOG_TICK_SEC="$tick_sec" \
+  SLACK_WEBHOOK_URL="https://example.invalid/webhook" \
+  DEV_WORKFLOW_NOTIFY_SINK="$sink" \
+  DEV_WORKFLOW_NO_SLEEP_INHIBIT=1 \
+  PATH="${WDS_FAKE_BIN}:${PATH}" \
+  bash "$WD_SCRIPT" --tick-once --epic 47 --label "Epic #47 test" > /dev/null 2>&1
+}
+
+wds_read_sink() {
+  [ -f "$1" ] && cat "$1" || printf ''
+}
+
+# --- ストール検知・エスカレーション・打ち止め・復帰（既定値 idle=900秒・escalate=1800秒） ---
+
+WDS_ROOT1="$(wd_new_root)"
+WDS_T0=1700000000
+wds_write_heartbeat "$WDS_ROOT1" "$WDS_T0" "post" "Bash"
+WDS_LOG1="${WDS_ROOT1}/.claude/.dev-workflow-watchdog.log"
+
+# 初回tick: 基準時刻を記録するだけ（通知は起きない）
+wds_tick "$WDS_ROOT1" "$WDS_T0" 3600
+if grep -q "$(printf '\tstall\t')" "$WDS_LOG1" 2>/dev/null; then
+  fail "watchdog.sh: 初回tickでは通知しない（基準時刻の記録のみ）" "$(cat "$WDS_LOG1" 2>&1)"
+else
+  pass "watchdog.sh: 初回tickでは通知しない（基準時刻の記録のみ）"
+fi
+
+# 無活動14分: 通知されない
+WDS_SINK_14M="${WDS_WORK}/14m.json"
+wds_tick "$WDS_ROOT1" "$((WDS_T0 + 14 * 60))" 3600 "$WDS_SINK_14M"
+if [ -f "$WDS_SINK_14M" ]; then
+  fail "watchdog.sh: 無活動14分では通知されない" "$(wds_read_sink "$WDS_SINK_14M")"
+else
+  pass "watchdog.sh: 無活動14分では通知されない"
+fi
+
+# 無活動16分: 初回通知される（state=post → モデルの応答待ちで停止）
+WDS_NOTIFY1_AT=$((WDS_T0 + 16 * 60))
+WDS_SINK_16M="${WDS_WORK}/16m.json"
+wds_tick "$WDS_ROOT1" "$WDS_NOTIFY1_AT" 3600 "$WDS_SINK_16M"
+WDS_BODY_16M="$(wds_read_sink "$WDS_SINK_16M")"
+case "$WDS_BODY_16M" in
+  *"応答なし"*) pass "watchdog.sh: 無活動16分で初回通知される" ;;
+  *)            fail "watchdog.sh: 無活動16分で初回通知される" "$WDS_BODY_16M" ;;
+esac
+case "$WDS_BODY_16M" in
+  *"モデルの応答待ちで停止"*)
+    pass "watchdog.sh: state=postの通知本文に «モデルの応答待ちで停止» を含む（受け入れ条件2）" ;;
+  *)
+    fail "watchdog.sh: state=postの通知本文に «モデルの応答待ちで停止» を含む" "$WDS_BODY_16M" ;;
+esac
+case "$WDS_BODY_16M" in
+  *"ツール実行中に停止"*)
+    fail "watchdog.sh: state=postの通知本文に «ツール実行中に停止» を誤って含まない" "$WDS_BODY_16M" ;;
+  *)
+    pass "watchdog.sh: state=postの通知本文に «ツール実行中に停止» を誤って含まない" ;;
+esac
+case "$WDS_BODY_16M" in
+  *"Epic #47"*) pass "watchdog.sh: 通知本文にEpic番号（--tick-onceで受け取ったもの）を含む" ;;
+  *)            fail "watchdog.sh: 通知本文にEpic番号を含む" "$WDS_BODY_16M" ;;
+esac
+case "$WDS_BODY_16M" in
+  *0h16m*) pass "watchdog.sh: 通知本文に無活動の継続時間（Nh Mm形式）を含む" ;;
+  *)       fail "watchdog.sh: 通知本文に無活動の継続時間（Nh Mm形式）を含む" "$WDS_BODY_16M" ;;
+esac
+
+# 初回通知の29分後: 再通知されない
+WDS_SINK_29M="${WDS_WORK}/29m.json"
+wds_tick "$WDS_ROOT1" "$((WDS_NOTIFY1_AT + 29 * 60))" 3600 "$WDS_SINK_29M"
+if [ -f "$WDS_SINK_29M" ]; then
+  fail "watchdog.sh: 初回通知後29分では再通知されない" "$(wds_read_sink "$WDS_SINK_29M")"
+else
+  pass "watchdog.sh: 初回通知後29分では再通知されない"
+fi
+
+# 初回通知の30分後: 2回目が通知される
+WDS_NOTIFY2_AT=$((WDS_NOTIFY1_AT + 30 * 60))
+WDS_SINK_30M="${WDS_WORK}/30m.json"
+wds_tick "$WDS_ROOT1" "$WDS_NOTIFY2_AT" 3600 "$WDS_SINK_30M"
+if [ -f "$WDS_SINK_30M" ]; then
+  pass "watchdog.sh: 初回通知後30分経過で2回目が通知される"
+else
+  fail "watchdog.sh: 初回通知後30分経過で2回目が通知される" "sinkが作られなかった"
+fi
+
+# 2回目通知の30分後: 3回目が通知される
+WDS_NOTIFY3_AT=$((WDS_NOTIFY2_AT + 30 * 60))
+WDS_SINK_3RD="${WDS_WORK}/3rd.json"
+wds_tick "$WDS_ROOT1" "$WDS_NOTIFY3_AT" 3600 "$WDS_SINK_3RD"
+if [ -f "$WDS_SINK_3RD" ]; then
+  pass "watchdog.sh: 3回目の通知がされる"
+else
+  fail "watchdog.sh: 3回目の通知がされる" "sinkが作られなかった"
+fi
+
+# 3回目通知の30分後（本来なら4回目のタイミング）: 最大3回で打ち止め、通知されない
+WDS_AFTER_3RD=$((WDS_NOTIFY3_AT + 30 * 60))
+WDS_SINK_4TH="${WDS_WORK}/4th.json"
+wds_tick "$WDS_ROOT1" "$WDS_AFTER_3RD" 3600 "$WDS_SINK_4TH"
+if [ -f "$WDS_SINK_4TH" ]; then
+  fail "watchdog.sh: 3回通知した後は再通知されない（最大3回で打ち止め）" "$(wds_read_sink "$WDS_SINK_4TH")"
+else
+  pass "watchdog.sh: 3回通知した後は再通知されない（最大3回で打ち止め）"
+fi
+
+# さらに先の時刻でtickしても通知されない（打ち止めが続くことの確認）
+WDS_SINK_FAR="${WDS_WORK}/far.json"
+wds_tick "$WDS_ROOT1" "$((WDS_AFTER_3RD + 3000))" 3600 "$WDS_SINK_FAR"
+if [ -f "$WDS_SINK_FAR" ]; then
+  fail "watchdog.sh: 3回打ち止め後はどれだけtickしても通知されない" "$(wds_read_sink "$WDS_SINK_FAR")"
+else
+  pass "watchdog.sh: 3回打ち止め後はどれだけtickしても通知されない"
+fi
+
+WDS_STALL_COUNT_LOG="$(grep -c "$(printf '\tstall\t')" "$WDS_LOG1" 2>/dev/null || true)"
+assert_eq "watchdog.sh: ログに記録されたstall通知は3件（打ち止めの上限どおり）" "3" "${WDS_STALL_COUNT_LOG:-0}"
+
+if [ -f "${WDS_ROOT1}/.claude/.dev-workflow-abort" ]; then
+  fail "watchdog.sh: ストールを3回検知しても .dev-workflow-abort が作られない（自動打ち切りをしない）"
+else
+  pass "watchdog.sh: ストールを3回検知しても .dev-workflow-abort が作られない（自動打ち切りをしない）"
+fi
+
+# --- heartbeat更新による復帰: stall-recoveredが1回だけ通知され、カウンタがリセットされる ---
+
+WDS_RECOVER_AT=$((WDS_AFTER_3RD + 3000 + 10))
+wds_write_heartbeat "$WDS_ROOT1" "$WDS_RECOVER_AT" "pre" "Read"
+
+WDS_SINK_RECOVER="${WDS_WORK}/recovered.json"
+wds_tick "$WDS_ROOT1" "$WDS_RECOVER_AT" 3600 "$WDS_SINK_RECOVER"
+WDS_BODY_RECOVER="$(wds_read_sink "$WDS_SINK_RECOVER")"
+case "$WDS_BODY_RECOVER" in
+  *"応答が再開"*) pass "watchdog.sh: heartbeat更新でstall-recoveredが通知される" ;;
+  *)              fail "watchdog.sh: heartbeat更新でstall-recoveredが通知される" "$WDS_BODY_RECOVER" ;;
+esac
+
+WDS_RECOVERED_COUNT_LOG="$(grep -c "$(printf '\tstall-recovered\t')" "$WDS_LOG1" 2>/dev/null || true)"
+assert_eq "watchdog.sh: stall-recovered通知は1回だけ記録される" "1" "${WDS_RECOVERED_COUNT_LOG:-0}"
+
+# 復帰直後（heartbeatが変わらない間）に再tickしても、stall-recoveredは再通知されない
+WDS_SINK_RECOVER_AGAIN="${WDS_WORK}/recovered-again.json"
+wds_tick "$WDS_ROOT1" "$((WDS_RECOVER_AT + 60))" 3600 "$WDS_SINK_RECOVER_AGAIN"
+if [ -f "$WDS_SINK_RECOVER_AGAIN" ]; then
+  fail "watchdog.sh: 復帰後、heartbeatが変わらない間はstall-recoveredが再通知されない" \
+    "$(wds_read_sink "$WDS_SINK_RECOVER_AGAIN")"
+else
+  pass "watchdog.sh: 復帰後、heartbeatが変わらない間はstall-recoveredが再通知されない"
+fi
+
+# 復帰後に再びストールすると、通知カウンタがリセットされ初回から数え直す
+# （4600秒超まで待たず、復帰後わずか16分の無活動で初回通知が来ることを確認する）
+WDS_SINK_RESTALL="${WDS_WORK}/restall.json"
+wds_tick "$WDS_ROOT1" "$((WDS_RECOVER_AT + 16 * 60))" 3600 "$WDS_SINK_RESTALL"
+if [ -f "$WDS_SINK_RESTALL" ]; then
+  pass "watchdog.sh: 復帰後に再びストールすると初回から数え直して通知される（16分で初回）"
+else
+  fail "watchdog.sh: 復帰後に再びストールすると初回から数え直して通知される" "sinkが作られなかった"
+fi
+
+WDS_STALL_COUNT_LOG2="$(grep -c "$(printf '\tstall\t')" "$WDS_LOG1" 2>/dev/null || true)"
+assert_eq "watchdog.sh: 復帰後の再ストールでstall通知が合計4件になる（打ち止め3件＋復帰後1件）" \
+  "4" "${WDS_STALL_COUNT_LOG2:-0}"
+
+# --- state=pre: 通知本文が «ツール実行中に停止» になる（受け入れ条件2） ---
+
+WDS_ROOT2="$(wd_new_root)"
+WDS_T0_PRE=1700100000
+wds_write_heartbeat "$WDS_ROOT2" "$WDS_T0_PRE" "pre" "Bash"
+wds_tick "$WDS_ROOT2" "$WDS_T0_PRE" 3600
+WDS_SINK_PRE="${WDS_WORK}/pre.json"
+wds_tick "$WDS_ROOT2" "$((WDS_T0_PRE + 16 * 60))" 3600 "$WDS_SINK_PRE"
+WDS_BODY_PRE="$(wds_read_sink "$WDS_SINK_PRE")"
+case "$WDS_BODY_PRE" in
+  *"ツール実行中に停止"*)
+    pass "watchdog.sh: state=preの通知本文に «ツール実行中に停止» を含む（受け入れ条件2）" ;;
+  *)
+    fail "watchdog.sh: state=preの通知本文に «ツール実行中に停止» を含む" "$WDS_BODY_PRE" ;;
+esac
+case "$WDS_BODY_PRE" in
+  *"モデルの応答待ちで停止"*)
+    fail "watchdog.sh: state=preの通知本文に «モデルの応答待ちで停止» を誤って含まない" "$WDS_BODY_PRE" ;;
+  *)
+    pass "watchdog.sh: state=preの通知本文に «モデルの応答待ちで停止» を誤って含まない" ;;
+esac
+
+# --- heartbeatファイルが無い場合はストール判定を行わない（run開始直後の誤報防止） ---
+
+WDS_ROOT3="$(wd_new_root)"
+WDS_TICK3_OK=1
+DEV_WORKFLOW_MARKER_ROOT="$WDS_ROOT3" DEV_WORKFLOW_WATCHDOG_NOW=1700200000 \
+  bash "$WD_SCRIPT" --tick-once > /dev/null 2>&1 || WDS_TICK3_OK=0
+assert_eq "watchdog.sh: heartbeatが無くてもtick-onceはexit 0で返る" "1" "$WDS_TICK3_OK"
+
+WDS_LOG3="${WDS_ROOT3}/.claude/.dev-workflow-watchdog.log"
+if grep -q "$(printf '\tstall\t')" "$WDS_LOG3" 2>/dev/null; then
+  fail "watchdog.sh: heartbeatファイルが無い場合はストール判定を行わない" "$(cat "$WDS_LOG3" 2>&1)"
+else
+  pass "watchdog.sh: heartbeatファイルが無い場合はストール判定を行わない"
+fi
+
+# --- スリープギャップ: 実経過がtick間隔の3倍を超えたら記録・通知され、無活動時間から差し引かれる ---
+
+WDS_ROOT4="$(wd_new_root)"
+WDS_T0_GAP=1700300000
+wds_write_heartbeat "$WDS_ROOT4" "$WDS_T0_GAP" "post" "Bash"
+WDS_LOG4="${WDS_ROOT4}/.claude/.dev-workflow-watchdog.log"
+
+# 初回tick（前回tickの記録が無いので判定なし）+ 通常のtick間隔（60秒に対し実経過50秒）
+wds_tick "$WDS_ROOT4" "$WDS_T0_GAP" 60
+wds_tick "$WDS_ROOT4" "$((WDS_T0_GAP + 50))" 60
+if grep -q "$(printf '\tsleep-gap\t')" "$WDS_LOG4" 2>/dev/null; then
+  fail "watchdog.sh: 通常のtick間隔ではsleep-gapを検知しない" "$(cat "$WDS_LOG4" 2>&1)"
+else
+  pass "watchdog.sh: 通常のtick間隔ではsleep-gapを検知しない"
+fi
+
+# 大きくジャンプ（tick間隔60秒に対し実経過3700秒 > 60*3）→ スリープと判定
+WDS_GAP_NOW=$((WDS_T0_GAP + 50 + 3700))
+WDS_SINK_GAP="${WDS_WORK}/sleep-gap.json"
+wds_tick "$WDS_ROOT4" "$WDS_GAP_NOW" 60 "$WDS_SINK_GAP"
+WDS_BODY_GAP="$(wds_read_sink "$WDS_SINK_GAP")"
+case "$WDS_BODY_GAP" in
+  *"スリープ痕跡"*) pass "watchdog.sh: tick間隔の3倍を超える実経過でsleep-gapが通知される" ;;
+  *)                fail "watchdog.sh: tick間隔の3倍を超える実経過でsleep-gapが通知される" "$WDS_BODY_GAP" ;;
+esac
+case "$WDS_BODY_GAP" in
+  *"応答なし"*)
+    fail "watchdog.sh: sleep-gap通知にstallの見出し «応答なし» が誤って混ざらない" "$WDS_BODY_GAP" ;;
+  *)
+    pass "watchdog.sh: sleep-gap通知にstallの見出し «応答なし» が誤って混ざらない" ;;
+esac
+
+if grep -q "$(printf '\tsleep-gap\t')" "$WDS_LOG4" 2>/dev/null; then
+  pass "watchdog.sh: sleep-gapイベントがログに記録される（差し引き累計を含め後から読める）"
+else
+  fail "watchdog.sh: sleep-gapイベントがログに記録される" "$(cat "$WDS_LOG4" 2>&1)"
+fi
+
+# スリープギャップ直後: 差し引きが効いて誤ってstallとして通知されない
+# （素の経過なら now - heartbeat_epoch = 3750秒 > 900秒でストール誤報になるはずだが、
+#   ギャップ分3640秒（実経過3700秒からtick_sec 60秒を引いた分）を差し引いた110秒は
+#   900秒未満なので通知されない）
+if grep -q "$(printf '\tstall\t')" "$WDS_LOG4" 2>/dev/null; then
+  fail "watchdog.sh: スリープギャップ直後のtickでストール誤報が出ない（差し引きが効いている）" \
+    "$(cat "$WDS_LOG4" 2>&1)"
+else
+  pass "watchdog.sh: スリープギャップ直後のtickでストール誤報が出ない（差し引きが効いている）"
+fi
+
+# --- curlが一度も実行されていないこと（通知はsink経由でのみ検証し、ネットワークに出ない） ---
+if [ -s "$WDS_CURL_LOG" ]; then
+  fail "watchdog.sh: 通知でsink使用時にcurlが呼ばれない（実送信しない）" "$(wds_read_sink "$WDS_CURL_LOG")"
+else
+  pass "watchdog.sh: 通知でsink使用時にcurlが呼ばれない（実送信しない）"
+fi
+
+# ---------------------------------------------------------------------------
+# scripts/watchdog.sh: ウェーブ予算の監視と `- 想定時間:` 宣言（Task #48、Epic #42）
+#
+# DEV_WORKFLOW_WATCHDOG_NOW で時刻を注入し --wave / --tick-once を組み合わせて、実時間を
+# 一切待たずに「run-state書き込み → 予算内は無通知 → 超過で1回だけ通知 → 次のwaveでリセット」
+# を検証する。`- 想定時間:` の解析は、実際の `gh issue view` を呼ばず、PATHに差し込んだ
+# 偽ghスクリプト（環境変数で指定したディレクトリのファイルを本文として返すだけ）を使い、
+# ネットワーク・GitHub 認証に一切依存しない（完了条件: 「gh に依存しないよう、issue本文の
+# 入力を差し替えられるようにする」）。通知はTask #47と同じくnotify-slack.shのsink機構で検証する。
+# ---------------------------------------------------------------------------
+
+echo ""
+echo "== scripts/watchdog.sh: ウェーブ予算の監視と - 想定時間: 宣言（Task #48） =="
+
+WB_WORK="$(mktemp -d "${TMPDIR:-/tmp}/dw-test-watchdog-budget.XXXXXX")"
+
+# --- --wave: run-stateを期待どおりの形式で書く ---
+
+WB_ROOT1="$(wd_new_root)"
+WB_T0=1700400000
+DEV_WORKFLOW_MARKER_ROOT="$WB_ROOT1" DEV_WORKFLOW_WATCHDOG_NOW="$WB_T0" \
+  bash "$WD_SCRIPT" --wave --epic 48 --wave-no 2 --tasks "44,45,46" --budget-sec 5000 \
+  > /dev/null 2>&1
+WB_STATE_FILE1="${WB_ROOT1}/.claude/.dev-workflow-run-state"
+WB_EXPECTED1=$'epic=48\nwave=2\ntasks=44,45,46\nwave_started=1700400000\nbudget_sec=5000'
+WB_ACTUAL1="$(cat "$WB_STATE_FILE1" 2>/dev/null)"
+assert_eq "watchdog.sh --wave: run-stateを期待どおりの形式(key=value)で書く" \
+  "$WB_EXPECTED1" "$WB_ACTUAL1"
+
+# --- 予算監視: 予算内は無通知・超過で1回だけ通知される・次の --wave でリセットされる ---
+
+WB_ROOT2="$(wd_new_root)"
+WB_LOG2="${WB_ROOT2}/.claude/.dev-workflow-watchdog.log"
+
+# wb_tick <root> <now> <tick_sec> [sink_file]  （wds_tickと同じ作法。偽curlはWDS_FAKE_BINを再利用する）
+wb_tick() {
+  local root="$1" now="$2" tick_sec="$3" sink="${4:-${WB_WORK}/unused-sink.json}"
+  DEV_WORKFLOW_MARKER_ROOT="$root" \
+  DEV_WORKFLOW_WATCHDOG_NOW="$now" \
+  DEV_WORKFLOW_WATCHDOG_TICK_SEC="$tick_sec" \
+  SLACK_WEBHOOK_URL="https://example.invalid/webhook" \
+  DEV_WORKFLOW_NOTIFY_SINK="$sink" \
+  DEV_WORKFLOW_NO_SLEEP_INHIBIT=1 \
+  PATH="${WDS_FAKE_BIN}:${PATH}" \
+  bash "$WD_SCRIPT" --tick-once --epic 48 --label "Epic #48 test" > /dev/null 2>&1
+}
+
+WB_T0_BUDGET=1700500000
+WB_BUDGET=3600
+DEV_WORKFLOW_MARKER_ROOT="$WB_ROOT2" DEV_WORKFLOW_WATCHDOG_NOW="$WB_T0_BUDGET" \
+  bash "$WD_SCRIPT" --wave --epic 48 --wave-no 1 --tasks "44" --budget-sec "$WB_BUDGET" \
+  > /dev/null 2>&1
+
+# 予算内（30分 < 60分）: 無通知
+WB_SINK_WITHIN="${WB_WORK}/within-budget.json"
+wb_tick "$WB_ROOT2" "$((WB_T0_BUDGET + 1800))" 3600 "$WB_SINK_WITHIN"
+if [ -f "$WB_SINK_WITHIN" ]; then
+  fail "watchdog.sh: ウェーブ予算内では通知されない" "$(wds_read_sink "$WB_SINK_WITHIN")"
+else
+  pass "watchdog.sh: ウェーブ予算内では通知されない"
+fi
+
+# 予算超過（61分 > 60分）: 1回通知される
+WB_OVER_AT=$((WB_T0_BUDGET + 3700))
+WB_SINK_OVER="${WB_WORK}/over-budget.json"
+wb_tick "$WB_ROOT2" "$WB_OVER_AT" 3600 "$WB_SINK_OVER"
+WB_BODY_OVER="$(wds_read_sink "$WB_SINK_OVER")"
+case "$WB_BODY_OVER" in
+  *"想定時間超過"*) pass "watchdog.sh: ウェーブ予算超過で通知される" ;;
+  *)                fail "watchdog.sh: ウェーブ予算超過で通知される" "$WB_BODY_OVER" ;;
+esac
+case "$WB_BODY_OVER" in
+  *"ウェーブ1"*) pass "watchdog.sh: 予算超過の通知本文にウェーブ番号を含む" ;;
+  *)             fail "watchdog.sh: 予算超過の通知本文にウェーブ番号を含む" "$WB_BODY_OVER" ;;
+esac
+
+# 超過後さらにtickしても再通知されない（1回だけ）
+WB_SINK_OVER_AGAIN="${WB_WORK}/over-budget-again.json"
+wb_tick "$WB_ROOT2" "$((WB_OVER_AT + 100))" 3600 "$WB_SINK_OVER_AGAIN"
+if [ -f "$WB_SINK_OVER_AGAIN" ]; then
+  fail "watchdog.sh: ウェーブ予算超過の通知は1回だけ（再通知されない）" \
+    "$(wds_read_sink "$WB_SINK_OVER_AGAIN")"
+else
+  pass "watchdog.sh: ウェーブ予算超過の通知は1回だけ（再通知されない）"
+fi
+
+WB_BUDGET_LOG_COUNT1="$(grep -c "$(printf '\tbudget\t')" "$WB_LOG2" 2>/dev/null || true)"
+assert_eq "watchdog.sh: 予算超過ログはウェーブ1で1件" "1" "${WB_BUDGET_LOG_COUNT1:-0}"
+
+# 次の --wave の後に再び超過すると、また1回通知される（通知済みフラグがリセットされる）
+WB_T1=$((WB_OVER_AT + 200))
+DEV_WORKFLOW_MARKER_ROOT="$WB_ROOT2" DEV_WORKFLOW_WATCHDOG_NOW="$WB_T1" \
+  bash "$WD_SCRIPT" --wave --epic 48 --wave-no 2 --tasks "44" --budget-sec 1800 > /dev/null 2>&1
+
+WB_SINK_WAVE2_WITHIN="${WB_WORK}/wave2-within.json"
+wb_tick "$WB_ROOT2" "$((WB_T1 + 100))" 3600 "$WB_SINK_WAVE2_WITHIN"
+if [ -f "$WB_SINK_WAVE2_WITHIN" ]; then
+  fail "watchdog.sh: 新しいウェーブの予算内では通知されない" "$(wds_read_sink "$WB_SINK_WAVE2_WITHIN")"
+else
+  pass "watchdog.sh: 新しいウェーブの予算内では通知されない"
+fi
+
+WB_WAVE2_OVER_AT=$((WB_T1 + 1900))
+WB_SINK_WAVE2_OVER="${WB_WORK}/wave2-over.json"
+wb_tick "$WB_ROOT2" "$WB_WAVE2_OVER_AT" 3600 "$WB_SINK_WAVE2_OVER"
+WB_BODY_WAVE2_OVER="$(wds_read_sink "$WB_SINK_WAVE2_OVER")"
+case "$WB_BODY_WAVE2_OVER" in
+  *"想定時間超過"*"ウェーブ2"*)
+    pass "watchdog.sh: 次の--waveの後に再び超過すると、また1回通知される" ;;
+  *)
+    fail "watchdog.sh: 次の--waveの後に再び超過すると、また1回通知される" "$WB_BODY_WAVE2_OVER" ;;
+esac
+
+WB_BUDGET_LOG_COUNT2="$(grep -c "$(printf '\tbudget\t')" "$WB_LOG2" 2>/dev/null || true)"
+assert_eq "watchdog.sh: 予算超過ログは合計2件（ウェーブ1で1件・ウェーブ2で1件）" \
+  "2" "${WB_BUDGET_LOG_COUNT2:-0}"
+
+# --- run-stateが無い場合: 予算監視をスキップし、他の監視（ストール検知）は動き続ける ---
+
+WB_ROOT3="$(wd_new_root)"
+WB_T0_NOSTATE=1700600000
+wds_write_heartbeat "$WB_ROOT3" "$WB_T0_NOSTATE" "post" "Bash"
+
+WB_TICK3_OK=1
+wb_tick "$WB_ROOT3" "$WB_T0_NOSTATE" 3600 || WB_TICK3_OK=0
+assert_eq "watchdog.sh: run-stateが無くてもtick-onceはexit 0で返る" "1" "$WB_TICK3_OK"
+
+WB_SINK_STALL_NOSTATE="${WB_WORK}/stall-no-run-state.json"
+wb_tick "$WB_ROOT3" "$((WB_T0_NOSTATE + 16 * 60))" 3600 "$WB_SINK_STALL_NOSTATE"
+WB_BODY_STALL_NOSTATE="$(wds_read_sink "$WB_SINK_STALL_NOSTATE")"
+case "$WB_BODY_STALL_NOSTATE" in
+  *"応答なし"*) pass "watchdog.sh: run-stateが無くてもストール監視は動き続ける" ;;
+  *)            fail "watchdog.sh: run-stateが無くてもストール監視は動き続ける" "$WB_BODY_STALL_NOSTATE" ;;
+esac
+
+WB_LOG3="${WB_ROOT3}/.claude/.dev-workflow-watchdog.log"
+if grep -q "$(printf '\tbudget\t')" "$WB_LOG3" 2>/dev/null; then
+  fail "watchdog.sh: run-stateが無い場合に予算監視をスキップする" "$(cat "$WB_LOG3" 2>&1)"
+else
+  pass "watchdog.sh: run-stateが無い場合に予算監視をスキップする"
+fi
+
+# --- `- 想定時間:` の解析: 30m / 2h / 90 / 不正値 / 宣言なし / 複数タスクの最大値 ---
+#
+# gh には一切依存しない。PATHに差し込む偽ghは `gh issue view <番号> --json body -q .body`
+# だけを模倣し、WB_GH_BODY_DIR/<番号>.txt の中身をそのまま本文として返す（無ければ失敗する）。
+
+WB_GH_BODY_DIR="${WB_WORK}/gh-bodies"
+mkdir -p "$WB_GH_BODY_DIR"
+WB_FAKE_GH_BIN="${WB_WORK}/gh-bin"
+mkdir -p "$WB_FAKE_GH_BIN"
+cat > "${WB_FAKE_GH_BIN}/gh" <<'FAKE_GH_EOF'
+#!/bin/bash
+# テスト用の偽gh。`gh issue view <番号> --json body -q .body` だけを模倣する。
+if [ "$1" = "issue" ] && [ "$2" = "view" ]; then
+  num="$3"
+  file="${WB_GH_BODY_DIR}/${num}.txt"
+  if [ -f "$file" ]; then
+    cat "$file"
+    exit 0
+  fi
+  exit 1
+fi
+exit 1
+FAKE_GH_EOF
+chmod +x "${WB_FAKE_GH_BIN}/gh"
+
+# wb_set_gh_body <issue番号> <本文>
+wb_set_gh_body() {
+  printf '%s\n' "$2" > "${WB_GH_BODY_DIR}/$1.txt"
+}
+
+# wb_wave_budget_sec <root> <tasks_csv>
+# --budget-sec なしで --wave を呼び、書かれたrun-stateのbudget_secを返す
+wb_wave_budget_sec() {
+  local root="$1" tasks="$2"
+  DEV_WORKFLOW_MARKER_ROOT="$root" DEV_WORKFLOW_WATCHDOG_NOW=1700700000 \
+  WB_GH_BODY_DIR="$WB_GH_BODY_DIR" PATH="${WB_FAKE_GH_BIN}:${PATH}" \
+    bash "$WD_SCRIPT" --wave --epic 48 --wave-no 1 --tasks "$tasks" > /dev/null 2>&1
+  grep '^budget_sec=' "${root}/.claude/.dev-workflow-run-state" | cut -d= -f2
+}
+
+WB_ROOT_EST="$(wd_new_root)"
+
+wb_set_gh_body 201 '- 想定時間: 30m'
+assert_eq "watchdog.sh: - 想定時間: 30m → 予算=(30分*2+900秒)=4500秒" \
+  "4500" "$(wb_wave_budget_sec "$WB_ROOT_EST" "201")"
+
+wb_set_gh_body 202 '- 想定時間: 2h'
+assert_eq "watchdog.sh: - 想定時間: 2h → 予算=(120分*2+900秒)=15300秒" \
+  "15300" "$(wb_wave_budget_sec "$WB_ROOT_EST" "202")"
+
+wb_set_gh_body 203 '- 想定時間: 90'
+assert_eq "watchdog.sh: - 想定時間: 90（単位なし=分）→ 予算=(90分*2+900秒)=11700秒" \
+  "11700" "$(wb_wave_budget_sec "$WB_ROOT_EST" "203")"
+
+wb_set_gh_body 204 '- 想定時間: abc'
+assert_eq "watchdog.sh: - 想定時間: 不正値は無視され既定5400秒になる" \
+  "5400" "$(wb_wave_budget_sec "$WB_ROOT_EST" "204")"
+
+# タスク205は本文ファイルを作らない（宣言なし）
+assert_eq "watchdog.sh: - 想定時間: 宣言が無いタスクは既定5400秒になる" \
+  "5400" "$(wb_wave_budget_sec "$WB_ROOT_EST" "205")"
+
+wb_set_gh_body 206 '- 想定時間: 30m'
+wb_set_gh_body 207 '- 想定時間: 2h'
+assert_eq "watchdog.sh: 複数タスクの - 想定時間: は最大値を使う（2hが優先）→ 15300秒" \
+  "15300" "$(wb_wave_budget_sec "$WB_ROOT_EST" "206,207")"
+
+# ghが使えない場合（常に失敗する偽gh）も既定5400秒になる
+WB_FAKE_GH_FAIL_BIN="${WB_WORK}/gh-fail-bin"
+mkdir -p "$WB_FAKE_GH_FAIL_BIN"
+printf '#!/bin/bash\nexit 1\n' > "${WB_FAKE_GH_FAIL_BIN}/gh"
+chmod +x "${WB_FAKE_GH_FAIL_BIN}/gh"
+WB_ROOT_NOGH="$(wd_new_root)"
+DEV_WORKFLOW_MARKER_ROOT="$WB_ROOT_NOGH" DEV_WORKFLOW_WATCHDOG_NOW=1700700000 \
+  PATH="${WB_FAKE_GH_FAIL_BIN}:${PATH}" \
+  bash "$WD_SCRIPT" --wave --epic 48 --wave-no 1 --tasks "999" > /dev/null 2>&1
+WB_BUDGET_NOGH="$(grep '^budget_sec=' "${WB_ROOT_NOGH}/.claude/.dev-workflow-run-state" \
+  | cut -d= -f2)"
+assert_eq "watchdog.sh --wave: ghが使えない場合は既定5400秒になる" "5400" "$WB_BUDGET_NOGH"
+
+# ---------------------------------------------------------------------------
+# scripts/watchdog.sh: スリープ抑止（Task #49、Epic #42）
+#
+# このサンドボックス（Alpine）には powershell / caffeinate / systemd-inhibit のいずれも
+# 存在しないため、OS判定は DEV_WORKFLOW_WATCHDOG_OS で注入し、実行はしない
+# （DEV_WORKFLOW_INHIBIT_SINK に組み立てたコマンド文字列だけを書かせて検証する。
+# 既存の notify-slack.sh sink・PATH注入の偽コマンド方式に倣う）。
+# 「抑止コマンドが失敗する状況」は、Alpineに実在しないpowershellを注入無しでそのまま
+# windowsとして実行させることで自然に再現する（フェイクを追加で用意する必要が無い）。
+# Windowsの実際の呼び出し成否は、powershellが存在するWindows実機上で --tick-once を
+# 直接叩いて別途確認する（テストでは検証しない。issueへ実出力を記録する）。
+# ---------------------------------------------------------------------------
+
+echo ""
+echo "== scripts/watchdog.sh: スリープ抑止（Task #49） =="
+
+WI_WORK="$(mktemp -d "${TMPDIR:-/tmp}/dw-test-watchdog-inhibit.XXXXXX")"
+
+# --- windows: SetThreadExecutionState を含むコマンドが組み立てられる ---
+
+WI_ROOT_WIN="$(wd_new_root)"
+WI_SINK_WIN="${WI_WORK}/windows.cmd"
+DEV_WORKFLOW_MARKER_ROOT="$WI_ROOT_WIN" DEV_WORKFLOW_WATCHDOG_NOW=1700800000 \
+DEV_WORKFLOW_WATCHDOG_OS=windows DEV_WORKFLOW_WATCHDOG_TICK_SEC=60 \
+DEV_WORKFLOW_INHIBIT_SINK="$WI_SINK_WIN" PATH="${WDS_FAKE_BIN}:${PATH}" \
+  bash "$WD_SCRIPT" --tick-once > /dev/null 2>&1
+WI_EXIT_WIN=$?
+assert_exit_code "watchdog.sh --tick-once: windows のスリープ抑止 tick は exit 0" 0 "$WI_EXIT_WIN"
+WI_CMD_WIN="$(cat "$WI_SINK_WIN" 2>/dev/null)"
+case "$WI_CMD_WIN" in
+  windows*"SetThreadExecutionState"*"0x00000001"*)
+    pass "watchdog.sh: windowsでSetThreadExecutionStateを含むコマンドが組み立てられる" ;;
+  *)
+    fail "watchdog.sh: windowsでSetThreadExecutionStateを含むコマンドが組み立てられる" "$WI_CMD_WIN" ;;
+esac
+case "$WI_CMD_WIN" in
+  *powershell*-NoProfile*) pass "watchdog.sh: windowsのコマンドはpowershell -NoProfileで組み立てられる" ;;
+  *)                       fail "watchdog.sh: windowsのコマンドはpowershell -NoProfileで組み立てられる" "$WI_CMD_WIN" ;;
+esac
+
+# --- macos: caffeinate -u -t <tick+30> を含むコマンドが組み立てられる ---
+
+WI_ROOT_MAC="$(wd_new_root)"
+WI_SINK_MAC="${WI_WORK}/macos.cmd"
+DEV_WORKFLOW_MARKER_ROOT="$WI_ROOT_MAC" DEV_WORKFLOW_WATCHDOG_NOW=1700800000 \
+DEV_WORKFLOW_WATCHDOG_OS=macos DEV_WORKFLOW_WATCHDOG_TICK_SEC=60 \
+DEV_WORKFLOW_INHIBIT_SINK="$WI_SINK_MAC" PATH="${WDS_FAKE_BIN}:${PATH}" \
+  bash "$WD_SCRIPT" --tick-once > /dev/null 2>&1
+WI_CMD_MAC="$(cat "$WI_SINK_MAC" 2>/dev/null)"
+case "$WI_CMD_MAC" in
+  macos*"caffeinate -u -t 90"*)
+    pass "watchdog.sh: macosでcaffeinate -u -t <tick+30>を含むコマンドが組み立てられる" ;;
+  *)
+    fail "watchdog.sh: macosでcaffeinate -u -t <tick+30>を含むコマンドが組み立てられる" "$WI_CMD_MAC" ;;
+esac
+
+# --- linux（systemd-inhibitあり）: systemd-inhibit --what=idle --mode=block を含むコマンドが組み立てられる ---
+
+WI_FAKE_BIN="${WI_WORK}/bin"
+mkdir -p "$WI_FAKE_BIN"
+printf '#!/bin/bash\nexit 0\n' > "${WI_FAKE_BIN}/systemd-inhibit"
+chmod +x "${WI_FAKE_BIN}/systemd-inhibit"
+
+WI_ROOT_LINUX="$(wd_new_root)"
+WI_SINK_LINUX="${WI_WORK}/linux.cmd"
+DEV_WORKFLOW_MARKER_ROOT="$WI_ROOT_LINUX" DEV_WORKFLOW_WATCHDOG_NOW=1700800000 \
+DEV_WORKFLOW_WATCHDOG_OS=linux DEV_WORKFLOW_WATCHDOG_TICK_SEC=60 \
+DEV_WORKFLOW_INHIBIT_SINK="$WI_SINK_LINUX" PATH="${WI_FAKE_BIN}:${WDS_FAKE_BIN}:${PATH}" \
+  bash "$WD_SCRIPT" --tick-once > /dev/null 2>&1
+WI_CMD_LINUX="$(cat "$WI_SINK_LINUX" 2>/dev/null)"
+case "$WI_CMD_LINUX" in
+  linux*"systemd-inhibit --what=idle --mode=block sleep 90"*)
+    pass "watchdog.sh: linux（systemd-inhibitあり）でsystemd-inhibitを含むコマンドが組み立てられる" ;;
+  *)
+    fail "watchdog.sh: linux（systemd-inhibitあり）でsystemd-inhibitを含むコマンドが組み立てられる" "$WI_CMD_LINUX" ;;
+esac
+
+# --- linux（systemd-inhibitなし）: コマンドは組み立てられず、警告のみ記録される ---
+
+WI_ROOT_LINUX_NO="$(wd_new_root)"
+WI_SINK_LINUX_NO="${WI_WORK}/linux-no.cmd"
+WI_NOTIFY_LINUX_NO="${WI_WORK}/linux-no-notify.json"
+DEV_WORKFLOW_MARKER_ROOT="$WI_ROOT_LINUX_NO" DEV_WORKFLOW_WATCHDOG_NOW=1700800000 \
+DEV_WORKFLOW_WATCHDOG_OS=linux DEV_WORKFLOW_WATCHDOG_TICK_SEC=60 \
+DEV_WORKFLOW_INHIBIT_SINK="$WI_SINK_LINUX_NO" \
+SLACK_WEBHOOK_URL="https://example.invalid/webhook" DEV_WORKFLOW_NOTIFY_SINK="$WI_NOTIFY_LINUX_NO" \
+PATH="${WDS_FAKE_BIN}:${PATH}" \
+  bash "$WD_SCRIPT" --tick-once > /dev/null 2>&1
+WI_EXIT_LINUX_NO=$?
+assert_exit_code "watchdog.sh: linux（systemd-inhibitなし）でも--tick-onceはexit 0" 0 "$WI_EXIT_LINUX_NO"
+if [ -f "$WI_SINK_LINUX_NO" ]; then
+  fail "watchdog.sh: linux（systemd-inhibitなし）ではコマンドを組み立てない" "$(cat "$WI_SINK_LINUX_NO")"
+else
+  pass "watchdog.sh: linux（systemd-inhibitなし）ではコマンドを組み立てない"
+fi
+WI_LOG_LINUX_NO="${WI_ROOT_LINUX_NO}/.claude/.dev-workflow-watchdog.log"
+if grep -q "$(printf '\tsleep-inhibit-warn\t')" "$WI_LOG_LINUX_NO" 2>/dev/null; then
+  pass "watchdog.sh: linux（systemd-inhibitなし）は警告としてログに記録される"
+else
+  fail "watchdog.sh: linux（systemd-inhibitなし）は警告としてログに記録される" "$(cat "$WI_LOG_LINUX_NO" 2>&1)"
+fi
+WI_NOTIFY_BODY_LINUX_NO="$(cat "$WI_NOTIFY_LINUX_NO" 2>/dev/null)"
+case "$WI_NOTIFY_BODY_LINUX_NO" in
+  *"スリープ抑止に失敗"*) pass "watchdog.sh: 抑止手段が無い場合もSlackへ警告が通知される" ;;
+  *)                      fail "watchdog.sh: 抑止手段が無い場合もSlackへ警告が通知される" "$WI_NOTIFY_BODY_LINUX_NO" ;;
+esac
+
+# --- unknown: 警告を1行出しつつ tick が正常終了する ---
+
+WI_ROOT_UNKNOWN="$(wd_new_root)"
+WI_NOTIFY_UNKNOWN="${WI_WORK}/unknown-notify.json"
+DEV_WORKFLOW_MARKER_ROOT="$WI_ROOT_UNKNOWN" DEV_WORKFLOW_WATCHDOG_NOW=1700800000 \
+DEV_WORKFLOW_WATCHDOG_OS=unknown \
+SLACK_WEBHOOK_URL="https://example.invalid/webhook" DEV_WORKFLOW_NOTIFY_SINK="$WI_NOTIFY_UNKNOWN" \
+PATH="${WDS_FAKE_BIN}:${PATH}" \
+  bash "$WD_SCRIPT" --tick-once > /dev/null 2>&1
+WI_EXIT_UNKNOWN=$?
+assert_exit_code "watchdog.sh: OS=unknownでも--tick-onceはexit 0で正常終了する" 0 "$WI_EXIT_UNKNOWN"
+WI_LOG_UNKNOWN="${WI_ROOT_UNKNOWN}/.claude/.dev-workflow-watchdog.log"
+WI_UNKNOWN_WARN_COUNT="$(grep -c "$(printf '\tsleep-inhibit-warn\t')" "$WI_LOG_UNKNOWN" 2>/dev/null || true)"
+assert_eq "watchdog.sh: OS=unknownでは警告が1行ログに出る" "1" "${WI_UNKNOWN_WARN_COUNT:-0}"
+
+# --- DEV_WORKFLOW_NO_SLEEP_INHIBIT=1: コマンドが一切組み立てられない ---
+
+WI_ROOT_NOINHIBIT="$(wd_new_root)"
+WI_SINK_NOINHIBIT="${WI_WORK}/noinhibit.cmd"
+DEV_WORKFLOW_MARKER_ROOT="$WI_ROOT_NOINHIBIT" DEV_WORKFLOW_WATCHDOG_NOW=1700800000 \
+DEV_WORKFLOW_WATCHDOG_OS=windows DEV_WORKFLOW_NO_SLEEP_INHIBIT=1 \
+DEV_WORKFLOW_INHIBIT_SINK="$WI_SINK_NOINHIBIT" PATH="${WDS_FAKE_BIN}:${PATH}" \
+  bash "$WD_SCRIPT" --tick-once > /dev/null 2>&1
+WI_EXIT_NOINHIBIT=$?
+assert_exit_code "watchdog.sh: DEV_WORKFLOW_NO_SLEEP_INHIBIT=1でも--tick-onceはexit 0" 0 "$WI_EXIT_NOINHIBIT"
+if [ -f "$WI_SINK_NOINHIBIT" ]; then
+  fail "watchdog.sh: DEV_WORKFLOW_NO_SLEEP_INHIBIT=1ではコマンドが一切組み立てられない" \
+    "$(cat "$WI_SINK_NOINHIBIT")"
+else
+  pass "watchdog.sh: DEV_WORKFLOW_NO_SLEEP_INHIBIT=1ではコマンドが一切組み立てられない"
+fi
+WI_LOG_NOINHIBIT="${WI_ROOT_NOINHIBIT}/.claude/.dev-workflow-watchdog.log"
+if grep -q "sleep-inhibit" "$WI_LOG_NOINHIBIT" 2>/dev/null; then
+  fail "watchdog.sh: DEV_WORKFLOW_NO_SLEEP_INHIBIT=1では抑止関連のログも一切残らない" \
+    "$(cat "$WI_LOG_NOINHIBIT" 2>&1)"
+else
+  pass "watchdog.sh: DEV_WORKFLOW_NO_SLEEP_INHIBIT=1では抑止関連のログも一切残らない"
+fi
+
+# --- 抑止コマンドが失敗する状況（Alpineに実在しないpowershellをそのまま呼ぶ）でも exit 0 ---
+
+WI_ROOT_FAIL="$(wd_new_root)"
+WI_NOTIFY_FAIL="${WI_WORK}/fail-notify.json"
+DEV_WORKFLOW_MARKER_ROOT="$WI_ROOT_FAIL" DEV_WORKFLOW_WATCHDOG_NOW=1700800000 \
+DEV_WORKFLOW_WATCHDOG_OS=windows \
+SLACK_WEBHOOK_URL="https://example.invalid/webhook" DEV_WORKFLOW_NOTIFY_SINK="$WI_NOTIFY_FAIL" \
+PATH="${WDS_FAKE_BIN}:${PATH}" \
+  bash "$WD_SCRIPT" --tick-once > /dev/null 2>&1
+WI_EXIT_FAIL=$?
+assert_exit_code "watchdog.sh: 抑止コマンドが失敗する状況（powershellが存在しない）でも--tick-onceはexit 0" \
+  0 "$WI_EXIT_FAIL"
+WI_LOG_FAIL="${WI_ROOT_FAIL}/.claude/.dev-workflow-watchdog.log"
+if grep -q "$(printf '\tsleep-inhibit-warn\t')" "$WI_LOG_FAIL" 2>/dev/null; then
+  pass "watchdog.sh: 抑止コマンドの実行失敗が警告としてログに記録される"
+else
+  fail "watchdog.sh: 抑止コマンドの実行失敗が警告としてログに記録される" "$(cat "$WI_LOG_FAIL" 2>&1)"
+fi
+
+# --- 同じ警告は毎tick Slackへ通知されない（初回のみ・以降はログのみ） ---
+
+WI_ROOT_WARNONCE="$(wd_new_root)"
+WI_NOTIFY_WARNONCE_1="${WI_WORK}/warnonce-1.json"
+WI_NOTIFY_WARNONCE_2="${WI_WORK}/warnonce-2.json"
+
+DEV_WORKFLOW_MARKER_ROOT="$WI_ROOT_WARNONCE" DEV_WORKFLOW_WATCHDOG_NOW=1700800000 \
+DEV_WORKFLOW_WATCHDOG_OS=unknown \
+SLACK_WEBHOOK_URL="https://example.invalid/webhook" DEV_WORKFLOW_NOTIFY_SINK="$WI_NOTIFY_WARNONCE_1" \
+PATH="${WDS_FAKE_BIN}:${PATH}" \
+  bash "$WD_SCRIPT" --tick-once > /dev/null 2>&1
+if [ -f "$WI_NOTIFY_WARNONCE_1" ]; then
+  pass "watchdog.sh: 抑止警告は初回tickでSlackへ通知される"
+else
+  fail "watchdog.sh: 抑止警告は初回tickでSlackへ通知される" "sinkが作られませんでした"
+fi
+
+DEV_WORKFLOW_MARKER_ROOT="$WI_ROOT_WARNONCE" DEV_WORKFLOW_WATCHDOG_NOW=1700800100 \
+DEV_WORKFLOW_WATCHDOG_OS=unknown \
+SLACK_WEBHOOK_URL="https://example.invalid/webhook" DEV_WORKFLOW_NOTIFY_SINK="$WI_NOTIFY_WARNONCE_2" \
+PATH="${WDS_FAKE_BIN}:${PATH}" \
+  bash "$WD_SCRIPT" --tick-once > /dev/null 2>&1
+if [ -f "$WI_NOTIFY_WARNONCE_2" ]; then
+  fail "watchdog.sh: 同じ抑止警告は2回目以降Slackへ通知されない（初回のみ）" \
+    "$(cat "$WI_NOTIFY_WARNONCE_2")"
+else
+  pass "watchdog.sh: 同じ抑止警告は2回目以降Slackへ通知されない（初回のみ）"
+fi
+
+WI_LOG_WARNONCE="${WI_ROOT_WARNONCE}/.claude/.dev-workflow-watchdog.log"
+WI_WARNONCE_LOG_COUNT="$(grep -c "$(printf '\tsleep-inhibit-warn\t')" "$WI_LOG_WARNONCE" 2>/dev/null || true)"
+assert_eq "watchdog.sh: ログには通知の有無に関わらず毎tick記録される（2回）" "2" "${WI_WARNONCE_LOG_COUNT:-0}"
+
+# --- 受け入れ条件6の再確認: スリープ抑止のフックにもkill/自動打ち切り経路が無いこと ---
+
+WI_INHIBIT_BLOCK="$(awk '
+  /^_watchdog_detect_os\(\) \{/ {f=1}
+  f {print}
+  /^_watchdog_sleep_inhibit_tick\(\) \{/ {g=1}
+  g && /^}/ {print; exit}
+' "$WD_SCRIPT")"
+if printf '%s' "$WI_INHIBIT_BLOCK" | grep -qE '\bkill\b'; then
+  fail "watchdog.sh: スリープ抑止のコードにkillが存在しない（受け入れ条件6）" "$WI_INHIBIT_BLOCK"
+else
+  pass "watchdog.sh: スリープ抑止のコードにkillが存在しない（受け入れ条件6）"
+fi
+
+# --- curlが一度も実行されていないこと（本セクションの通知もsink経由でのみ検証する） ---
+if [ -s "$WDS_CURL_LOG" ]; then
+  fail "watchdog.sh: ウェーブ予算・スリープ抑止の通知でもcurlが呼ばれない（実送信しない）" \
+    "$(wds_read_sink "$WDS_CURL_LOG")"
+else
+  pass "watchdog.sh: ウェーブ予算・スリープ抑止の通知でもcurlが呼ばれない（実送信しない）"
+fi
+
+# ---------------------------------------------------------------------------
+# hooks.json / hooks.codex.json: heartbeat結線（Task #52）
+# ---------------------------------------------------------------------------
+
+echo "== hooks.json / hooks.codex.json: heartbeat結線（Task #52） =="
+
+HJ_HOOKS_JSON="${REPO_ROOT}/hooks/hooks.json"
+HJ_HOOKS_CODEX_JSON="${REPO_ROOT}/hooks/hooks.codex.json"
+HJ_HEARTBEAT_SCRIPT="${REPO_ROOT}/scripts/heartbeat.sh"
+
+# JSONとしての構文妥当性を、jq/pythonを新たに足さず括弧の対応だけで確認する
+# （文字列リテラル内の括弧は無視する）。完全なJSONパーサではないが、
+# このタスクで書き換える範囲の妥当性を検証するには十分（issue #52 の指示どおり
+# 「既存に検証手段が無ければ grep で必要なキー・文字列の存在を確認する」方針に沿う）。
+_hj_json_syntax_ok() {
+  local file="$1"
+  local content
+  content="$(cat "$file" 2>/dev/null)" || return 1
+  local len=${#content}
+  local i char depth_curly=0 depth_square=0 in_string=0 escape=0
+  for ((i = 0; i < len; i++)); do
+    char="${content:i:1}"
+    if [ "$escape" -eq 1 ]; then
+      escape=0
+      continue
+    fi
+    if [ "$in_string" -eq 1 ]; then
+      case "$char" in
+        '\') escape=1 ;;
+        '"') in_string=0 ;;
+      esac
+      continue
+    fi
+    case "$char" in
+      '"') in_string=1 ;;
+      '{') depth_curly=$((depth_curly + 1)) ;;
+      '}') depth_curly=$((depth_curly - 1)); [ "$depth_curly" -lt 0 ] && return 1 ;;
+      '[') depth_square=$((depth_square + 1)) ;;
+      ']') depth_square=$((depth_square - 1)); [ "$depth_square" -lt 0 ] && return 1 ;;
+    esac
+  done
+  [ "$depth_curly" -eq 0 ] && [ "$depth_square" -eq 0 ] && [ "$in_string" -eq 0 ]
+}
+
+# トップレベルキー（4スペースインデント。例: `    "PostToolUse": [`）から、
+# 対応する閉じ `],` または `]` までを抜き出す。結線の取り違え（pre/postの混同など）を
+# セクション単位で検出するために使う。
+_hj_extract_section() {
+  local file="$1" key="$2"
+  awk -v line="    \"${key}\": [" '
+    $0 == line {f = 1}
+    f {print}
+    f && /^    \],?$/ {exit}
+  ' "$file"
+}
+
+if _hj_json_syntax_ok "$HJ_HOOKS_JSON"; then
+  pass "hooks.json: 構文として妥当（括弧の対応が取れている）"
+else
+  fail "hooks.json: 構文として妥当（括弧の対応が取れている）" "$(cat "$HJ_HOOKS_JSON" 2>&1)"
+fi
+
+if _hj_json_syntax_ok "$HJ_HOOKS_CODEX_JSON"; then
+  pass "hooks.codex.json: 構文として妥当（括弧の対応が取れている）"
+else
+  fail "hooks.codex.json: 構文として妥当（括弧の対応が取れている）" "$(cat "$HJ_HOOKS_CODEX_JSON" 2>&1)"
+fi
+
+# --- heartbeat.sh の実契約（pre|postのみを受理する）を確認してから、結線がそれに沿っているか検証する ---
+
+HJ_HB_ACCEPTED_LINE="$(grep -E '^\s*pre\|post\)' "$HJ_HEARTBEAT_SCRIPT")"
+if printf '%s' "$HJ_HB_ACCEPTED_LINE" | grep -q 'pre' \
+  && printf '%s' "$HJ_HB_ACCEPTED_LINE" | grep -q 'post'; then
+  pass "heartbeat.sh: 受理する引数がpre/postであることを確認できる（結線テストの前提）"
+else
+  fail "heartbeat.sh: 受理する引数がpre/postであることを確認できる（結線テストの前提）" \
+    "case文にpre|postが見つかりません: ${HJ_HB_ACCEPTED_LINE}"
+fi
+
+# --- hooks.json: PreToolUse(matcher=*)にheartbeat.sh preが結線されている ---
+
+# JSON文字列内の `"` はエスケープされて `\"` になっているため、grep -Fq の照合パターンにも
+# バックスラッシュを含める（例: `"command": "bash \"${CLAUDE_PLUGIN_ROOT}/...\" pre"`）。
+# ここを素の `"` のまま書くと、実ファイルの内容と1文字も一致せず必ず不一致になる。
+HJ_PRETOOLUSE="$(_hj_extract_section "$HJ_HOOKS_JSON" "PreToolUse")"
+if printf '%s' "$HJ_PRETOOLUSE" | grep -Fq '"matcher": "*"' \
+  && printf '%s' "$HJ_PRETOOLUSE" | grep -Fq 'bash \"${CLAUDE_PLUGIN_ROOT}/scripts/heartbeat.sh\" pre'; then
+  pass "hooks.json: PreToolUse(matcher=*)にheartbeat.sh preが結線されている"
+else
+  fail "hooks.json: PreToolUse(matcher=*)にheartbeat.sh preが結線されている" "$HJ_PRETOOLUSE"
+fi
+
+# pre/postの取り違えはabort判定（#50）を機能させなくする致命的なバグになるため、
+# 混入していないことを個別に確認する
+if printf '%s' "$HJ_PRETOOLUSE" | grep -Fq 'heartbeat.sh\" post'; then
+  fail "hooks.json: PreToolUseにheartbeat.sh postが紛れ込んでいない" "$HJ_PRETOOLUSE"
+else
+  pass "hooks.json: PreToolUseにheartbeat.sh postが紛れ込んでいない"
+fi
+
+# --- hooks.json: PostToolUse(matcher=*)にheartbeat.sh postが結線され、既存の可読性ガードも残っている ---
+
+HJ_POSTTOOLUSE="$(_hj_extract_section "$HJ_HOOKS_JSON" "PostToolUse")"
+if printf '%s' "$HJ_POSTTOOLUSE" | grep -Fq '"matcher": "*"' \
+  && printf '%s' "$HJ_POSTTOOLUSE" | grep -Fq 'bash \"${CLAUDE_PLUGIN_ROOT}/scripts/heartbeat.sh\" post'; then
+  pass "hooks.json: PostToolUse(matcher=*)にheartbeat.sh postが結線されている"
+else
+  fail "hooks.json: PostToolUse(matcher=*)にheartbeat.sh postが結線されている" "$HJ_POSTTOOLUSE"
+fi
+
+if printf '%s' "$HJ_POSTTOOLUSE" | grep -Fq 'heartbeat.sh\" pre'; then
+  fail "hooks.json: PostToolUseにheartbeat.sh preが紛れ込んでいない" "$HJ_POSTTOOLUSE"
+else
+  pass "hooks.json: PostToolUseにheartbeat.sh preが紛れ込んでいない"
+fi
+
+if printf '%s' "$HJ_POSTTOOLUSE" | grep -Fq '"matcher": "Write|Edit|MultiEdit"' \
+  && printf '%s' "$HJ_POSTTOOLUSE" | grep -Fq 'bash \"${CLAUDE_PLUGIN_ROOT}/scripts/check-readability.sh\"'; then
+  pass "hooks.json: PostToolUseの既存check-readability.sh（matcher=Write|Edit|MultiEdit）が残っている"
+else
+  fail "hooks.json: PostToolUseの既存check-readability.sh（matcher=Write|Edit|MultiEdit）が残っている" \
+    "$HJ_POSTTOOLUSE"
+fi
+
+# --- hooks.codex.json: PreToolUse(matcher=*)にheartbeat.sh preが結線されている ---
+#
+# CodexのイベントにPreToolUseは実在する（docs/dev-workflow-multi-vendor-guide.md §3.5.1）。
+# 当初（#52）はこれを「Codexに存在しない」と誤認して縮退させていたが、レビュー#59で
+# タスク間の不整合として指摘され、レビュー#61（state=postしか記録されず原因切り分けが
+# 成立しない）と合わせて結線することにした（詳細はheartbeat.shの打ち切り判定コメントを参照）。
+# ブロック契約自体はClaude Codeと異なり`continue`非対応でsystemMessageのみ（§3.5.2）だが、
+# state=preの記録（pre/postの切り分け）自体はブロック契約と独立して機能するため、
+# 結線するだけで#61の実害（stateが常にpostになる問題）は解消する。
+
+HJ_CODEX_PRETOOLUSE="$(_hj_extract_section "$HJ_HOOKS_CODEX_JSON" "PreToolUse")"
+if printf '%s' "$HJ_CODEX_PRETOOLUSE" | grep -Fq '"matcher": "*"' \
+  && printf '%s' "$HJ_CODEX_PRETOOLUSE" | grep -Fq 'bash \"${CLAUDE_PLUGIN_ROOT}/scripts/heartbeat.sh\" pre'; then
+  pass "hooks.codex.json: PreToolUse(matcher=*)にheartbeat.sh preが結線されている（#59, #61）"
+else
+  fail "hooks.codex.json: PreToolUse(matcher=*)にheartbeat.sh preが結線されている（#59, #61）" \
+    "$HJ_CODEX_PRETOOLUSE"
+fi
+
+if printf '%s' "$HJ_CODEX_PRETOOLUSE" | grep -Fq 'heartbeat.sh\" post'; then
+  fail "hooks.codex.json: PreToolUseにheartbeat.sh postが紛れ込んでいない" "$HJ_CODEX_PRETOOLUSE"
+else
+  pass "hooks.codex.json: PreToolUseにheartbeat.sh postが紛れ込んでいない"
+fi
+
+HJ_CODEX_POSTTOOLUSE="$(_hj_extract_section "$HJ_HOOKS_CODEX_JSON" "PostToolUse")"
+if printf '%s' "$HJ_CODEX_POSTTOOLUSE" | grep -Fq '"matcher": "*"' \
+  && printf '%s' "$HJ_CODEX_POSTTOOLUSE" | grep -Fq 'bash \"${CLAUDE_PLUGIN_ROOT}/scripts/heartbeat.sh\" post'; then
+  pass "hooks.codex.json: PostToolUse(matcher=*)にheartbeat.sh postが結線されている"
+else
+  fail "hooks.codex.json: PostToolUse(matcher=*)にheartbeat.sh postが結線されている" "$HJ_CODEX_POSTTOOLUSE"
+fi
+
+if printf '%s' "$HJ_CODEX_POSTTOOLUSE" | grep -Fq 'heartbeat.sh\" pre'; then
+  fail "hooks.codex.json: PostToolUseにheartbeat.sh preが紛れ込んでいない" "$HJ_CODEX_POSTTOOLUSE"
+else
+  pass "hooks.codex.json: PostToolUseにheartbeat.sh preが紛れ込んでいない"
+fi
+
+if printf '%s' "$HJ_CODEX_POSTTOOLUSE" | grep -Fq '"matcher": "Write|Edit|MultiEdit|apply_patch"' \
+  && printf '%s' "$HJ_CODEX_POSTTOOLUSE" | grep -Fq 'bash \"${CLAUDE_PLUGIN_ROOT}/scripts/check-readability.sh\"'; then
+  pass "hooks.codex.json: PostToolUseの既存check-readability.sh（matcher=Write|Edit|MultiEdit|apply_patch）が残っている"
+else
+  fail "hooks.codex.json: PostToolUseの既存check-readability.sh（matcher=Write|Edit|MultiEdit|apply_patch）が残っている" \
+    "$HJ_CODEX_POSTTOOLUSE"
+fi
+
+# --- hooks.codex.json: 既存のStop3フック（通知・可読性ガード・変更チェック）が残っている ---
+
+HJ_CODEX_STOP="$(_hj_extract_section "$HJ_HOOKS_CODEX_JSON" "Stop")"
+if printf '%s' "$HJ_CODEX_STOP" | grep -Fq 'notify-slack.sh\" stop' \
+  && printf '%s' "$HJ_CODEX_STOP" | grep -Fq 'check-readability.sh\" --git' \
+  && printf '%s' "$HJ_CODEX_STOP" | grep -Fq 'check-stop-review.sh\"'; then
+  pass "hooks.codex.json: 既存のStop3フック（通知・可読性ガード・変更チェック）が残っている"
+else
+  fail "hooks.codex.json: 既存のStop3フック（通知・可読性ガード・変更チェック）が残っている" "$HJ_CODEX_STOP"
+fi
+
+# --- 両JSONとも heartbeat.sh の結線が ${CLAUDE_PLUGIN_ROOT} を使ったパス指定になっている ---
+
+if grep -Fq '${CLAUDE_PLUGIN_ROOT}/scripts/heartbeat.sh' "$HJ_HOOKS_JSON"; then
+  pass "hooks.json: heartbeat.shの結線が\${CLAUDE_PLUGIN_ROOT}を使ったパス指定になっている"
+else
+  fail "hooks.json: heartbeat.shの結線が\${CLAUDE_PLUGIN_ROOT}を使ったパス指定になっている" \
+    "$(cat "$HJ_HOOKS_JSON")"
+fi
+
+if grep -Fq '${CLAUDE_PLUGIN_ROOT}/scripts/heartbeat.sh' "$HJ_HOOKS_CODEX_JSON"; then
+  pass "hooks.codex.json: heartbeat.shの結線が\${CLAUDE_PLUGIN_ROOT}を使ったパス指定になっている"
+else
+  fail "hooks.codex.json: heartbeat.shの結線が\${CLAUDE_PLUGIN_ROOT}を使ったパス指定になっている" \
+    "$(cat "$HJ_HOOKS_CODEX_JSON")"
+fi
+
+# --- フックが参照しているscripts/heartbeat.shが実在する（参照切れの防止） ---
+
+if [ -f "$HJ_HEARTBEAT_SCRIPT" ]; then
+  pass "hooks.json/hooks.codex.json: 参照しているscripts/heartbeat.shが実在する"
+else
+  fail "hooks.json/hooks.codex.json: 参照しているscripts/heartbeat.shが実在する" \
+    "見つかりません: ${HJ_HEARTBEAT_SCRIPT}"
+fi
+
+# ---------------------------------------------------------------------------
+# ドキュメント（共通ルール・generator・README）とアダプタ再生成・v0.13.0（#55）
+# ---------------------------------------------------------------------------
+
+echo "== ドキュメント（共通ルール・generator・README）とアダプタ再生成・v0.13.0（#55） =="
+
+DOC55_CLAUDE_PLUGIN_JSON="${REPO_ROOT}/.claude-plugin/plugin.json"
+DOC55_CODEX_PLUGIN_JSON="${REPO_ROOT}/.codex-plugin/plugin.json"
+DOC55_INSTRUCTIONS="${REPO_ROOT}/core/instructions.md"
+DOC55_GENERATOR_ROLE="${REPO_ROOT}/core/roles/generator.md"
+DOC55_README="${REPO_ROOT}/README.md"
+DOC55_AGENT_GENERATOR="${REPO_ROOT}/agents/generator.md"
+DOC55_CODEX_AGENT_GENERATOR="${REPO_ROOT}/codex-agents/generator.toml"
+
+# --- 両 plugin.json のバージョンが 0.13.0 で一致している ---
+
+DOC55_CLAUDE_VERSION="$(grep -m1 '"version"' "$DOC55_CLAUDE_PLUGIN_JSON" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+')"
+DOC55_CODEX_VERSION="$(grep -m1 '"version"' "$DOC55_CODEX_PLUGIN_JSON" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+')"
+
+assert_eq ".claude-plugin/plugin.json のバージョンが0.13.0である" "0.13.0" "$DOC55_CLAUDE_VERSION"
+assert_eq ".codex-plugin/plugin.json のバージョンが0.13.0である" "0.13.0" "$DOC55_CODEX_VERSION"
+assert_eq "両plugin.jsonのバージョンが一致している" "$DOC55_CLAUDE_VERSION" "$DOC55_CODEX_VERSION"
+
+# --- core/instructions.md に watchdog の3点の記述がある ---
+
+if grep -Fq 'watchdog は検知して通知するだけであり' "$DOC55_INSTRUCTIONS"; then
+  pass "core/instructions.md: 「watchdogは検知して通知するだけ」の記述がある"
+else
+  fail "core/instructions.md: 「watchdogは検知して通知するだけ」の記述がある"
+fi
+
+if grep -Fq '自動打ち切りは原理的に実装できない' "$DOC55_INSTRUCTIONS" \
+  && grep -Fq 'Claude Code ではサブエージェントを外部から中断できない' "$DOC55_INSTRUCTIONS"; then
+  pass "core/instructions.md: 「Claude Codeでは自動打ち切りが原理的に不可能」の記述がある"
+else
+  fail "core/instructions.md: 「Claude Codeでは自動打ち切りが原理的に不可能」の記述がある"
+fi
+
+if grep -Fq 'アダプタ間に' "$DOC55_INSTRUCTIONS" && grep -Fq '機能差を作らないため採用していない' "$DOC55_INSTRUCTIONS"; then
+  pass "core/instructions.md: 「Codexでも採用していない（機能差を作らない）」の記述がある"
+else
+  fail "core/instructions.md: 「Codexでも採用していない（機能差を作らない）」の記述がある"
+fi
+
+# --- core/roles/generator.md に拒否メッセージを受けたときの振る舞いの記述がある ---
+
+if grep -Fq '打ち切りが指示されました' "$DOC55_GENERATOR_ROLE" \
+  && grep -Fq '別のツールで迂回・回避を試みない' "$DOC55_GENERATOR_ROLE"; then
+  pass "core/roles/generator.md: 拒否メッセージを受けたときの振る舞い（別のツールで回避しない）の記述がある"
+else
+  fail "core/roles/generator.md: 拒否メッセージを受けたときの振る舞い（別のツールで回避しない）の記述がある"
+fi
+
+if grep -Fq '実施済みの変更・' "$DOC55_GENERATOR_ROLE" && grep -Fq '未コミットの有無' "$DOC55_GENERATOR_ROLE"; then
+  pass "core/roles/generator.md: 拒否メッセージを受けたときに現状（変更・未コミット）を報告する記述がある"
+else
+  fail "core/roles/generator.md: 拒否メッセージを受けたときに現状（変更・未コミット）を報告する記述がある"
+fi
+
+# --- README に運用手順の節と「抑止できないもの」の記述がある ---
+
+if grep -Fq '## 運用手順（watchdog）' "$DOC55_README"; then
+  pass "README.md: 「運用手順（watchdog）」の節がある"
+else
+  fail "README.md: 「運用手順（watchdog）」の節がある"
+fi
+
+if grep -Fq '抑止できないもの' "$DOC55_README" \
+  && grep -Fq 'ふたを閉じる操作' "$DOC55_README" \
+  && grep -Fq 'バッテリー切れ' "$DOC55_README"; then
+  pass "README.md: 「抑止できないもの」（ふたを閉じる操作・バッテリー切れ等）の記述がある"
+else
+  fail "README.md: 「抑止できないもの」（ふたを閉じる操作・バッテリー切れ等）の記述がある"
+fi
+
+if grep -Fq 'DEV_WORKFLOW_WATCHDOG_IDLE_SEC' "$DOC55_README" \
+  && grep -Fq 'DEV_WORKFLOW_NO_SLEEP_INHIBIT' "$DOC55_README"; then
+  pass "README.md: watchdogの環境変数一覧がある"
+else
+  fail "README.md: watchdogの環境変数一覧がある"
+fi
+
+# セッション中断後は watchdog.sh --stop を実行する旨の記述が存在すること（レビュー#62）。
+# セッションをプロセスごと中断するとStopフックが発火せずrunマーカーが残り続け、
+# watchdogが打ち切りに気付かないまま無活動検知・エスカレーション通知を出し続けるため。
+DOC62_README_HANG_SECTION="$(awk '/^### ハングしたときの対処/{f=1} /^### スリープ抑止/{f=0} f' "$DOC55_README")"
+
+if [ -n "$DOC62_README_HANG_SECTION" ]; then
+  pass "README.md: 「ハングしたときの対処」の節が存在する（#62）"
+else
+  fail "README.md: 「ハングしたときの対処」の節が存在する（#62）" "節が見つかりません"
+fi
+
+case "$DOC62_README_HANG_SECTION" in
+  *'watchdog.sh" --stop'*)
+    pass "README.md: ハング時の節にセッション中断後の watchdog.sh --stop の指示がある（#62）" ;;
+  *)
+    fail "README.md: ハング時の節にセッション中断後の watchdog.sh --stop の指示がある（#62）" \
+      "$DOC62_README_HANG_SECTION" ;;
+esac
+
+case "$DOC62_README_HANG_SECTION" in
+  *'Stop フックが走らず'*'run マーカー'*)
+    pass "README.md: セッション中断時にStopフックが走らずrunマーカーが残る旨の説明がある（#62）" ;;
+  *)
+    fail "README.md: セッション中断時にStopフックが走らずrunマーカーが残る旨の説明がある（#62）" \
+      "$DOC62_README_HANG_SECTION" ;;
+esac
+
+# --- 生成物（agents/generator.md 等）に正本の追記内容が反映されている ---
+
+if [ -f "$DOC55_AGENT_GENERATOR" ] \
+  && grep -Fq '打ち切りが指示されました' "$DOC55_AGENT_GENERATOR" \
+  && grep -Fq 'watchdog は検知して通知するだけであり' "$DOC55_AGENT_GENERATOR"; then
+  pass "agents/generator.md: 正本（core/roles/generator.md・core/instructions.md）の追記内容が反映されている"
+else
+  fail "agents/generator.md: 正本（core/roles/generator.md・core/instructions.md）の追記内容が反映されている" \
+    "見つかりません: ${DOC55_AGENT_GENERATOR}"
+fi
+
+if [ -f "$DOC55_CODEX_AGENT_GENERATOR" ] \
+  && grep -Fq '打ち切りが指示されました' "$DOC55_CODEX_AGENT_GENERATOR" \
+  && grep -Fq 'watchdog は検知して通知するだけであり' "$DOC55_CODEX_AGENT_GENERATOR"; then
+  pass "codex-agents/generator.toml: 正本の追記内容が反映されている"
+else
+  fail "codex-agents/generator.toml: 正本の追記内容が反映されている" \
+    "見つかりません: ${DOC55_CODEX_AGENT_GENERATOR}"
+fi
+
+# --- adapters/claude/build.sh・adapters/codex/build.sh の再生成後に差分が出ない（--check） ---
+
+DOC55_CLAUDE_BUILD_CHECK_LOG="$(mktemp "${TMPDIR:-/tmp}/dw-test-claude-build-check.XXXXXX")"
+DOC55_CODEX_BUILD_CHECK_LOG="$(mktemp "${TMPDIR:-/tmp}/dw-test-codex-build-check.XXXXXX")"
+
+if bash "${REPO_ROOT}/adapters/claude/build.sh" --check >"$DOC55_CLAUDE_BUILD_CHECK_LOG" 2>&1; then
+  pass "adapters/claude/build.sh --check: 生成物が正本と一致している（再生成後に差分が無い）"
+else
+  fail "adapters/claude/build.sh --check: 生成物が正本と一致している（再生成後に差分が無い）" \
+    "$(cat "$DOC55_CLAUDE_BUILD_CHECK_LOG")"
+fi
+
+if bash "${REPO_ROOT}/adapters/codex/build.sh" --check >"$DOC55_CODEX_BUILD_CHECK_LOG" 2>&1; then
+  pass "adapters/codex/build.sh --check: 生成物が正本と一致している（再生成後に差分が無い）"
+else
+  fail "adapters/codex/build.sh --check: 生成物が正本と一致している（再生成後に差分が無い）" \
+    "$(cat "$DOC55_CODEX_BUILD_CHECK_LOG")"
 fi
 
 # ---------------------------------------------------------------------------

@@ -12,6 +12,19 @@
         ]
       }
     ],
+    "PreToolUse": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PLUGIN_ROOT}/scripts/heartbeat.sh\" pre",
+            "timeout": 30,
+            "statusMessage": "dev-workflow: 生存信号を記録中..."
+          }
+        ]
+      }
+    ],
     "PostToolUse": [
       {
         "matcher": "Write|Edit|MultiEdit|apply_patch",
@@ -21,6 +34,17 @@
             "command": "bash \"${CLAUDE_PLUGIN_ROOT}/scripts/check-readability.sh\"",
             "timeout": 30,
             "statusMessage": "dev-workflow: 可読性チェック中..."
+          }
+        ]
+      },
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PLUGIN_ROOT}/scripts/heartbeat.sh\" post",
+            "timeout": 30,
+            "statusMessage": "dev-workflow: 生存信号を記録中..."
           }
         ]
       }

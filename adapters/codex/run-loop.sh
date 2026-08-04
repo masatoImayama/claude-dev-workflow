@@ -29,8 +29,27 @@
 #       Codex 側の承認プロンプトを飛ばすため、**信頼できるリポジトリでのみ**使うこと。
 #       Codex にはターン数の上限設定がないため、暴走の抑止は
 #       このスクリプトの反復回数上限と、各役割のプロンプト規約で担保している。
+#
+# watchdog（Epic #42 決定事項4。Task #53）: `scripts/watchdog.sh` を Claude Code 版
+# （`skills/run/SKILL.md`）と同じ経路（--start → 各タスク開始時に --wave → 終了時に --stop）
+# で結線する。**アダプタ間に機能差を作らないため**、Codex 側もハングを検知して通知するだけに
+# 揃える。ここに `codex exec` に対するタイムアウト監視・TERM/KILL・打ち切り後の自動再投入は
+# 実装しない（`codex exec` は子プロセスとして起動しているため技術的には可能だが、Claude Code の
+# サブエージェントには同じことが原理的にできず、CLI ごとに挙動が変わってしまうため）。
 
 set -uo pipefail
+
+PLUGIN_ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+
+# watchdog の --stop を、正常終了・異常終了・途中の exit を問わず必ず1回通す。
+# 引数エラー等 --start より前に落ちる経路でも安全に呼べる（watchdog.sh --stop は
+# 「起動していない」場合 exit 0 で何もしない）。watchdog.sh 自体が無い・失敗する
+# 環境でもループを止めないよう `|| true` で握りつぶす。PLUGIN_ROOT_DIR の直後、
+# 最初の `exit` より前に trap を仕掛けることで、以降のどの経路で終了しても通る。
+_run_loop_watchdog_stop() {
+  bash "${PLUGIN_ROOT_DIR}/scripts/watchdog.sh" --stop >/dev/null 2>&1 || true
+}
+trap '_run_loop_watchdog_stop' EXIT
 
 EPIC_NUMBER="${1:-}"
 PROJECT_ROOT="${2:-.}"
@@ -41,7 +60,6 @@ if [ -z "$EPIC_NUMBER" ]; then
 fi
 EPIC_NUMBER="${EPIC_NUMBER#\#}"
 
-PLUGIN_ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 SCHEMA="${PLUGIN_ROOT_DIR}/adapters/codex/schemas/evaluator-verdict.json"
 MAX_ATTEMPTS="${DEV_WORKFLOW_MAX_ATTEMPTS:-3}"
 MAX_TASKS="${DEV_WORKFLOW_MAX_TASKS:-50}"
@@ -153,6 +171,10 @@ mechanical_gate() {
 # ── 開始を記録 ───────────────────────────────────────────────────────
 bash "${PLUGIN_ROOT_DIR}/scripts/notify-slack.sh" run-start "Epic #${EPIC_NUMBER}" || true
 
+# watchdog を起動する（run マーカーの消失を自己終了条件の1つにしているため、
+# 必ずマーカーより後に起動すること）。`--start` 自体は自己デタッチして即座に返る。
+bash "${PLUGIN_ROOT_DIR}/scripts/watchdog.sh" --start --epic "$EPIC_NUM" --label "Epic #${EPIC_NUMBER}" || true
+
 # ── タスクループ（依存グラフに基づくウェーブ実行。lanes=1 固定）───────
 # 1タスク = 1レーン = 1ウェーブとして扱う。plan-waves.sh を毎回再計算し、
 # 常に「次に処理すべきタスク」を先頭から1件だけ取り出す（Codexは並列起動しないため）。
@@ -160,7 +182,16 @@ processed=0
 skipped=0
 SKIPPED_CSV=""
 PROPAGATED_CSV=""   # 依存先スキップにより伝播スキップ済みとして既にコメントしたタスク番号（重複コメント防止）
-WAVE_NO=0
+
+# WAVE_NO: wave ブランチ名（wave/${EPIC_NUM}/${WAVE_NO}）の通し番号。0 から始めてはならない
+# （Task #54）。中断→再開でこのスクリプトを再実行すると本変数はプロセスごと失われ 0 から
+# 数え直すことになるが、`wave/${EPIC_NUM}/*` ブランチはローカルに残り続ける（origin へ push
+# しない設計）。0 から始めると前回の残骸 wave ブランチをそのまま掴んでしまう。既存の
+# wave ブランチの番号の最大値から始めることで、再開時も必ず新しい wave ブランチが使われる
+# （残骸を掴んだ場合も `merge-lane.sh --create` が tip 不一致を検出し exit 1 で拒否する）。
+WAVE_NO=$(git -C "$EPIC_WT" for-each-ref --format='%(refname:short)' "refs/heads/wave/${EPIC_NUM}/*" \
+  | sed "s#^wave/${EPIC_NUM}/##" | sort -n | tail -1)
+WAVE_NO="${WAVE_NO:-0}"
 
 while [ "$processed" -lt "$MAX_TASKS" ]; do
   PLAN_ARGS=(--epic "$EPIC_NUMBER" --lanes 1)
@@ -219,6 +250,11 @@ while [ "$processed" -lt "$MAX_TASKS" ]; do
   WAVE_NO=$((WAVE_NO + 1))
   WAVE_BRANCH="wave/${EPIC_NUM}/${WAVE_NO}"
   LANE_BRANCH="task/${EPIC_NUM}/${task}"
+
+  # ウェーブ予算の監視（watchdog）に、このウェーブの内訳を伝える。lanes=1 固定のため
+  # 1タスク=1ウェーブとして扱う（generator を起動する前に伝えること）
+  bash "${PLUGIN_ROOT_DIR}/scripts/watchdog.sh" --wave --epic "$EPIC_NUM" \
+    --wave-no "$WAVE_NO" --tasks "$task" || true
 
   attempt=1
   passed=0
