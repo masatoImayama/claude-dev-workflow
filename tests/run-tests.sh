@@ -5245,6 +5245,198 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+# hooks.json / hooks.codex.json: heartbeat結線（Task #52）
+# ---------------------------------------------------------------------------
+
+echo "== hooks.json / hooks.codex.json: heartbeat結線（Task #52） =="
+
+HJ_HOOKS_JSON="${REPO_ROOT}/hooks/hooks.json"
+HJ_HOOKS_CODEX_JSON="${REPO_ROOT}/hooks/hooks.codex.json"
+HJ_HEARTBEAT_SCRIPT="${REPO_ROOT}/scripts/heartbeat.sh"
+
+# JSONとしての構文妥当性を、jq/pythonを新たに足さず括弧の対応だけで確認する
+# （文字列リテラル内の括弧は無視する）。完全なJSONパーサではないが、
+# このタスクで書き換える範囲の妥当性を検証するには十分（issue #52 の指示どおり
+# 「既存に検証手段が無ければ grep で必要なキー・文字列の存在を確認する」方針に沿う）。
+_hj_json_syntax_ok() {
+  local file="$1"
+  local content
+  content="$(cat "$file" 2>/dev/null)" || return 1
+  local len=${#content}
+  local i char depth_curly=0 depth_square=0 in_string=0 escape=0
+  for ((i = 0; i < len; i++)); do
+    char="${content:i:1}"
+    if [ "$escape" -eq 1 ]; then
+      escape=0
+      continue
+    fi
+    if [ "$in_string" -eq 1 ]; then
+      case "$char" in
+        '\') escape=1 ;;
+        '"') in_string=0 ;;
+      esac
+      continue
+    fi
+    case "$char" in
+      '"') in_string=1 ;;
+      '{') depth_curly=$((depth_curly + 1)) ;;
+      '}') depth_curly=$((depth_curly - 1)); [ "$depth_curly" -lt 0 ] && return 1 ;;
+      '[') depth_square=$((depth_square + 1)) ;;
+      ']') depth_square=$((depth_square - 1)); [ "$depth_square" -lt 0 ] && return 1 ;;
+    esac
+  done
+  [ "$depth_curly" -eq 0 ] && [ "$depth_square" -eq 0 ] && [ "$in_string" -eq 0 ]
+}
+
+# トップレベルキー（4スペースインデント。例: `    "PostToolUse": [`）から、
+# 対応する閉じ `],` または `]` までを抜き出す。結線の取り違え（pre/postの混同など）を
+# セクション単位で検出するために使う。
+_hj_extract_section() {
+  local file="$1" key="$2"
+  awk -v line="    \"${key}\": [" '
+    $0 == line {f = 1}
+    f {print}
+    f && /^    \],?$/ {exit}
+  ' "$file"
+}
+
+if _hj_json_syntax_ok "$HJ_HOOKS_JSON"; then
+  pass "hooks.json: 構文として妥当（括弧の対応が取れている）"
+else
+  fail "hooks.json: 構文として妥当（括弧の対応が取れている）" "$(cat "$HJ_HOOKS_JSON" 2>&1)"
+fi
+
+if _hj_json_syntax_ok "$HJ_HOOKS_CODEX_JSON"; then
+  pass "hooks.codex.json: 構文として妥当（括弧の対応が取れている）"
+else
+  fail "hooks.codex.json: 構文として妥当（括弧の対応が取れている）" "$(cat "$HJ_HOOKS_CODEX_JSON" 2>&1)"
+fi
+
+# --- heartbeat.sh の実契約（pre|postのみを受理する）を確認してから、結線がそれに沿っているか検証する ---
+
+HJ_HB_ACCEPTED_LINE="$(grep -E '^\s*pre\|post\)' "$HJ_HEARTBEAT_SCRIPT")"
+if printf '%s' "$HJ_HB_ACCEPTED_LINE" | grep -q 'pre' \
+  && printf '%s' "$HJ_HB_ACCEPTED_LINE" | grep -q 'post'; then
+  pass "heartbeat.sh: 受理する引数がpre/postであることを確認できる（結線テストの前提）"
+else
+  fail "heartbeat.sh: 受理する引数がpre/postであることを確認できる（結線テストの前提）" \
+    "case文にpre|postが見つかりません: ${HJ_HB_ACCEPTED_LINE}"
+fi
+
+# --- hooks.json: PreToolUse(matcher=*)にheartbeat.sh preが結線されている ---
+
+# JSON文字列内の `"` はエスケープされて `\"` になっているため、grep -Fq の照合パターンにも
+# バックスラッシュを含める（例: `"command": "bash \"${CLAUDE_PLUGIN_ROOT}/...\" pre"`）。
+# ここを素の `"` のまま書くと、実ファイルの内容と1文字も一致せず必ず不一致になる。
+HJ_PRETOOLUSE="$(_hj_extract_section "$HJ_HOOKS_JSON" "PreToolUse")"
+if printf '%s' "$HJ_PRETOOLUSE" | grep -Fq '"matcher": "*"' \
+  && printf '%s' "$HJ_PRETOOLUSE" | grep -Fq 'bash \"${CLAUDE_PLUGIN_ROOT}/scripts/heartbeat.sh\" pre'; then
+  pass "hooks.json: PreToolUse(matcher=*)にheartbeat.sh preが結線されている"
+else
+  fail "hooks.json: PreToolUse(matcher=*)にheartbeat.sh preが結線されている" "$HJ_PRETOOLUSE"
+fi
+
+# pre/postの取り違えはabort判定（#50）を機能させなくする致命的なバグになるため、
+# 混入していないことを個別に確認する
+if printf '%s' "$HJ_PRETOOLUSE" | grep -Fq 'heartbeat.sh\" post'; then
+  fail "hooks.json: PreToolUseにheartbeat.sh postが紛れ込んでいない" "$HJ_PRETOOLUSE"
+else
+  pass "hooks.json: PreToolUseにheartbeat.sh postが紛れ込んでいない"
+fi
+
+# --- hooks.json: PostToolUse(matcher=*)にheartbeat.sh postが結線され、既存の可読性ガードも残っている ---
+
+HJ_POSTTOOLUSE="$(_hj_extract_section "$HJ_HOOKS_JSON" "PostToolUse")"
+if printf '%s' "$HJ_POSTTOOLUSE" | grep -Fq '"matcher": "*"' \
+  && printf '%s' "$HJ_POSTTOOLUSE" | grep -Fq 'bash \"${CLAUDE_PLUGIN_ROOT}/scripts/heartbeat.sh\" post'; then
+  pass "hooks.json: PostToolUse(matcher=*)にheartbeat.sh postが結線されている"
+else
+  fail "hooks.json: PostToolUse(matcher=*)にheartbeat.sh postが結線されている" "$HJ_POSTTOOLUSE"
+fi
+
+if printf '%s' "$HJ_POSTTOOLUSE" | grep -Fq 'heartbeat.sh\" pre'; then
+  fail "hooks.json: PostToolUseにheartbeat.sh preが紛れ込んでいない" "$HJ_POSTTOOLUSE"
+else
+  pass "hooks.json: PostToolUseにheartbeat.sh preが紛れ込んでいない"
+fi
+
+if printf '%s' "$HJ_POSTTOOLUSE" | grep -Fq '"matcher": "Write|Edit|MultiEdit"' \
+  && printf '%s' "$HJ_POSTTOOLUSE" | grep -Fq 'bash \"${CLAUDE_PLUGIN_ROOT}/scripts/check-readability.sh\"'; then
+  pass "hooks.json: PostToolUseの既存check-readability.sh（matcher=Write|Edit|MultiEdit）が残っている"
+else
+  fail "hooks.json: PostToolUseの既存check-readability.sh（matcher=Write|Edit|MultiEdit）が残っている" \
+    "$HJ_POSTTOOLUSE"
+fi
+
+# --- hooks.codex.json: CodexにPreToolUseは存在しないため、PostToolUseだけで縮退結線されている ---
+
+if grep -Fq '"PreToolUse"' "$HJ_HOOKS_CODEX_JSON"; then
+  fail "hooks.codex.json: PreToolUseが無い（CodexにPreToolUseは存在しないため縮退させる。issue #52）" \
+    "$(cat "$HJ_HOOKS_CODEX_JSON")"
+else
+  pass "hooks.codex.json: PreToolUseが無い（CodexにPreToolUseは存在しないため縮退させる。issue #52）"
+fi
+
+HJ_CODEX_POSTTOOLUSE="$(_hj_extract_section "$HJ_HOOKS_CODEX_JSON" "PostToolUse")"
+if printf '%s' "$HJ_CODEX_POSTTOOLUSE" | grep -Fq '"matcher": "*"' \
+  && printf '%s' "$HJ_CODEX_POSTTOOLUSE" | grep -Fq 'bash \"${CLAUDE_PLUGIN_ROOT}/scripts/heartbeat.sh\" post'; then
+  pass "hooks.codex.json: PostToolUse(matcher=*)にheartbeat.sh postが結線されている"
+else
+  fail "hooks.codex.json: PostToolUse(matcher=*)にheartbeat.sh postが結線されている" "$HJ_CODEX_POSTTOOLUSE"
+fi
+
+if printf '%s' "$HJ_CODEX_POSTTOOLUSE" | grep -Fq 'heartbeat.sh\" pre'; then
+  fail "hooks.codex.json: heartbeat.sh preが紛れ込んでいない（PreToolUse非対応のため）" \
+    "$HJ_CODEX_POSTTOOLUSE"
+else
+  pass "hooks.codex.json: heartbeat.sh preが紛れ込んでいない（PreToolUse非対応のため）"
+fi
+
+if printf '%s' "$HJ_CODEX_POSTTOOLUSE" | grep -Fq '"matcher": "Write|Edit|MultiEdit|apply_patch"' \
+  && printf '%s' "$HJ_CODEX_POSTTOOLUSE" | grep -Fq 'bash \"${CLAUDE_PLUGIN_ROOT}/scripts/check-readability.sh\"'; then
+  pass "hooks.codex.json: PostToolUseの既存check-readability.sh（matcher=Write|Edit|MultiEdit|apply_patch）が残っている"
+else
+  fail "hooks.codex.json: PostToolUseの既存check-readability.sh（matcher=Write|Edit|MultiEdit|apply_patch）が残っている" \
+    "$HJ_CODEX_POSTTOOLUSE"
+fi
+
+# --- hooks.codex.json: 既存のStop3フック（通知・可読性ガード・変更チェック）が残っている ---
+
+HJ_CODEX_STOP="$(_hj_extract_section "$HJ_HOOKS_CODEX_JSON" "Stop")"
+if printf '%s' "$HJ_CODEX_STOP" | grep -Fq 'notify-slack.sh\" stop' \
+  && printf '%s' "$HJ_CODEX_STOP" | grep -Fq 'check-readability.sh\" --git' \
+  && printf '%s' "$HJ_CODEX_STOP" | grep -Fq 'check-stop-review.sh\"'; then
+  pass "hooks.codex.json: 既存のStop3フック（通知・可読性ガード・変更チェック）が残っている"
+else
+  fail "hooks.codex.json: 既存のStop3フック（通知・可読性ガード・変更チェック）が残っている" "$HJ_CODEX_STOP"
+fi
+
+# --- 両JSONとも heartbeat.sh の結線が ${CLAUDE_PLUGIN_ROOT} を使ったパス指定になっている ---
+
+if grep -Fq '${CLAUDE_PLUGIN_ROOT}/scripts/heartbeat.sh' "$HJ_HOOKS_JSON"; then
+  pass "hooks.json: heartbeat.shの結線が\${CLAUDE_PLUGIN_ROOT}を使ったパス指定になっている"
+else
+  fail "hooks.json: heartbeat.shの結線が\${CLAUDE_PLUGIN_ROOT}を使ったパス指定になっている" \
+    "$(cat "$HJ_HOOKS_JSON")"
+fi
+
+if grep -Fq '${CLAUDE_PLUGIN_ROOT}/scripts/heartbeat.sh' "$HJ_HOOKS_CODEX_JSON"; then
+  pass "hooks.codex.json: heartbeat.shの結線が\${CLAUDE_PLUGIN_ROOT}を使ったパス指定になっている"
+else
+  fail "hooks.codex.json: heartbeat.shの結線が\${CLAUDE_PLUGIN_ROOT}を使ったパス指定になっている" \
+    "$(cat "$HJ_HOOKS_CODEX_JSON")"
+fi
+
+# --- フックが参照しているscripts/heartbeat.shが実在する（参照切れの防止） ---
+
+if [ -f "$HJ_HEARTBEAT_SCRIPT" ]; then
+  pass "hooks.json/hooks.codex.json: 参照しているscripts/heartbeat.shが実在する"
+else
+  fail "hooks.json/hooks.codex.json: 参照しているscripts/heartbeat.shが実在する" \
+    "見つかりません: ${HJ_HEARTBEAT_SCRIPT}"
+fi
+
+# ---------------------------------------------------------------------------
 # 結果集計
 # ---------------------------------------------------------------------------
 
