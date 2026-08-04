@@ -11,6 +11,8 @@
 #   stall-recovered  <詳細>   — watchdog用。ストール後に活動が戻った
 #   sleep-gap        <詳細>   — watchdog用。tickの実経過が異常に飛んだ（スリープ痕跡）
 #   budget           <詳細>   — watchdog用。ウェーブが予算を超えた（メンション付き）
+#   sleep-inhibit-warn <詳細> — watchdog用。スリープ抑止に失敗、または対応する手段が無い
+#                               （run中でもPCがスリープしうる状態。初回のみ通知される）
 #
 # watchdogイベントの<詳細>は呼び出し側（watchdog.sh）が組み立てた文字列をそのまま本文に載せる。
 # ストール警告では「ツール実行中に停止（state=pre）」「モデルの応答待ちで停止（state=post）」を
@@ -213,6 +215,13 @@ $(last_assistant_message 2>/dev/null || true)"
     ;;
   budget)
     HEADLINE=":hourglass_flowing_sand: 想定時間超過"
+    DETAIL="$ARG"
+    ;;
+  sleep-inhibit-warn)
+    # スリープ抑止に失敗した、または対応する手段が無い場合の警告。同じ警告を毎tick
+    # 送るとSlackを埋めるため、初回のみ呼び出す（watchdog.sh側でWD_STATE_INHIBIT_WARNEDを
+    # 見て制御している。ここでは受け取った通知をそのまま送るだけ）
+    HEADLINE=":warning: スリープ抑止に失敗"
     DETAIL="$ARG"
     ;;
   *)

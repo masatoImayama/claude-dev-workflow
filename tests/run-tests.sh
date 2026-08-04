@@ -4302,6 +4302,7 @@ wds_tick() {
   DEV_WORKFLOW_WATCHDOG_TICK_SEC="$tick_sec" \
   SLACK_WEBHOOK_URL="https://example.invalid/webhook" \
   DEV_WORKFLOW_NOTIFY_SINK="$sink" \
+  DEV_WORKFLOW_NO_SLEEP_INHIBIT=1 \
   PATH="${WDS_FAKE_BIN}:${PATH}" \
   bash "$WD_SCRIPT" --tick-once --epic 47 --label "Epic #47 test" > /dev/null 2>&1
 }
@@ -4596,6 +4597,7 @@ wb_tick() {
   DEV_WORKFLOW_WATCHDOG_TICK_SEC="$tick_sec" \
   SLACK_WEBHOOK_URL="https://example.invalid/webhook" \
   DEV_WORKFLOW_NOTIFY_SINK="$sink" \
+  DEV_WORKFLOW_NO_SLEEP_INHIBIT=1 \
   PATH="${WDS_FAKE_BIN}:${PATH}" \
   bash "$WD_SCRIPT" --tick-once --epic 48 --label "Epic #48 test" > /dev/null 2>&1
 }
@@ -4775,12 +4777,224 @@ WB_BUDGET_NOGH="$(grep '^budget_sec=' "${WB_ROOT_NOGH}/.claude/.dev-workflow-run
   | cut -d= -f2)"
 assert_eq "watchdog.sh --wave: ghが使えない場合は既定5400秒になる" "5400" "$WB_BUDGET_NOGH"
 
+# ---------------------------------------------------------------------------
+# scripts/watchdog.sh: スリープ抑止（Task #49、Epic #42）
+#
+# このサンドボックス（Alpine）には powershell / caffeinate / systemd-inhibit のいずれも
+# 存在しないため、OS判定は DEV_WORKFLOW_WATCHDOG_OS で注入し、実行はしない
+# （DEV_WORKFLOW_INHIBIT_SINK に組み立てたコマンド文字列だけを書かせて検証する。
+# 既存の notify-slack.sh sink・PATH注入の偽コマンド方式に倣う）。
+# 「抑止コマンドが失敗する状況」は、Alpineに実在しないpowershellを注入無しでそのまま
+# windowsとして実行させることで自然に再現する（フェイクを追加で用意する必要が無い）。
+# Windowsの実際の呼び出し成否は、powershellが存在するWindows実機上で --tick-once を
+# 直接叩いて別途確認する（テストでは検証しない。issueへ実出力を記録する）。
+# ---------------------------------------------------------------------------
+
+echo ""
+echo "== scripts/watchdog.sh: スリープ抑止（Task #49） =="
+
+WI_WORK="$(mktemp -d "${TMPDIR:-/tmp}/dw-test-watchdog-inhibit.XXXXXX")"
+
+# --- windows: SetThreadExecutionState を含むコマンドが組み立てられる ---
+
+WI_ROOT_WIN="$(wd_new_root)"
+WI_SINK_WIN="${WI_WORK}/windows.cmd"
+DEV_WORKFLOW_MARKER_ROOT="$WI_ROOT_WIN" DEV_WORKFLOW_WATCHDOG_NOW=1700800000 \
+DEV_WORKFLOW_WATCHDOG_OS=windows DEV_WORKFLOW_WATCHDOG_TICK_SEC=60 \
+DEV_WORKFLOW_INHIBIT_SINK="$WI_SINK_WIN" PATH="${WDS_FAKE_BIN}:${PATH}" \
+  bash "$WD_SCRIPT" --tick-once > /dev/null 2>&1
+WI_EXIT_WIN=$?
+assert_exit_code "watchdog.sh --tick-once: windows のスリープ抑止 tick は exit 0" 0 "$WI_EXIT_WIN"
+WI_CMD_WIN="$(cat "$WI_SINK_WIN" 2>/dev/null)"
+case "$WI_CMD_WIN" in
+  windows*"SetThreadExecutionState"*"0x00000001"*)
+    pass "watchdog.sh: windowsでSetThreadExecutionStateを含むコマンドが組み立てられる" ;;
+  *)
+    fail "watchdog.sh: windowsでSetThreadExecutionStateを含むコマンドが組み立てられる" "$WI_CMD_WIN" ;;
+esac
+case "$WI_CMD_WIN" in
+  *powershell*-NoProfile*) pass "watchdog.sh: windowsのコマンドはpowershell -NoProfileで組み立てられる" ;;
+  *)                       fail "watchdog.sh: windowsのコマンドはpowershell -NoProfileで組み立てられる" "$WI_CMD_WIN" ;;
+esac
+
+# --- macos: caffeinate -u -t <tick+30> を含むコマンドが組み立てられる ---
+
+WI_ROOT_MAC="$(wd_new_root)"
+WI_SINK_MAC="${WI_WORK}/macos.cmd"
+DEV_WORKFLOW_MARKER_ROOT="$WI_ROOT_MAC" DEV_WORKFLOW_WATCHDOG_NOW=1700800000 \
+DEV_WORKFLOW_WATCHDOG_OS=macos DEV_WORKFLOW_WATCHDOG_TICK_SEC=60 \
+DEV_WORKFLOW_INHIBIT_SINK="$WI_SINK_MAC" PATH="${WDS_FAKE_BIN}:${PATH}" \
+  bash "$WD_SCRIPT" --tick-once > /dev/null 2>&1
+WI_CMD_MAC="$(cat "$WI_SINK_MAC" 2>/dev/null)"
+case "$WI_CMD_MAC" in
+  macos*"caffeinate -u -t 90"*)
+    pass "watchdog.sh: macosでcaffeinate -u -t <tick+30>を含むコマンドが組み立てられる" ;;
+  *)
+    fail "watchdog.sh: macosでcaffeinate -u -t <tick+30>を含むコマンドが組み立てられる" "$WI_CMD_MAC" ;;
+esac
+
+# --- linux（systemd-inhibitあり）: systemd-inhibit --what=idle --mode=block を含むコマンドが組み立てられる ---
+
+WI_FAKE_BIN="${WI_WORK}/bin"
+mkdir -p "$WI_FAKE_BIN"
+printf '#!/bin/bash\nexit 0\n' > "${WI_FAKE_BIN}/systemd-inhibit"
+chmod +x "${WI_FAKE_BIN}/systemd-inhibit"
+
+WI_ROOT_LINUX="$(wd_new_root)"
+WI_SINK_LINUX="${WI_WORK}/linux.cmd"
+DEV_WORKFLOW_MARKER_ROOT="$WI_ROOT_LINUX" DEV_WORKFLOW_WATCHDOG_NOW=1700800000 \
+DEV_WORKFLOW_WATCHDOG_OS=linux DEV_WORKFLOW_WATCHDOG_TICK_SEC=60 \
+DEV_WORKFLOW_INHIBIT_SINK="$WI_SINK_LINUX" PATH="${WI_FAKE_BIN}:${WDS_FAKE_BIN}:${PATH}" \
+  bash "$WD_SCRIPT" --tick-once > /dev/null 2>&1
+WI_CMD_LINUX="$(cat "$WI_SINK_LINUX" 2>/dev/null)"
+case "$WI_CMD_LINUX" in
+  linux*"systemd-inhibit --what=idle --mode=block sleep 90"*)
+    pass "watchdog.sh: linux（systemd-inhibitあり）でsystemd-inhibitを含むコマンドが組み立てられる" ;;
+  *)
+    fail "watchdog.sh: linux（systemd-inhibitあり）でsystemd-inhibitを含むコマンドが組み立てられる" "$WI_CMD_LINUX" ;;
+esac
+
+# --- linux（systemd-inhibitなし）: コマンドは組み立てられず、警告のみ記録される ---
+
+WI_ROOT_LINUX_NO="$(wd_new_root)"
+WI_SINK_LINUX_NO="${WI_WORK}/linux-no.cmd"
+WI_NOTIFY_LINUX_NO="${WI_WORK}/linux-no-notify.json"
+DEV_WORKFLOW_MARKER_ROOT="$WI_ROOT_LINUX_NO" DEV_WORKFLOW_WATCHDOG_NOW=1700800000 \
+DEV_WORKFLOW_WATCHDOG_OS=linux DEV_WORKFLOW_WATCHDOG_TICK_SEC=60 \
+DEV_WORKFLOW_INHIBIT_SINK="$WI_SINK_LINUX_NO" \
+SLACK_WEBHOOK_URL="https://example.invalid/webhook" DEV_WORKFLOW_NOTIFY_SINK="$WI_NOTIFY_LINUX_NO" \
+PATH="${WDS_FAKE_BIN}:${PATH}" \
+  bash "$WD_SCRIPT" --tick-once > /dev/null 2>&1
+WI_EXIT_LINUX_NO=$?
+assert_exit_code "watchdog.sh: linux（systemd-inhibitなし）でも--tick-onceはexit 0" 0 "$WI_EXIT_LINUX_NO"
+if [ -f "$WI_SINK_LINUX_NO" ]; then
+  fail "watchdog.sh: linux（systemd-inhibitなし）ではコマンドを組み立てない" "$(cat "$WI_SINK_LINUX_NO")"
+else
+  pass "watchdog.sh: linux（systemd-inhibitなし）ではコマンドを組み立てない"
+fi
+WI_LOG_LINUX_NO="${WI_ROOT_LINUX_NO}/.claude/.dev-workflow-watchdog.log"
+if grep -q "$(printf '\tsleep-inhibit-warn\t')" "$WI_LOG_LINUX_NO" 2>/dev/null; then
+  pass "watchdog.sh: linux（systemd-inhibitなし）は警告としてログに記録される"
+else
+  fail "watchdog.sh: linux（systemd-inhibitなし）は警告としてログに記録される" "$(cat "$WI_LOG_LINUX_NO" 2>&1)"
+fi
+WI_NOTIFY_BODY_LINUX_NO="$(cat "$WI_NOTIFY_LINUX_NO" 2>/dev/null)"
+case "$WI_NOTIFY_BODY_LINUX_NO" in
+  *"スリープ抑止に失敗"*) pass "watchdog.sh: 抑止手段が無い場合もSlackへ警告が通知される" ;;
+  *)                      fail "watchdog.sh: 抑止手段が無い場合もSlackへ警告が通知される" "$WI_NOTIFY_BODY_LINUX_NO" ;;
+esac
+
+# --- unknown: 警告を1行出しつつ tick が正常終了する ---
+
+WI_ROOT_UNKNOWN="$(wd_new_root)"
+WI_NOTIFY_UNKNOWN="${WI_WORK}/unknown-notify.json"
+DEV_WORKFLOW_MARKER_ROOT="$WI_ROOT_UNKNOWN" DEV_WORKFLOW_WATCHDOG_NOW=1700800000 \
+DEV_WORKFLOW_WATCHDOG_OS=unknown \
+SLACK_WEBHOOK_URL="https://example.invalid/webhook" DEV_WORKFLOW_NOTIFY_SINK="$WI_NOTIFY_UNKNOWN" \
+PATH="${WDS_FAKE_BIN}:${PATH}" \
+  bash "$WD_SCRIPT" --tick-once > /dev/null 2>&1
+WI_EXIT_UNKNOWN=$?
+assert_exit_code "watchdog.sh: OS=unknownでも--tick-onceはexit 0で正常終了する" 0 "$WI_EXIT_UNKNOWN"
+WI_LOG_UNKNOWN="${WI_ROOT_UNKNOWN}/.claude/.dev-workflow-watchdog.log"
+WI_UNKNOWN_WARN_COUNT="$(grep -c "$(printf '\tsleep-inhibit-warn\t')" "$WI_LOG_UNKNOWN" 2>/dev/null || true)"
+assert_eq "watchdog.sh: OS=unknownでは警告が1行ログに出る" "1" "${WI_UNKNOWN_WARN_COUNT:-0}"
+
+# --- DEV_WORKFLOW_NO_SLEEP_INHIBIT=1: コマンドが一切組み立てられない ---
+
+WI_ROOT_NOINHIBIT="$(wd_new_root)"
+WI_SINK_NOINHIBIT="${WI_WORK}/noinhibit.cmd"
+DEV_WORKFLOW_MARKER_ROOT="$WI_ROOT_NOINHIBIT" DEV_WORKFLOW_WATCHDOG_NOW=1700800000 \
+DEV_WORKFLOW_WATCHDOG_OS=windows DEV_WORKFLOW_NO_SLEEP_INHIBIT=1 \
+DEV_WORKFLOW_INHIBIT_SINK="$WI_SINK_NOINHIBIT" PATH="${WDS_FAKE_BIN}:${PATH}" \
+  bash "$WD_SCRIPT" --tick-once > /dev/null 2>&1
+WI_EXIT_NOINHIBIT=$?
+assert_exit_code "watchdog.sh: DEV_WORKFLOW_NO_SLEEP_INHIBIT=1でも--tick-onceはexit 0" 0 "$WI_EXIT_NOINHIBIT"
+if [ -f "$WI_SINK_NOINHIBIT" ]; then
+  fail "watchdog.sh: DEV_WORKFLOW_NO_SLEEP_INHIBIT=1ではコマンドが一切組み立てられない" \
+    "$(cat "$WI_SINK_NOINHIBIT")"
+else
+  pass "watchdog.sh: DEV_WORKFLOW_NO_SLEEP_INHIBIT=1ではコマンドが一切組み立てられない"
+fi
+WI_LOG_NOINHIBIT="${WI_ROOT_NOINHIBIT}/.claude/.dev-workflow-watchdog.log"
+if grep -q "sleep-inhibit" "$WI_LOG_NOINHIBIT" 2>/dev/null; then
+  fail "watchdog.sh: DEV_WORKFLOW_NO_SLEEP_INHIBIT=1では抑止関連のログも一切残らない" \
+    "$(cat "$WI_LOG_NOINHIBIT" 2>&1)"
+else
+  pass "watchdog.sh: DEV_WORKFLOW_NO_SLEEP_INHIBIT=1では抑止関連のログも一切残らない"
+fi
+
+# --- 抑止コマンドが失敗する状況（Alpineに実在しないpowershellをそのまま呼ぶ）でも exit 0 ---
+
+WI_ROOT_FAIL="$(wd_new_root)"
+WI_NOTIFY_FAIL="${WI_WORK}/fail-notify.json"
+DEV_WORKFLOW_MARKER_ROOT="$WI_ROOT_FAIL" DEV_WORKFLOW_WATCHDOG_NOW=1700800000 \
+DEV_WORKFLOW_WATCHDOG_OS=windows \
+SLACK_WEBHOOK_URL="https://example.invalid/webhook" DEV_WORKFLOW_NOTIFY_SINK="$WI_NOTIFY_FAIL" \
+PATH="${WDS_FAKE_BIN}:${PATH}" \
+  bash "$WD_SCRIPT" --tick-once > /dev/null 2>&1
+WI_EXIT_FAIL=$?
+assert_exit_code "watchdog.sh: 抑止コマンドが失敗する状況（powershellが存在しない）でも--tick-onceはexit 0" \
+  0 "$WI_EXIT_FAIL"
+WI_LOG_FAIL="${WI_ROOT_FAIL}/.claude/.dev-workflow-watchdog.log"
+if grep -q "$(printf '\tsleep-inhibit-warn\t')" "$WI_LOG_FAIL" 2>/dev/null; then
+  pass "watchdog.sh: 抑止コマンドの実行失敗が警告としてログに記録される"
+else
+  fail "watchdog.sh: 抑止コマンドの実行失敗が警告としてログに記録される" "$(cat "$WI_LOG_FAIL" 2>&1)"
+fi
+
+# --- 同じ警告は毎tick Slackへ通知されない（初回のみ・以降はログのみ） ---
+
+WI_ROOT_WARNONCE="$(wd_new_root)"
+WI_NOTIFY_WARNONCE_1="${WI_WORK}/warnonce-1.json"
+WI_NOTIFY_WARNONCE_2="${WI_WORK}/warnonce-2.json"
+
+DEV_WORKFLOW_MARKER_ROOT="$WI_ROOT_WARNONCE" DEV_WORKFLOW_WATCHDOG_NOW=1700800000 \
+DEV_WORKFLOW_WATCHDOG_OS=unknown \
+SLACK_WEBHOOK_URL="https://example.invalid/webhook" DEV_WORKFLOW_NOTIFY_SINK="$WI_NOTIFY_WARNONCE_1" \
+PATH="${WDS_FAKE_BIN}:${PATH}" \
+  bash "$WD_SCRIPT" --tick-once > /dev/null 2>&1
+if [ -f "$WI_NOTIFY_WARNONCE_1" ]; then
+  pass "watchdog.sh: 抑止警告は初回tickでSlackへ通知される"
+else
+  fail "watchdog.sh: 抑止警告は初回tickでSlackへ通知される" "sinkが作られませんでした"
+fi
+
+DEV_WORKFLOW_MARKER_ROOT="$WI_ROOT_WARNONCE" DEV_WORKFLOW_WATCHDOG_NOW=1700800100 \
+DEV_WORKFLOW_WATCHDOG_OS=unknown \
+SLACK_WEBHOOK_URL="https://example.invalid/webhook" DEV_WORKFLOW_NOTIFY_SINK="$WI_NOTIFY_WARNONCE_2" \
+PATH="${WDS_FAKE_BIN}:${PATH}" \
+  bash "$WD_SCRIPT" --tick-once > /dev/null 2>&1
+if [ -f "$WI_NOTIFY_WARNONCE_2" ]; then
+  fail "watchdog.sh: 同じ抑止警告は2回目以降Slackへ通知されない（初回のみ）" \
+    "$(cat "$WI_NOTIFY_WARNONCE_2")"
+else
+  pass "watchdog.sh: 同じ抑止警告は2回目以降Slackへ通知されない（初回のみ）"
+fi
+
+WI_LOG_WARNONCE="${WI_ROOT_WARNONCE}/.claude/.dev-workflow-watchdog.log"
+WI_WARNONCE_LOG_COUNT="$(grep -c "$(printf '\tsleep-inhibit-warn\t')" "$WI_LOG_WARNONCE" 2>/dev/null || true)"
+assert_eq "watchdog.sh: ログには通知の有無に関わらず毎tick記録される（2回）" "2" "${WI_WARNONCE_LOG_COUNT:-0}"
+
+# --- 受け入れ条件6の再確認: スリープ抑止のフックにもkill/自動打ち切り経路が無いこと ---
+
+WI_INHIBIT_BLOCK="$(awk '
+  /^_watchdog_detect_os\(\) \{/ {f=1}
+  f {print}
+  /^_watchdog_sleep_inhibit_tick\(\) \{/ {g=1}
+  g && /^}/ {print; exit}
+' "$WD_SCRIPT")"
+if printf '%s' "$WI_INHIBIT_BLOCK" | grep -qE '\bkill\b'; then
+  fail "watchdog.sh: スリープ抑止のコードにkillが存在しない（受け入れ条件6）" "$WI_INHIBIT_BLOCK"
+else
+  pass "watchdog.sh: スリープ抑止のコードにkillが存在しない（受け入れ条件6）"
+fi
+
 # --- curlが一度も実行されていないこと（本セクションの通知もsink経由でのみ検証する） ---
 if [ -s "$WDS_CURL_LOG" ]; then
-  fail "watchdog.sh: ウェーブ予算の通知でもcurlが呼ばれない（実送信しない）" \
+  fail "watchdog.sh: ウェーブ予算・スリープ抑止の通知でもcurlが呼ばれない（実送信しない）" \
     "$(wds_read_sink "$WDS_CURL_LOG")"
 else
-  pass "watchdog.sh: ウェーブ予算の通知でもcurlが呼ばれない（実送信しない）"
+  pass "watchdog.sh: ウェーブ予算・スリープ抑止の通知でもcurlが呼ばれない（実送信しない）"
 fi
 
 # ---------------------------------------------------------------------------

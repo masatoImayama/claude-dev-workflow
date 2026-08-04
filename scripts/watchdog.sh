@@ -23,8 +23,8 @@
 # 状態ファイル（マーカールート直下の .claude/。解決は scripts/lib/marker-root.sh を使う）:
 #   .dev-workflow-watchdog.pid    監視デーモンの "<pid> <開始epoch秒>"（1行）
 #   .dev-workflow-watchdog.log    検知イベントの追記ログ（人間可読TSV: <時刻>\t<イベント>\t<詳細>）
-#   .dev-workflow-watchdog-state  ストール判定・スリープギャップ補正・予算通知済みフラグの
-#                                  内部状態（key=value、1行1項目）
+#   .dev-workflow-watchdog-state  ストール判定・スリープギャップ補正・予算通知済み・
+#                                  スリープ抑止警告通知済みフラグの内部状態（key=value、1行1項目）
 #   .dev-workflow-heartbeat       heartbeat.sh（#44）が書く生存信号（<epoch>\t<pre|post>\t<ツール名>）
 #   .dev-workflow-run-state       --wave が書くウェーブ予算の状態（key=value）:
 #                                  epic= wave= tasks= wave_started= budget_sec=
@@ -35,6 +35,10 @@
 #   DEV_WORKFLOW_WATCHDOG_IDLE_SEC      無活動しきい値（秒）。既定900（15分）。超えるとstall通知
 #   DEV_WORKFLOW_WATCHDOG_ESCALATE_SEC  再通知間隔（秒）。既定1800（30分）。最大3回まで
 #   DEV_WORKFLOW_WATCHDOG_NOW           現在時刻をepoch秒で注入する（テスト用。実運用では使わない）
+#   DEV_WORKFLOW_WATCHDOG_OS            OS判定を上書きする windows/macos/linux/unknown（テスト用）
+#   DEV_WORKFLOW_NO_SLEEP_INHIBIT       "1" でスリープ抑止を完全に無効化する
+#   DEV_WORKFLOW_INHIBIT_SINK           設定されていれば抑止コマンドを実行せず、
+#                                        組み立てたコマンド文字列をこのファイルへ書く（テスト用）
 #   DEV_WORKFLOW_MARKER_ROOT            マーカー置き場の解決に使う（scripts/lib/marker-root.sh）
 #
 # 自己終了条件（run がどの経路で終了しても watchdog が残らないための3条件。受け入れ条件8）:
@@ -50,9 +54,9 @@
 # --stop を叩いたときだけ実行され、監視ループの内部（tick・検知処理）から
 # 自動的に呼ばれる経路は存在しない（受け入れ条件6）。
 #
-# ストール判定・エスカレーション・スリープギャップ補正は #47、ウェーブ予算の監視は #48 で
-# 実装済み（本ファイル）。スリープ抑止は #49、人間が明示的に叩く打ち切り（--abort）は #50 の
-# スコープ。それらはまだ no-op のフック関数（_watchdog_sleep_inhibit_tick）のままである。
+# ストール判定・エスカレーション・スリープギャップ補正は #47、ウェーブ予算の監視は #48、
+# スリープ抑止は #49 で実装済み（本ファイル）。人間が明示的に叩く打ち切り（--abort）は
+# #50 のスコープでまだ実装していない。
 
 set -u
 
@@ -207,6 +211,7 @@ _watchdog_state_load() {
   WD_STATE_SLEEP_GAP_SEC=0
   WD_STATE_LAST_TICK=0
   WD_STATE_BUDGET_NOTIFIED=0
+  WD_STATE_INHIBIT_WARNED=0
 
   if [ -f "$STALL_STATE_FILE" ]; then
     local key val
@@ -218,6 +223,7 @@ _watchdog_state_load() {
         WD_STATE_SLEEP_GAP_SEC)     WD_STATE_SLEEP_GAP_SEC="$val" ;;
         WD_STATE_LAST_TICK)         WD_STATE_LAST_TICK="$val" ;;
         WD_STATE_BUDGET_NOTIFIED)   WD_STATE_BUDGET_NOTIFIED="$val" ;;
+        WD_STATE_INHIBIT_WARNED)    WD_STATE_INHIBIT_WARNED="$val" ;;
       esac
     done < "$STALL_STATE_FILE"
   fi
@@ -228,6 +234,7 @@ _watchdog_state_load() {
   case "$WD_STATE_SLEEP_GAP_SEC"     in ''|*[!0-9]*) WD_STATE_SLEEP_GAP_SEC=0 ;; esac
   case "$WD_STATE_LAST_TICK"         in ''|*[!0-9]*) WD_STATE_LAST_TICK=0 ;; esac
   case "$WD_STATE_BUDGET_NOTIFIED"   in ''|*[!0-9]*) WD_STATE_BUDGET_NOTIFIED=0 ;; esac
+  case "$WD_STATE_INHIBIT_WARNED"    in ''|*[!0-9]*) WD_STATE_INHIBIT_WARNED=0 ;; esac
 }
 
 # _watchdog_state_save  現在のWD_STATE_*変数を$STALL_STATE_FILEへ原子的に書き出す
@@ -242,6 +249,7 @@ _watchdog_state_save() {
     printf 'WD_STATE_SLEEP_GAP_SEC=%s\n' "$WD_STATE_SLEEP_GAP_SEC"
     printf 'WD_STATE_LAST_TICK=%s\n' "$WD_STATE_LAST_TICK"
     printf 'WD_STATE_BUDGET_NOTIFIED=%s\n' "$WD_STATE_BUDGET_NOTIFIED"
+    printf 'WD_STATE_INHIBIT_WARNED=%s\n' "$WD_STATE_INHIBIT_WARNED"
   } > "$tmp"
   mv -f "$tmp" "$STALL_STATE_FILE"
 }
@@ -509,8 +517,150 @@ _watchdog_check_wave_budget() {
   _watchdog_state_save
 }
 
-# フック: スリープ抑止のtick呼び出し（#49）。現時点では何もしない。
-_watchdog_sleep_inhibit_tick() { :; }
+# ---- スリープ抑止（#49） ----
+#
+# tickごとにOSに応じた抑止コマンドを1回実行し、アイドルタイマをその都度リセットする
+# （Epic #42 仕様書「4.4 スリープ抑止」）。DEV_WORKFLOW_NO_SLEEP_INHIBIT=1 で完全に無効化
+# できる。抑止に失敗しても watchdog は死なない。同じ警告で毎tick Slackを埋めないよう、
+# 初回のみ notify-slack.sh へ通知し、以降はログ（$LOG_FILE）だけに記録する
+# （WD_STATE_INHIBIT_WARNED。完了条件）。
+#
+# 抑止できないもの（ドキュメントに明記する。README への転記は別タスク #M のスコープ）:
+#   ノートPCのふたを閉じる操作、ユーザーが明示的に実行するスリープ・休止、
+#   バッテリー切れ、OSの更新による再起動。
+
+# _watchdog_detect_os  実行環境を windows/macos/linux/unknown で返す。
+# DEV_WORKFLOW_WATCHDOG_OS が上記4値のいずれかならそれを最優先する（テスト用）。
+# 未設定・想定外の値なら `uname -s` の出力から判定する。
+_watchdog_detect_os() {
+  case "${DEV_WORKFLOW_WATCHDOG_OS:-}" in
+    windows|macos|linux|unknown)
+      printf '%s' "$DEV_WORKFLOW_WATCHDOG_OS"
+      return 0
+      ;;
+  esac
+
+  local uname_s
+  uname_s="$(uname -s 2>/dev/null)" || uname_s=""
+  case "$uname_s" in
+    MSYS*|MINGW*|CYGWIN*) printf 'windows' ;;
+    Darwin)                printf 'macos' ;;
+    Linux)                 printf 'linux' ;;
+    *)                      printf 'unknown' ;;
+  esac
+}
+
+# _watchdog_inhibit_command_for_os <os> <tick_sec>
+# OSに応じた抑止コマンドを1行の文字列として組み立てて返す（実行はしない）。
+# 対応する手段が無い場合（unknown、またはLinuxでsystemd-inhibitが無い）は空文字を返す。
+#
+# Windows: SetThreadExecutionState(ES_SYSTEM_REQUIRED) を ES_CONTINUOUS 無しで単発呼び出し
+# する。アイドルタイマがその場でリセットされるだけなので、常駐を維持する時間の指定は
+# 不要（管理者権限も不要。Epic #42 で実測済み）。
+# macOS/Linux: 次のtickが来るまでの間だけ抑止できればよいので、tick間隔+30秒（次のtickが
+# 少し遅れても抑止が途切れない余裕分）だけブロックするコマンドを組み立てる。
+_watchdog_inhibit_command_for_os() {
+  local os="$1" tick_sec="$2" wait_sec
+
+  case "$os" in
+    windows)
+      # 対象文字列（改行なしの1行コマンド）:
+      #   powershell -NoProfile -Command "Add-Type -Namespace DW -Name P -MemberDefinition
+      #   '[DllImport(\"kernel32.dll\", SetLastError=true)] public static extern uint
+      #   SetThreadExecutionState(uint esFlags);'; [DW.P]::SetThreadExecutionState(0x00000001)"
+      printf '%s' "powershell -NoProfile -Command \"Add-Type -Namespace DW -Name P -MemberDefinition '[DllImport(\\\"kernel32.dll\\\", SetLastError=true)] public static extern uint SetThreadExecutionState(uint esFlags);'; [DW.P]::SetThreadExecutionState(0x00000001)\""
+      ;;
+    macos)
+      wait_sec=$(( tick_sec + 30 ))
+      printf 'caffeinate -u -t %s' "$wait_sec"
+      ;;
+    linux)
+      if command -v systemd-inhibit >/dev/null 2>&1; then
+        wait_sec=$(( tick_sec + 30 ))
+        printf 'systemd-inhibit --what=idle --mode=block sleep %s' "$wait_sec"
+      else
+        printf ''
+      fi
+      ;;
+    *)
+      printf ''
+      ;;
+  esac
+}
+
+# _watchdog_run_inhibit_command <os> <cmd>
+# 組み立てた抑止コマンドを実行する箇所を1つに閉じ込める。DEV_WORKFLOW_INHIBIT_SINK が
+# 設定されていれば実行せず、組み立てたコマンド文字列をそのファイルへ追記するだけにする
+# （テスト用。完了条件）。
+#
+# macOS/Linuxのコマンドはtick間隔+30秒ブロックするため、tickループを止めないよう
+# バックグラウンドで起動して即座に戻る（起動できたかどうかまでしか分からないが、
+# 検知して通知するだけという方針上、抑止の成否を厳密に追跡する必要はない）。
+# Windowsは単発の即時呼び出しなので、フォアグラウンドで実行し終了コードをそのまま返す。
+_watchdog_run_inhibit_command() {
+  local os="$1" cmd="$2"
+
+  if [ -n "${DEV_WORKFLOW_INHIBIT_SINK:-}" ]; then
+    printf '%s\t%s\n' "$os" "$cmd" >> "$DEV_WORKFLOW_INHIBIT_SINK"
+    return 0
+  fi
+
+  case "$os" in
+    windows)
+      eval "$cmd" >/dev/null 2>&1
+      return $?
+      ;;
+    macos|linux)
+      eval "$cmd" >/dev/null 2>&1 &
+      disown "$!" 2>/dev/null || true
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+# _watchdog_inhibit_warn <now> <detail>
+# スリープ抑止の警告を記録する。初回だけnotify-slack.shへ通知し、WD_STATE_INHIBIT_WARNED
+# を立てる。2回目以降は$LOG_FILEへの追記だけに留める（同じ警告で毎tick Slackを
+# 埋めないため。完了条件）。
+_watchdog_inhibit_warn() {
+  local now="$1" detail="$2"
+
+  _watchdog_state_load
+  if [ "$WD_STATE_INHIBIT_WARNED" -eq 0 ]; then
+    local notify_detail
+    notify_detail="スリープ抑止: ${detail}$(_watchdog_context_suffix)"
+    bash "${WATCHDOG_DIR}/notify-slack.sh" sleep-inhibit-warn "$notify_detail" >/dev/null 2>&1 || true
+    WD_STATE_INHIBIT_WARNED=1
+    _watchdog_state_save
+  fi
+  _watchdog_log "sleep-inhibit-warn" "now=${now} ${detail}"
+}
+
+# フック: スリープ抑止のtick呼び出し（#49）。
+_watchdog_sleep_inhibit_tick() {
+  local now="$1"
+
+  [ "${DEV_WORKFLOW_NO_SLEEP_INHIBIT:-}" = "1" ] && return 0
+
+  local os cmd tick_sec
+  os="$(_watchdog_detect_os)"
+  tick_sec="${DEV_WORKFLOW_WATCHDOG_TICK_SEC:-60}"
+  cmd="$(_watchdog_inhibit_command_for_os "$os" "$tick_sec")"
+
+  if [ -z "$cmd" ]; then
+    _watchdog_inhibit_warn "$now" "os=${os}向けの抑止手段が無い（未対応OS、またはLinuxでsystemd-inhibitが無い）"
+    return 0
+  fi
+
+  if _watchdog_run_inhibit_command "$os" "$cmd"; then
+    _watchdog_log "inhibit" "os=${os}"
+  else
+    _watchdog_inhibit_warn "$now" "抑止コマンドの実行に失敗（os=${os}）"
+  fi
+}
 
 # _watchdog_tick <now>  監視ループ1周分の処理。tickイベントを記録し、上記フックを呼ぶ。
 _watchdog_tick() {
