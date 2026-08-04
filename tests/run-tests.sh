@@ -3704,6 +3704,225 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+# ケース: scripts/heartbeat.sh（フックから生存信号を記録・外部プロセス0、Task #44）
+#
+# PreToolUse / PostToolUse フックから高頻度に呼ばれるため、内部で date / jq / sed / grep
+# を一切呼ばない（唯一の例外は原子的な置き換えに使う mv）。マーカールートの解決は
+# scripts/lib/marker-root.sh（#43）に委譲する（Epic #42 仕様書「3. ファイルと責務」）。
+# ---------------------------------------------------------------------------
+
+echo "== scripts/heartbeat.sh（フックから生存信号を記録・外部プロセス0・Task #44） =="
+
+HEARTBEAT_SCRIPT="${REPO_ROOT}/scripts/heartbeat.sh"
+
+bash -n "$HEARTBEAT_SCRIPT" >/dev/null 2>&1
+assert_exit_code "heartbeat.sh: bash -n が通る（構文エラーなし）" 0 $?
+
+HB_MARKER_FILE=".dev-workflow-heartbeat"
+
+# --- 書式: pre 呼び出しは <epoch>\t<pre>\t<ツール名> の1行だけを書く ---
+HB_REPO="$(canon_root "$(make_temp_repo)")"
+mkdir -p "${HB_REPO}/.claude"
+HB_TARGET="${HB_REPO}/.claude/${HB_MARKER_FILE}"
+
+HB_JSON_PRE=$'{\n  "session_id": "abc",\n  "cwd": "'"${HB_REPO}"'",\n  "tool_name": "Bash",\n  "tool_input": {\n    "command": "echo hi"\n  }\n}'
+
+HB_PRE_OUT="$(DEV_WORKFLOW_MARKER_ROOT="$HB_REPO" bash "$HEARTBEAT_SCRIPT" pre <<< "$HB_JSON_PRE" 2>&1)"
+assert_exit_code "heartbeat.sh pre: exit 0 で終わる" 0 $?
+assert_eq "heartbeat.sh pre: 無出力" "" "$HB_PRE_OUT"
+
+if [ -f "$HB_TARGET" ]; then
+  HB_EPOCH="" HB_STATE="" HB_TOOL=""
+  IFS=$'\t' read -r HB_EPOCH HB_STATE HB_TOOL < "$HB_TARGET"
+  case "$HB_EPOCH" in
+    ''|*[!0-9]*) fail "heartbeat.sh pre: 1列目が epoch 秒（数字のみ）" "実際=[${HB_EPOCH}]" ;;
+    *)           pass "heartbeat.sh pre: 1列目が epoch 秒（数字のみ）" ;;
+  esac
+  assert_eq "heartbeat.sh pre: 2列目が pre（ツール実行中を示す）" "pre" "$HB_STATE"
+  assert_eq "heartbeat.sh pre: 3列目が複数行JSONからツール名を正しく抽出" "Bash" "$HB_TOOL"
+  HB_LINE_COUNT="$(wc -l < "$HB_TARGET" | tr -d ' ')"
+  assert_eq "heartbeat.sh pre: マーカーファイルは1行だけ" "1" "$HB_LINE_COUNT"
+else
+  fail "heartbeat.sh pre: マーカーファイルが書かれる" "存在しません: ${HB_TARGET}"
+fi
+
+# --- post 呼び出し: 別の state・別のツール名で上書き（追記ではなく置き換え） ---
+HB_JSON_POST=$'{\n  "cwd": "'"${HB_REPO}"'",\n  "tool_name": "mcp__foo__bar"\n}'
+HB_POST_OUT="$(DEV_WORKFLOW_MARKER_ROOT="$HB_REPO" bash "$HEARTBEAT_SCRIPT" post <<< "$HB_JSON_POST" 2>&1)"
+assert_exit_code "heartbeat.sh post: exit 0 で終わる" 0 $?
+assert_eq "heartbeat.sh post: 無出力" "" "$HB_POST_OUT"
+
+IFS=$'\t' read -r HB_EPOCH2 HB_STATE2 HB_TOOL2 < "$HB_TARGET"
+assert_eq "heartbeat.sh post: 2列目が post（モデル応答待ちを示す）" "post" "$HB_STATE2"
+assert_eq "heartbeat.sh post: 3列目がツール名(mcp形式)を正しく抽出" "mcp__foo__bar" "$HB_TOOL2"
+HB_LINE_COUNT2="$(wc -l < "$HB_TARGET" | tr -d ' ')"
+assert_eq "heartbeat.sh post: 上書き後もマーカーファイルは1行だけ（追記でない）" "1" "$HB_LINE_COUNT2"
+
+# --- ツール名が取れない入力でも "-" として記録し exit 0 ---
+HB_JSON_NOTOOL=$'{\n  "cwd": "'"${HB_REPO}"'"\n}'
+HB_NOTOOL_OUT="$(DEV_WORKFLOW_MARKER_ROOT="$HB_REPO" bash "$HEARTBEAT_SCRIPT" pre <<< "$HB_JSON_NOTOOL" 2>&1)"
+assert_exit_code "heartbeat.sh: tool_name が無いJSONでも exit 0" 0 $?
+IFS=$'\t' read -r HB_EPOCH3 HB_STATE3 HB_TOOL3 < "$HB_TARGET"
+assert_eq "heartbeat.sh: tool_name が無ければ '-' として記録" "-" "$HB_TOOL3"
+
+# --- 壊れたJSON（想定外の入力）でも exit 0、"-" として記録 ---
+HB_GARBAGE='not even json { [ garbage without any structure'
+HB_GARBAGE_OUT="$(DEV_WORKFLOW_MARKER_ROOT="$HB_REPO" bash "$HEARTBEAT_SCRIPT" post <<< "$HB_GARBAGE" 2>&1)"
+assert_exit_code "heartbeat.sh: 壊れたJSONでも exit 0" 0 $?
+assert_eq "heartbeat.sh: 壊れたJSONでも無出力" "" "$HB_GARBAGE_OUT"
+IFS=$'\t' read -r HB_EPOCH4 HB_STATE4 HB_TOOL4 < "$HB_TARGET"
+assert_eq "heartbeat.sh: 壊れたJSONでは '-' として記録" "-" "$HB_TOOL4"
+
+# --- 空のstdinでも exit 0（記録は続ける。マーカールート自体は解決できているため） ---
+HB_EMPTY_OUT="$(DEV_WORKFLOW_MARKER_ROOT="$HB_REPO" bash "$HEARTBEAT_SCRIPT" pre < /dev/null 2>&1)"
+assert_exit_code "heartbeat.sh: 空のstdinでも exit 0" 0 $?
+assert_eq "heartbeat.sh: 空のstdinでも無出力" "" "$HB_EMPTY_OUT"
+
+# --- 不正な引数（pre/post以外）は無出力・exit 0 ---
+HB_BADARG_OUT="$(DEV_WORKFLOW_MARKER_ROOT="$HB_REPO" bash "$HEARTBEAT_SCRIPT" bogus < /dev/null 2>&1)"
+assert_exit_code "heartbeat.sh: 不正な引数でも exit 0" 0 $?
+assert_eq "heartbeat.sh: 不正な引数では無出力" "" "$HB_BADARG_OUT"
+
+# --- git管理外のディレクトリでは exit 0 かつ無出力（マーカーは書かない） ---
+HB_NONGIT="$(mktemp -d "${TMPDIR:-/tmp}/dw-test-hb-nongit.XXXXXX")"
+HB_NONGIT_OUT_FILE="$(mktemp "${TMPDIR:-/tmp}/dw-test-hb-nongit-out.XXXXXX")"
+(
+  cd "$HB_NONGIT" || exit 1
+  unset DEV_WORKFLOW_MARKER_ROOT CLAUDE_PROJECT_DIR
+  bash "$HEARTBEAT_SCRIPT" pre < /dev/null > "$HB_NONGIT_OUT_FILE" 2>&1
+)
+HB_NONGIT_EXIT=$?
+HB_NONGIT_OUT="$(cat "$HB_NONGIT_OUT_FILE")"
+assert_exit_code "heartbeat.sh: git管理外のディレクトリでは exit 0" 0 "$HB_NONGIT_EXIT"
+assert_eq "heartbeat.sh: git管理外のディレクトリでは無出力" "" "$HB_NONGIT_OUT"
+
+# --- .claude が無いリポジトリでは exit 0 かつ無出力・マーカーは作られない ---
+HB_NOCLAUDE_REPO="$(canon_root "$(make_temp_repo)")"
+HB_NOCLAUDE_OUT_FILE="$(mktemp "${TMPDIR:-/tmp}/dw-test-hb-noclaude-out.XXXXXX")"
+DEV_WORKFLOW_MARKER_ROOT="$HB_NOCLAUDE_REPO" bash "$HEARTBEAT_SCRIPT" pre < /dev/null \
+  > "$HB_NOCLAUDE_OUT_FILE" 2>&1
+HB_NOCLAUDE_EXIT=$?
+HB_NOCLAUDE_OUT="$(cat "$HB_NOCLAUDE_OUT_FILE")"
+assert_exit_code "heartbeat.sh: .claude が無ければ exit 0" 0 "$HB_NOCLAUDE_EXIT"
+assert_eq "heartbeat.sh: .claude が無ければ無出力" "" "$HB_NOCLAUDE_OUT"
+if [ -e "${HB_NOCLAUDE_REPO}/.claude" ]; then
+  fail "heartbeat.sh: .claude が無ければ作成もマーカー書き込みもしない" ".claude が作られました"
+else
+  pass "heartbeat.sh: .claude が無ければ作成もマーカー書き込みもしない"
+fi
+
+# --- worktreeから呼んでもメインリポのルートに書かれる ---
+HB_WT_REPO="$(canon_root "$(make_temp_repo)")"
+mkdir -p "${HB_WT_REPO}/.claude"
+HB_WT_DIR="${HB_WT_REPO}/.claude/worktrees/agent-hbtest"
+make_worktree "$HB_WT_REPO" "$HB_WT_DIR" "hb-agent-branch"
+HB_WT_JSON=$'{\n  "cwd": "'"${HB_WT_DIR}"'",\n  "tool_name": "Write"\n}'
+(
+  cd "$HB_WT_DIR" || exit 1
+  unset DEV_WORKFLOW_MARKER_ROOT CLAUDE_PROJECT_DIR
+  bash "$HEARTBEAT_SCRIPT" post <<< "$HB_WT_JSON" > /dev/null 2>&1
+)
+HB_WT_TARGET="${HB_WT_REPO}/.claude/${HB_MARKER_FILE}"
+if [ -f "$HB_WT_TARGET" ]; then
+  IFS=$'\t' read -r HB_WT_EPOCH HB_WT_STATE HB_WT_TOOL < "$HB_WT_TARGET"
+  assert_eq "heartbeat.sh: worktreeから呼んでもメインリポのルートに書かれる" "Write" "$HB_WT_TOOL"
+else
+  fail "heartbeat.sh: worktreeから呼んでもメインリポのルートに書かれる" "存在しません: ${HB_WT_TARGET}"
+fi
+
+# --- 同時に複数プロセスから呼ばれても、常に「正しい1行」である（行の混在・破損が無い） ---
+HB_CONC_REPO="$(canon_root "$(make_temp_repo)")"
+mkdir -p "${HB_CONC_REPO}/.claude"
+HB_CONC_TARGET="${HB_CONC_REPO}/.claude/${HB_MARKER_FILE}"
+HB_CONC_JSON_A=$'{\n  "cwd": "'"${HB_CONC_REPO}"'",\n  "tool_name": "ToolA"\n}'
+HB_CONC_JSON_B=$'{\n  "cwd": "'"${HB_CONC_REPO}"'",\n  "tool_name": "ToolB"\n}'
+HB_CONC_JSON_C=$'{\n  "cwd": "'"${HB_CONC_REPO}"'",\n  "tool_name": "ToolC"\n}'
+(
+  DEV_WORKFLOW_MARKER_ROOT="$HB_CONC_REPO" bash "$HEARTBEAT_SCRIPT" pre  <<< "$HB_CONC_JSON_A" >/dev/null 2>&1 &
+  DEV_WORKFLOW_MARKER_ROOT="$HB_CONC_REPO" bash "$HEARTBEAT_SCRIPT" post <<< "$HB_CONC_JSON_B" >/dev/null 2>&1 &
+  DEV_WORKFLOW_MARKER_ROOT="$HB_CONC_REPO" bash "$HEARTBEAT_SCRIPT" pre  <<< "$HB_CONC_JSON_C" >/dev/null 2>&1 &
+  wait
+)
+HB_CONC_LINES="$(wc -l < "$HB_CONC_TARGET" | tr -d ' ')"
+assert_eq "heartbeat.sh: 並行3プロセスから呼ばれてもファイルは常に1行" "1" "$HB_CONC_LINES"
+IFS=$'\t' read -r HB_CONC_EPOCH HB_CONC_STATE HB_CONC_TOOL < "$HB_CONC_TARGET"
+case "$HB_CONC_STATE" in
+  pre|post) : ;;
+  *) HB_CONC_STATE="invalid" ;;
+esac
+case "$HB_CONC_TOOL" in
+  ToolA|ToolB|ToolC) : ;;
+  *) HB_CONC_TOOL="invalid" ;;
+esac
+if [ "$HB_CONC_STATE" != "invalid" ] && [ "$HB_CONC_TOOL" != "invalid" ]; then
+  pass "heartbeat.sh: 並行書き込みの結果は3者のいずれか1つの完全な行（破損・混在なし）"
+else
+  fail "heartbeat.sh: 並行書き込みの結果は3者のいずれか1つの完全な行（破損・混在なし）" \
+    "実際の内容: $(cat "$HB_CONC_TARGET" 2>/dev/null)"
+fi
+
+# --- stdinがttyのときは読まない設計になっていることの静的確認 ---
+if grep -qE '\[ ! -t 0 \]' "$HEARTBEAT_SCRIPT"; then
+  pass "heartbeat.sh: stdinがtty（対話実行）のときは読まないガードがある"
+else
+  fail "heartbeat.sh: stdinがtty（対話実行）のときは読まないガードがある" "[ ! -t 0 ] が見つかりません"
+fi
+
+# --- スクリプト本体が date / jq を呼んでいないことの静的確認（受け入れ条件10の前提） ---
+# コメント行は対象外にし、単語境界での一致だけを見る
+HB_FORBIDDEN_HITS="$(grep -v '^[[:space:]]*#' "$HEARTBEAT_SCRIPT" \
+  | grep -E '(^|[^A-Za-z0-9_])(date|jq)[[:space:]]' || true)"
+if [ -z "$HB_FORBIDDEN_HITS" ]; then
+  pass "heartbeat.sh: スクリプト本体が date / jq を呼んでいない"
+else
+  fail "heartbeat.sh: スクリプト本体が date / jq を呼んでいない" "$HB_FORBIDDEN_HITS"
+fi
+
+# --- 性能: 100回連続実行が「素のプロセス起動コスト」に対して過大でないこと（受け入れ条件10） ---
+# heartbeat.sh は毎回 bash プロセスとして spawn される（フック呼び出しの実態）ため、
+# 絶対時間には bind mount 越しのファイル open や git worktree 越しのサンドボックスなど
+# 実行環境固有のプロセス起動オーバーヘッドが乗る（実測: Docker Desktop on Windows の
+# bind mount 環境では、素の `bash -c 'exit 0'` を100回起動するだけで数秒かかることがある）。
+# 絶対時間を固定の秒数で決め打つと環境差でフレーキーになるため、同一環境で素のプロセス起動を
+# 100回行った基準時間（FLOOR）を測り、heartbeat.sh 自身のロジック（marker-root.sh の
+# source・stdin読み取り・tmp書き込み+mv）に許される予算をその上乗せ分として評価する。
+# 外部プロセス（date/jq等）を呼ぶ regression が入れば、その分だけ FLOOR に対して余分な
+# プロセス起動が積み増しされるため、この相対評価でも十分検出できる。
+HB_PERF_FLOOR_START=""
+printf -v HB_PERF_FLOOR_START '%(%s)T' -1
+HB_PERF_FLOOR_I=0
+while [ "$HB_PERF_FLOOR_I" -lt 100 ]; do
+  bash -c 'exit 0' >/dev/null 2>&1
+  HB_PERF_FLOOR_I=$((HB_PERF_FLOOR_I + 1))
+done
+HB_PERF_FLOOR_END=""
+printf -v HB_PERF_FLOOR_END '%(%s)T' -1
+HB_PERF_FLOOR=$((HB_PERF_FLOOR_END - HB_PERF_FLOOR_START))
+
+HB_PERF_REPO="$(canon_root "$(make_temp_repo)")"
+mkdir -p "${HB_PERF_REPO}/.claude"
+HB_PERF_JSON=$'{\n  "cwd": "'"${HB_PERF_REPO}"'",\n  "tool_name": "Bash"\n}'
+HB_PERF_START=""
+printf -v HB_PERF_START '%(%s)T' -1
+HB_PERF_I=0
+while [ "$HB_PERF_I" -lt 100 ]; do
+  DEV_WORKFLOW_MARKER_ROOT="$HB_PERF_REPO" bash "$HEARTBEAT_SCRIPT" pre <<< "$HB_PERF_JSON" >/dev/null 2>&1
+  HB_PERF_I=$((HB_PERF_I + 1))
+done
+HB_PERF_END=""
+printf -v HB_PERF_END '%(%s)T' -1
+HB_PERF_ELAPSED=$((HB_PERF_END - HB_PERF_START))
+
+# FLOOR + 5秒: heartbeat.sh 自身の純粋なbashロジック（外部プロセス無し）に許される予算。
+HB_PERF_BUDGET=$((HB_PERF_FLOOR + 5))
+if [ "$HB_PERF_ELAPSED" -le "$HB_PERF_BUDGET" ]; then
+  pass "heartbeat.sh: 100回連続実行がプロセス起動コストに対して過大でない（実測 ${HB_PERF_ELAPSED}s / floor ${HB_PERF_FLOOR}s+5s予算・受け入れ条件10）"
+else
+  fail "heartbeat.sh: 100回連続実行がプロセス起動コストに対して過大でない" \
+    "実測 ${HB_PERF_ELAPSED}s > floor ${HB_PERF_FLOOR}s + 5s予算"
+fi
+
+# ---------------------------------------------------------------------------
 # 結果集計
 # ---------------------------------------------------------------------------
 
