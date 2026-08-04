@@ -85,6 +85,15 @@ bash "${CLAUDE_PLUGIN_ROOT}/scripts/notify-slack.sh" run-start "Epic #$ARGUMENTS
 
 worktree内から実行してもマーカーはメインリポのルートに置かれるため、実行場所は問わない。
 
+run マーカーが置かれた直後に、ハング・スリープを検知する watchdog を起動する（`--start`
+自体は自己デタッチして**即座に返る**。監視ループはプロセス外で動く常駐プロセスに移る）。
+watchdog は run マーカー（`.claude/.dev-workflow-run`）の消失を自己終了条件の1つにしているため、
+**マーカーより後に起動すること**（先に起動するとマーカーがまだ無い一瞬で誤って自己終了しうる）:
+
+```bash
+bash "${CLAUDE_PLUGIN_ROOT}/scripts/watchdog.sh" --start --epic "$EPIC_NUM" --label "Epic #$ARGUMENTS"
+```
+
 ### Docker sandbox の準備
 
 **まず作業 worktree に移動してから**、`sandbox-exec.sh` でサンドボックスを準備する（以降 `pwd` は
@@ -326,6 +335,13 @@ git checkout "${EPIC_BRANCH}"
 git pull origin "${EPIC_BRANCH}"
 WAVE_BASE=$(git rev-parse HEAD)
 IMPL_START_SEC=$(date +%s)   # 「実装」フェーズ（Step 3〜4）の計測開始
+```
+
+ウェーブ予算の監視（watchdog）に、このウェーブの内訳を伝える:
+
+```bash
+bash "${CLAUDE_PLUGIN_ROOT}/scripts/watchdog.sh" --wave --epic "$EPIC_NUM" \
+  --wave-no "$WAVE_NO" --tasks "[今回のウェーブのタスク番号のカンマ区切り]"
 ```
 
 **同期はここ（ウェーブの先頭）でだけ行う。** タスクごとには行わない。この `WAVE_BASE` が、
@@ -603,7 +619,14 @@ depends-on-skipped <依存先番号>`）に従って実行せずスキップし�
 ```bash
 # 常駐コンテナの削除（epic 単位。キャッシュ volume は次の Epic のために残す）
 bash "${CLAUDE_PLUGIN_ROOT}/scripts/sandbox-exec.sh" --epic "$EPIC_NUM" --down
+
+# watchdog の停止（正常終了・異常終了を問わず必ず実行する。--down と同じ強さで必須）
+bash "${CLAUDE_PLUGIN_ROOT}/scripts/watchdog.sh" --stop
 ```
+
+watchdog は run マーカーの消失でも自己終了するが、消失までに1 tick分のタイムラグがある
+（既定60秒）ため、後続処理へ進む前に `--stop` で確実に止める。**これを怠ると、run が
+終了した後も無活動を検知し続けて的外れな stall 通知が届く。**
 
 **キャッシュ volume は削除しない。** 次の Epic でそのまま効くのが利点であり、消すと
 毎回キャッシュ構築コストを払い直すことになる。明示的に消したい場合のみ `--reset-cache` を使う。
@@ -619,6 +642,27 @@ bash "${CLAUDE_PLUGIN_ROOT}/scripts/sandbox-exec.sh" --epic "$EPIC_NUM" --down
 bash "${CLAUDE_PLUGIN_ROOT}/scripts/sandbox-exec.sh" --ls          # 管理コンテナを一覧表示（他リポジトリ分も含む）
 bash "${CLAUDE_PLUGIN_ROOT}/scripts/sandbox-exec.sh" --down --all   # 現在のリポジトリに属する管理コンテナを全て削除
 ```
+
+## ハングしたときに人間がすること
+
+watchdog は無活動を検知しても**自動では打ち切らない**（Epic #42「決定事項」参照）。
+Slack に `:rotating_light: 応答なし` が届いたら、人間が次の手順で判断・対処する。
+
+1. **通知本文の `state` を見る**（`scripts/watchdog.sh` の通知文言がそのまま切り分けの根拠になる）
+   - `ツール実行中に停止` → サンドボックス（Docker）側を疑う。
+     `bash "${CLAUDE_PLUGIN_ROOT}/scripts/sandbox-exec.sh" --ls` でコンテナの状態を確認する
+   - `モデルの応答待ちで停止` → API 側のスロットリングの疑い。待つか、打ち切るかを判断する
+2. **打ち切る場合**: `bash "${CLAUDE_PLUGIN_ROOT}/scripts/watchdog.sh" --abort "理由"` を実行する。
+   **これはエージェントが次にツールを呼んだ瞬間に効く**（`heartbeat.sh pre` がフラグを見て
+   拒否する経路のため）。**応答待ちの最中には効かない。** 即座に止めたい場合は Claude Code 側の
+   セッションを中断する
+3. **再開する場合**: `/dev-workflow:run #<epic番号>` を再実行する。残タスクは open な Task issue
+   から再計算されるため、途中から続けられる（wave ブランチの残骸の扱いは #54 で保証する）
+
+**Claude Code 側では「自動で打ち切って再投入する」ことは原理的にできない。** サブエージェントは
+独立した OS プロセスではなく同一プロセス内の API 呼び出しであり、外部から中断する手段が無いためである
+（Epic #42「2. サブエージェントを外部から中断する手段は無い」参照）。watchdog にできるのは検知して
+通知することまでであり、打ち切りの主体は常に人間である。
 
 ## 進捗表示
 

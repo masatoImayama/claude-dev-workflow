@@ -3384,6 +3384,88 @@ case "$RS_STEP6" in
 esac
 
 # ---------------------------------------------------------------------------
+# skills/run/SKILL.md: watchdog の結線（--start/--wave/--stop）とハング時の
+# 運用手順の記述（回帰防止 #51）
+# ---------------------------------------------------------------------------
+
+echo ""
+echo "== skills/run/SKILL.md（watchdog結線・ハング時運用手順の回帰防止 #51） =="
+
+# --start の呼び出しが run-start の記述より後にあること（run マーカーが立った後に
+# watchdogを起動する契約。マーカーより先に起動すると自己終了条件を誤検知しうる）
+RS_RUN_START_LINE="$(grep -n 'notify-slack.sh" run-start' "$RUN_SKILL" | head -1 | cut -d: -f1)"
+RS_WATCHDOG_START_LINE="$(grep -n 'watchdog.sh" --start' "$RUN_SKILL" | head -1 | cut -d: -f1)"
+
+if [ -n "$RS_RUN_START_LINE" ] && [ -n "$RS_WATCHDOG_START_LINE" ] && [ "$RS_WATCHDOG_START_LINE" -gt "$RS_RUN_START_LINE" ]; then
+  pass "SKILL.md: watchdog.sh --start の呼び出しが notify-slack.sh run-start より後にある（#51）"
+else
+  fail "SKILL.md: watchdog.sh --start の呼び出しが notify-slack.sh run-start より後にある（#51）" \
+    "run-start行=${RS_RUN_START_LINE:-なし} --start行=${RS_WATCHDOG_START_LINE:-なし}"
+fi
+
+# --wave の呼び出しが Step 2（WAVE_BASEを記録する節）にあること
+RS_STEP2="$(awk '/^### Step 2:/{f=1} /^### Step 3:/{f=0} f' "$RUN_SKILL")"
+
+case "$RS_STEP2" in
+  *'watchdog.sh" --wave'*)
+    pass "SKILL.md: watchdog.sh --wave の呼び出しが Step 2（WAVE_BASE）の節にある（#51）" ;;
+  *)
+    fail "SKILL.md: watchdog.sh --wave の呼び出しが Step 2（WAVE_BASE）の節にある（#51）" "$RS_STEP2" ;;
+esac
+
+# --stop の呼び出しが「正常終了・異常終了を問わず」と書かれた節の中にあり、
+# かつ完了通知（run-complete）より前の位置にあること
+RS_CLEANUP="$(awk '/^## サンドボックスの後片付け（正常終了・異常終了を問わず必ず実行）/{f=1} /^## /{if (f && !/サンドボックスの後片付け/) f=0} f' "$RUN_SKILL")"
+
+case "$RS_CLEANUP" in
+  *'watchdog.sh" --stop'*)
+    pass "SKILL.md: watchdog.sh --stop の呼び出しが「正常終了・異常終了を問わず」の節にある（#51）" ;;
+  *)
+    fail "SKILL.md: watchdog.sh --stop の呼び出しが「正常終了・異常終了を問わず」の節にある（#51）" "$RS_CLEANUP" ;;
+esac
+
+RS_WATCHDOG_STOP_LINE="$(grep -n 'watchdog.sh" --stop' "$RUN_SKILL" | head -1 | cut -d: -f1)"
+RS_RUN_COMPLETE_LINE="$(grep -n 'notify-slack.sh" run-complete' "$RUN_SKILL" | head -1 | cut -d: -f1)"
+
+if [ -n "$RS_WATCHDOG_STOP_LINE" ] && [ -n "$RS_RUN_COMPLETE_LINE" ] && [ "$RS_WATCHDOG_STOP_LINE" -lt "$RS_RUN_COMPLETE_LINE" ]; then
+  pass "SKILL.md: watchdog.sh --stop の呼び出しが完了通知（run-complete）より前の位置にある（#51）"
+else
+  fail "SKILL.md: watchdog.sh --stop の呼び出しが完了通知（run-complete）より前の位置にある（#51）" \
+    "--stop行=${RS_WATCHDOG_STOP_LINE:-なし} run-complete行=${RS_RUN_COMPLETE_LINE:-なし}"
+fi
+
+# 「ハングしたときに人間がすること」の節が存在し、--abort の説明と再実行の手順を含むこと
+RS_HANG_SECTION="$(awk '/^## ハングしたときに人間がすること/{f=1} /^## 進捗表示/{f=0} f' "$RUN_SKILL")"
+
+if [ -n "$RS_HANG_SECTION" ]; then
+  pass "SKILL.md: 「ハングしたときに人間がすること」の節が存在する（#51）"
+else
+  fail "SKILL.md: 「ハングしたときに人間がすること」の節が存在する（#51）" "節が見つかりません"
+fi
+
+case "$RS_HANG_SECTION" in
+  *'watchdog.sh" --abort'*)
+    pass "SKILL.md: ハング時の節に watchdog.sh --abort の説明がある（#51）" ;;
+  *)
+    fail "SKILL.md: ハング時の節に watchdog.sh --abort の説明がある（#51）" "$RS_HANG_SECTION" ;;
+esac
+
+case "$RS_HANG_SECTION" in
+  *'/dev-workflow:run'*)
+    pass "SKILL.md: ハング時の節に再実行（/dev-workflow:run）の手順がある（#51）" ;;
+  *)
+    fail "SKILL.md: ハング時の節に再実行（/dev-workflow:run）の手順がある（#51）" "$RS_HANG_SECTION" ;;
+esac
+
+# 「自動で打ち切って再投入することはできない」旨の記述が存在すること
+case "$RS_HANG_SECTION" in
+  *'自動で打ち切って再投入する'*'原理的にできない'*)
+    pass "SKILL.md: 「自動で打ち切って再投入することはできない」旨の記述がある（#51）" ;;
+  *)
+    fail "SKILL.md: 「自動で打ち切って再投入することはできない」旨の記述がある（#51）" "$RS_HANG_SECTION" ;;
+esac
+
+# ---------------------------------------------------------------------------
 # skills-codex/dev-workflow-run/SKILL.md: 統合ゲートの記述が Claude 版と揃っていること
 # （回帰防止 #37）
 # ---------------------------------------------------------------------------
