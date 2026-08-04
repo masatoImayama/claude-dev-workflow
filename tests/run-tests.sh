@@ -5954,6 +5954,127 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+# ドキュメント（共通ルール・generator・README）とアダプタ再生成・v0.13.0（#55）
+# ---------------------------------------------------------------------------
+
+echo "== ドキュメント（共通ルール・generator・README）とアダプタ再生成・v0.13.0（#55） =="
+
+DOC55_CLAUDE_PLUGIN_JSON="${REPO_ROOT}/.claude-plugin/plugin.json"
+DOC55_CODEX_PLUGIN_JSON="${REPO_ROOT}/.codex-plugin/plugin.json"
+DOC55_INSTRUCTIONS="${REPO_ROOT}/core/instructions.md"
+DOC55_GENERATOR_ROLE="${REPO_ROOT}/core/roles/generator.md"
+DOC55_README="${REPO_ROOT}/README.md"
+DOC55_AGENT_GENERATOR="${REPO_ROOT}/agents/generator.md"
+DOC55_CODEX_AGENT_GENERATOR="${REPO_ROOT}/codex-agents/generator.toml"
+
+# --- 両 plugin.json のバージョンが 0.13.0 で一致している ---
+
+DOC55_CLAUDE_VERSION="$(grep -m1 '"version"' "$DOC55_CLAUDE_PLUGIN_JSON" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+')"
+DOC55_CODEX_VERSION="$(grep -m1 '"version"' "$DOC55_CODEX_PLUGIN_JSON" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+')"
+
+assert_eq ".claude-plugin/plugin.json のバージョンが0.13.0である" "0.13.0" "$DOC55_CLAUDE_VERSION"
+assert_eq ".codex-plugin/plugin.json のバージョンが0.13.0である" "0.13.0" "$DOC55_CODEX_VERSION"
+assert_eq "両plugin.jsonのバージョンが一致している" "$DOC55_CLAUDE_VERSION" "$DOC55_CODEX_VERSION"
+
+# --- core/instructions.md に watchdog の3点の記述がある ---
+
+if grep -Fq 'watchdog は検知して通知するだけであり' "$DOC55_INSTRUCTIONS"; then
+  pass "core/instructions.md: 「watchdogは検知して通知するだけ」の記述がある"
+else
+  fail "core/instructions.md: 「watchdogは検知して通知するだけ」の記述がある"
+fi
+
+if grep -Fq '自動打ち切りは原理的に実装できない' "$DOC55_INSTRUCTIONS" \
+  && grep -Fq 'Claude Code ではサブエージェントを外部から中断できない' "$DOC55_INSTRUCTIONS"; then
+  pass "core/instructions.md: 「Claude Codeでは自動打ち切りが原理的に不可能」の記述がある"
+else
+  fail "core/instructions.md: 「Claude Codeでは自動打ち切りが原理的に不可能」の記述がある"
+fi
+
+if grep -Fq 'アダプタ間に' "$DOC55_INSTRUCTIONS" && grep -Fq '機能差を作らないため採用していない' "$DOC55_INSTRUCTIONS"; then
+  pass "core/instructions.md: 「Codexでも採用していない（機能差を作らない）」の記述がある"
+else
+  fail "core/instructions.md: 「Codexでも採用していない（機能差を作らない）」の記述がある"
+fi
+
+# --- core/roles/generator.md に拒否メッセージを受けたときの振る舞いの記述がある ---
+
+if grep -Fq '打ち切りが指示されました' "$DOC55_GENERATOR_ROLE" \
+  && grep -Fq '別のツールで迂回・回避を試みない' "$DOC55_GENERATOR_ROLE"; then
+  pass "core/roles/generator.md: 拒否メッセージを受けたときの振る舞い（別のツールで回避しない）の記述がある"
+else
+  fail "core/roles/generator.md: 拒否メッセージを受けたときの振る舞い（別のツールで回避しない）の記述がある"
+fi
+
+if grep -Fq '実施済みの変更・' "$DOC55_GENERATOR_ROLE" && grep -Fq '未コミットの有無' "$DOC55_GENERATOR_ROLE"; then
+  pass "core/roles/generator.md: 拒否メッセージを受けたときに現状（変更・未コミット）を報告する記述がある"
+else
+  fail "core/roles/generator.md: 拒否メッセージを受けたときに現状（変更・未コミット）を報告する記述がある"
+fi
+
+# --- README に運用手順の節と「抑止できないもの」の記述がある ---
+
+if grep -Fq '## 運用手順（watchdog）' "$DOC55_README"; then
+  pass "README.md: 「運用手順（watchdog）」の節がある"
+else
+  fail "README.md: 「運用手順（watchdog）」の節がある"
+fi
+
+if grep -Fq '抑止できないもの' "$DOC55_README" \
+  && grep -Fq 'ふたを閉じる操作' "$DOC55_README" \
+  && grep -Fq 'バッテリー切れ' "$DOC55_README"; then
+  pass "README.md: 「抑止できないもの」（ふたを閉じる操作・バッテリー切れ等）の記述がある"
+else
+  fail "README.md: 「抑止できないもの」（ふたを閉じる操作・バッテリー切れ等）の記述がある"
+fi
+
+if grep -Fq 'DEV_WORKFLOW_WATCHDOG_IDLE_SEC' "$DOC55_README" \
+  && grep -Fq 'DEV_WORKFLOW_NO_SLEEP_INHIBIT' "$DOC55_README"; then
+  pass "README.md: watchdogの環境変数一覧がある"
+else
+  fail "README.md: watchdogの環境変数一覧がある"
+fi
+
+# --- 生成物（agents/generator.md 等）に正本の追記内容が反映されている ---
+
+if [ -f "$DOC55_AGENT_GENERATOR" ] \
+  && grep -Fq '打ち切りが指示されました' "$DOC55_AGENT_GENERATOR" \
+  && grep -Fq 'watchdog は検知して通知するだけであり' "$DOC55_AGENT_GENERATOR"; then
+  pass "agents/generator.md: 正本（core/roles/generator.md・core/instructions.md）の追記内容が反映されている"
+else
+  fail "agents/generator.md: 正本（core/roles/generator.md・core/instructions.md）の追記内容が反映されている" \
+    "見つかりません: ${DOC55_AGENT_GENERATOR}"
+fi
+
+if [ -f "$DOC55_CODEX_AGENT_GENERATOR" ] \
+  && grep -Fq '打ち切りが指示されました' "$DOC55_CODEX_AGENT_GENERATOR" \
+  && grep -Fq 'watchdog は検知して通知するだけであり' "$DOC55_CODEX_AGENT_GENERATOR"; then
+  pass "codex-agents/generator.toml: 正本の追記内容が反映されている"
+else
+  fail "codex-agents/generator.toml: 正本の追記内容が反映されている" \
+    "見つかりません: ${DOC55_CODEX_AGENT_GENERATOR}"
+fi
+
+# --- adapters/claude/build.sh・adapters/codex/build.sh の再生成後に差分が出ない（--check） ---
+
+DOC55_CLAUDE_BUILD_CHECK_LOG="$(mktemp "${TMPDIR:-/tmp}/dw-test-claude-build-check.XXXXXX")"
+DOC55_CODEX_BUILD_CHECK_LOG="$(mktemp "${TMPDIR:-/tmp}/dw-test-codex-build-check.XXXXXX")"
+
+if bash "${REPO_ROOT}/adapters/claude/build.sh" --check >"$DOC55_CLAUDE_BUILD_CHECK_LOG" 2>&1; then
+  pass "adapters/claude/build.sh --check: 生成物が正本と一致している（再生成後に差分が無い）"
+else
+  fail "adapters/claude/build.sh --check: 生成物が正本と一致している（再生成後に差分が無い）" \
+    "$(cat "$DOC55_CLAUDE_BUILD_CHECK_LOG")"
+fi
+
+if bash "${REPO_ROOT}/adapters/codex/build.sh" --check >"$DOC55_CODEX_BUILD_CHECK_LOG" 2>&1; then
+  pass "adapters/codex/build.sh --check: 生成物が正本と一致している（再生成後に差分が無い）"
+else
+  fail "adapters/codex/build.sh --check: 生成物が正本と一致している（再生成後に差分が無い）" \
+    "$(cat "$DOC55_CODEX_BUILD_CHECK_LOG")"
+fi
+
+# ---------------------------------------------------------------------------
 # 結果集計
 # ---------------------------------------------------------------------------
 
