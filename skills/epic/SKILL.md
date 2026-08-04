@@ -108,6 +108,8 @@ gh issue create \
 ## 親Epic
 #[epic番号]
 
+- Epic: #[epic番号]
+
 ## ブランチ
 `epic/epic[番号]/[機能名]`
 

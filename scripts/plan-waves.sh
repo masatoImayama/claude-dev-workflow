@@ -16,8 +16,9 @@
 #         最初のフェッチに含まれない依存番号は `gh issue view` で個別に state/labels を確認する
 #         （task ラベル付き closed のみ充足済み。それ以外は unknown-dep として警告し無視する）。
 #
-#         Epic 混入対策: 本文の「- Epic: #N」行（`skills/run/SKILL.md` の Task/Review issue
-#         テンプレートが書く行）を見て、N が指定 Epic と異なるタスクだけを除外する。行が無い
+#         Epic 混入対策: 本文の「- Epic: #N」行（`skills/epic/SKILL.md` の Task issue テンプレート、
+#         `skills/run/SKILL.md` の Review issue テンプレートが書く行）を見て、N が指定 Epic と
+#         異なるタスクだけを除外する。行が無い
 #         （旧形式の Task issue）場合はフェイルオープンで含める。`gh issue list --search` は
 #         数値・記号をトークン化して "Epic: #3" が "#34" 等にもマッチする誤検出を起こすため
 #         （Task #39 対応時に実データで確認済み）、本文の完全一致抽出のみを信頼する。

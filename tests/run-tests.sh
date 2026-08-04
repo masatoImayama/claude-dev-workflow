@@ -6312,6 +6312,68 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+echo "== Task issueテンプレートの「- Epic: #N」行規定（レビュー#56） =="
+
+# plan-waves.sh の load_from_gh は本文の「- Epic: #N」行で他Epicのタスクを除外する
+# （行が無ければフェイルオープンで含める）。この行がどの成果物にも規定されていないと、
+# テンプレートどおりに作った Task issue が別Epicの実行中にウェーブ計画へ混入する
+# （#39 の再発）。テンプレート・役割定義側に規定があることを固定する。
+
+DOC56_EPIC_SKILL="${REPO_ROOT}/skills/epic/SKILL.md"
+DOC56_PLANNER_ROLE="${REPO_ROOT}/core/roles/planner.md"
+DOC56_PLAN_SKILL="${REPO_ROOT}/skills/plan/SKILL.md"
+DOC56_CODEX_PLAN_SKILL="${REPO_ROOT}/skills-codex/dev-workflow-plan/SKILL.md"
+DOC56_PLAN_WAVES="${REPO_ROOT}/scripts/plan-waves.sh"
+DOC56_AGENT_PLANNER="${REPO_ROOT}/agents/planner.md"
+DOC56_CODEX_AGENT_PLANNER="${REPO_ROOT}/codex-agents/planner.toml"
+
+if grep -Fq -e '- Epic: #[epic番号]' "$DOC56_EPIC_SKILL"; then
+  pass "skills/epic/SKILL.md: Task issue本文テンプレートに「- Epic: #[epic番号]」行がある（#56）"
+else
+  fail "skills/epic/SKILL.md: Task issue本文テンプレートに「- Epic: #[epic番号]」行がある（#56）"
+fi
+
+if grep -Fq '`- Epic: #N`' "$DOC56_PLANNER_ROLE"; then
+  pass "core/roles/planner.md: 依存宣言の節に「- Epic: #N」の必須化が明記されている（#56）"
+else
+  fail "core/roles/planner.md: 依存宣言の節に「- Epic: #N」の必須化が明記されている（#56）"
+fi
+
+if grep -Fq '`- Epic: #N`' "$DOC56_PLAN_SKILL"; then
+  pass "skills/plan/SKILL.md: Task issue要件に「- Epic: #N」が明記されている（#56）"
+else
+  fail "skills/plan/SKILL.md: Task issue要件に「- Epic: #N」が明記されている（#56）"
+fi
+
+if grep -Fq '`- Epic: #N`' "$DOC56_CODEX_PLAN_SKILL"; then
+  pass "skills-codex/dev-workflow-plan/SKILL.md: Task issue要件に「- Epic: #N」が明記されている（#56）"
+else
+  fail "skills-codex/dev-workflow-plan/SKILL.md: Task issue要件に「- Epic: #N」が明記されている（#56）"
+fi
+
+if grep -Fq 'skills/epic/SKILL.md' "$DOC56_PLAN_WAVES" && grep -Fq 'Task issue テンプレート' "$DOC56_PLAN_WAVES"; then
+  pass "scripts/plan-waves.sh: ヘッダコメントが「- Epic:」行の出所をskills/epic/SKILL.mdに正しく記載している（#56）"
+else
+  fail "scripts/plan-waves.sh: ヘッダコメントが「- Epic:」行の出所をskills/epic/SKILL.mdに正しく記載している（#56）"
+fi
+
+# core/roles/planner.md の追記は adapters/*/build.sh の再生成対象であるため、
+# 生成物側にも同じ記述が反映されていることを固定する（生成漏れの検出）。
+if [ -f "$DOC56_AGENT_PLANNER" ] && grep -Fq '`- Epic: #N`' "$DOC56_AGENT_PLANNER"; then
+  pass "agents/planner.md: 正本（core/roles/planner.md）の「- Epic: #N」追記内容が反映されている（#56）"
+else
+  fail "agents/planner.md: 正本（core/roles/planner.md）の「- Epic: #N」追記内容が反映されている（#56）" \
+    "見つかりません: ${DOC56_AGENT_PLANNER}"
+fi
+
+if [ -f "$DOC56_CODEX_AGENT_PLANNER" ] && grep -Fq '`- Epic: #N`' "$DOC56_CODEX_AGENT_PLANNER"; then
+  pass "codex-agents/planner.toml: 正本の「- Epic: #N」追記内容が反映されている（#56）"
+else
+  fail "codex-agents/planner.toml: 正本の「- Epic: #N」追記内容が反映されている（#56）" \
+    "見つかりません: ${DOC56_CODEX_AGENT_PLANNER}"
+fi
+
+# ---------------------------------------------------------------------------
 # 結果集計
 # ---------------------------------------------------------------------------
 

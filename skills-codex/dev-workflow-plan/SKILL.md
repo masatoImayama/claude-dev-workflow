@@ -25,7 +25,9 @@ description: 機能要求を仕様ヒアリングして仕様書・実装計画�
 2. 仕様書と実装計画書を作成する（ファイル出力は不要）
 3. Epic issue を作成する（epicラベル、仕様書・計画書を <details> で本文に埋め込む）
 4. Epic issue番号を使って epic/epic<番号>/<機能名> ブランチを作成・push する
-5. 各タスクの Task issue を作成する（taskラベル）
+5. 各タスクの Task issue を作成する（taskラベル）。各Task issueには `- 前提: #N`
+   （依存タスクのissue番号。無い場合は `- 前提: なし`）と `- Epic: #N`（親Epic issue番号。
+   `plan-waves.sh` がこの行で他Epicのタスクを除外するため必須）を必ず含める
 6. Epic issue 本文に Task issue のチェックリストを追記する
 7. 成果物一覧を表示してユーザーに確認を求める
 ```
