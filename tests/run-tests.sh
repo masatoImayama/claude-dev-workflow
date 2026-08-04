@@ -4647,6 +4647,51 @@ HBA_POST_OUT="$(DEV_WORKFLOW_MARKER_ROOT="$HBA_REPO" DEV_WORKFLOW_HOOK_VENDOR=cl
 assert_exit_code "heartbeat.sh: postでは拒否しない（フラグ・agent cwdがあってもexit 0）" 0 $?
 assert_eq "heartbeat.sh: postでは無出力" "" "$HBA_POST_OUT"
 
+# --- Windowsネイティブパス表現（バックスラッシュ、JSONでは二重エスケープ）のcwd正規化
+#     （レビュー#60）。scripts/check-readability.sh:220-221 と同じ「JSONエスケープ解除
+#     （\\ → \）+ Windowsパス正規化（\ → /）」がheartbeat.shにも入っていることを、
+#     cwdがバックスラッシュ表現で来た場合に確認する。 ---
+
+# フラグあり + cwdがWindows表現のagent worktree(.claude\worktrees\agent-) → 拒否される
+HBA_WIN_AGENT_CWD='C:\\Users\\hba-win\\.claude\\worktrees\\agent-hba-winpath'
+HBA_JSON_WIN_AGENT=$'{\n  "cwd": "'"${HBA_WIN_AGENT_CWD}"'",\n  "tool_name": "Bash"\n}'
+HBA_WIN_AGENT_OUT="$(DEV_WORKFLOW_MARKER_ROOT="$HBA_REPO" DEV_WORKFLOW_HOOK_VENDOR=claude \
+  bash "$HEARTBEAT_SCRIPT" pre <<< "$HBA_JSON_WIN_AGENT" 2>&1)"
+assert_exit_code "heartbeat.sh: abortフラグあり・Windows表現(バックスラッシュ)のagent worktreeのcwd → exit 2で拒否（#60）" \
+  2 $?
+case "$HBA_WIN_AGENT_OUT" in
+  *"テスト用の打ち切り理由"*) pass "heartbeat.sh: Windows表現のcwdでも拒否メッセージに--abortの理由が含まれる（#60）" ;;
+  *) fail "heartbeat.sh: Windows表現のcwdでも拒否メッセージに--abortの理由が含まれる（#60）" "$HBA_WIN_AGENT_OUT" ;;
+esac
+
+# フラグあり + cwdがWindows表現のCodex共有worktree(.codex\worktrees\) → 拒否される（Codex契約）
+HBA_WIN_CODEX_WT_CWD='C:\\Users\\hba-win\\.codex\\worktrees\\epic42'
+HBA_JSON_WIN_CODEX_WT=$'{\n  "cwd": "'"${HBA_WIN_CODEX_WT_CWD}"'",\n  "tool_name": "Bash"\n}'
+HBA_WIN_CODEX_WT_OUT="$(DEV_WORKFLOW_MARKER_ROOT="$HBA_REPO" DEV_WORKFLOW_HOOK_VENDOR=codex \
+  bash "$HEARTBEAT_SCRIPT" pre <<< "$HBA_JSON_WIN_CODEX_WT" 2>&1)"
+assert_exit_code "heartbeat.sh: abortフラグあり・Windows表現(バックスラッシュ)のCodex共有worktreeのcwd → exit 0で終わる（Codex契約。#60）" \
+  0 $?
+case "$HBA_WIN_CODEX_WT_OUT" in
+  *'"continue":false'*) pass "heartbeat.sh: Windows表現のCodex共有worktreeのcwdでもstdoutに\"continue\":falseを含むJSONを出す（#60）" ;;
+  *) fail "heartbeat.sh: Windows表現のCodex共有worktreeのcwdでもstdoutに\"continue\":falseを含むJSONを出す（#60）" \
+    "$HBA_WIN_CODEX_WT_OUT" ;;
+esac
+case "$HBA_WIN_CODEX_WT_OUT" in
+  *"テスト用の打ち切り理由"*) pass "heartbeat.sh: Windows表現のCodex共有worktreeのcwdでも--abortの理由がJSONに含まれる（#60）" ;;
+  *) fail "heartbeat.sh: Windows表現のCodex共有worktreeのcwdでも--abortの理由がJSONに含まれる（#60）" \
+    "$HBA_WIN_CODEX_WT_OUT" ;;
+esac
+
+# フラグあり + cwdがWindows表現のepic worktree(agent-プレフィックスなし) → 拒否されない
+# （正規化してもagent-パターン・.codex/worktrees/パターンいずれにも一致しないこと）
+HBA_WIN_EPIC_CWD='C:\\Users\\hba-win\\.claude\\worktrees\\epic99'
+HBA_JSON_WIN_EPIC=$'{\n  "cwd": "'"${HBA_WIN_EPIC_CWD}"'",\n  "tool_name": "Bash"\n}'
+HBA_WIN_EPIC_OUT="$(DEV_WORKFLOW_MARKER_ROOT="$HBA_REPO" DEV_WORKFLOW_HOOK_VENDOR=claude \
+  bash "$HEARTBEAT_SCRIPT" pre <<< "$HBA_JSON_WIN_EPIC" 2>&1)"
+assert_exit_code "heartbeat.sh: abortフラグあり・Windows表現のepic worktreeのcwd → 拒否されない（exit 0。#60）" \
+  0 $?
+assert_eq "heartbeat.sh: abortフラグあり・Windows表現のepic worktreeのcwd → 無出力（#60）" "" "$HBA_WIN_EPIC_OUT"
+
 # --- watchdog.sh --abort / --clear との結合: 実際にwatchdog.shで作った/消したフラグで動く ---
 HBA_WD_SCRIPT="${REPO_ROOT}/scripts/watchdog.sh"
 HBA_INT_REPO="$(canon_root "$(make_temp_repo)")"

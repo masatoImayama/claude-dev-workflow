@@ -151,6 +151,18 @@ case "$INPUT" in
     ;;
 esac
 
+# Windows パスの正規化（レビュー#60）: scripts/check-readability.sh:220-221 と同じ方針で、
+# JSONエスケープ解除（\\ → \）と Windows パスの正規化（\ → /）を行う。ただし
+# check-readability.sh は sed（外部プロセス）で行っているのに対し、heartbeat.sh は
+# 全ツール呼び出しごとに走るため外部プロセスを1つも起動できない（冒頭の非機能要件）。
+# そのため sed ではなく bash 組み込みのパラメータ展開（${var//pattern/repl}）だけで
+# 同じ正規化を行う。フック入力の cwd が `"C:\\Users\\...\\.claude\\worktrees\\agent-y"`
+# のようにJSON上でバックスラッシュが二重エスケープされたまま来ても、
+# `C:/Users/.../.claude/worktrees/agent-y` に正規化してから下の abort 判定に渡す。
+# POSIX形式（前方スラッシュ）の cwd はこの展開で変化しないため無害。
+CWD="${CWD//\\\\/\\}"
+CWD="${CWD//\\//}"
+
 # ── 時刻取得（dateプロセスを起動しない。bash組み込みの strftime） ────
 NOW=""
 printf -v NOW '%(%s)T' -1
@@ -160,11 +172,13 @@ TMP_FILE="${TARGET}.tmp.$$.${RANDOM}"
 { printf '%s\t%s\t%s\n' "$NOW" "$MODE" "$TOOL" > "$TMP_FILE"; } 2>/dev/null || exit 0
 mv -f "$TMP_FILE" "$TARGET" 2>/dev/null || true
 
-# ── 打ち切り（--abort）判定（#50。cwdパターンのCodex対応拡張はレビュー#59, #61） ──
+# ── 打ち切り（--abort）判定（#50。cwdパターンのCodex対応拡張はレビュー#59, #61。
+#    Windowsパス正規化はレビュー#60） ──
 # pre（PreToolUse）以外は対象外（postでは拒否しない）。cwdが対象パターン
 # （Claude: .claude/worktrees/agent- ／ Codex: .codex/worktrees/）を含まない呼び出し
-# （run のメインループ本体）はここで素通りする。この case のパターンマッチ自体は
-# 外部プロセスを起動しない。
+# （run のメインループ本体）はここで素通りする。CWDは上の正規化により前方スラッシュに
+# 揃っているため、cwdがバックスラッシュ表現（Windows）で来ても一致する。
+# この case のパターンマッチ自体は外部プロセスを起動しない。
 if [ "$MODE" = "pre" ]; then
   case "$CWD" in
     *'.claude/worktrees/agent-'*|*'.codex/worktrees/'*)
