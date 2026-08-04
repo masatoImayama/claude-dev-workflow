@@ -4263,6 +4263,298 @@ wd_cleanup_all
 trap - EXIT
 
 # ---------------------------------------------------------------------------
+# scripts/watchdog.sh: ストール判定・エスカレーション・スリープギャップ補正（Task #47、Epic #42）
+#
+# DEV_WORKFLOW_WATCHDOG_NOW で時刻を注入し --tick-once を連続で叩くことで、実時間を
+# 一切待たずに「未検知→初回→エスカレーション→打ち止め→復帰→再ストール」の遷移を検証する。
+# 通知は notify-slack.sh の DEV_WORKFLOW_NOTIFY_SINK 経由で検証し、ネットワークには
+# 一切出ない（既存の notify-slack.sh テストと同じsink機構。PATHへ偽curlを差し込み、
+# 万一sink機構をバイパスしても実curlが呼ばれないことも確認する）。
+#
+# tick_sec は意図的に大きく（3600秒）取り、テストで注入する時刻ジャンプ（最大でも
+# 数千秒）がスリープギャップ（tick間隔の3倍超）として誤検知されないようにしている
+# （スリープギャップそのものの検証は専用のケース群で tick_sec=60 を使って別途行う）。
+# ---------------------------------------------------------------------------
+
+echo ""
+echo "== scripts/watchdog.sh: ストール判定・エスカレーション・スリープギャップ補正（Task #47） =="
+
+WDS_WORK="$(mktemp -d "${TMPDIR:-/tmp}/dw-test-watchdog-stall.XXXXXX")"
+WDS_FAKE_BIN="${WDS_WORK}/bin"
+mkdir -p "$WDS_FAKE_BIN"
+WDS_CURL_LOG="${WDS_WORK}/curl-calls.log"
+printf '#!/bin/bash\necho "called: $*" >> "%s"\nexit 0\n' "$WDS_CURL_LOG" > "${WDS_FAKE_BIN}/curl"
+chmod +x "${WDS_FAKE_BIN}/curl"
+
+# wds_write_heartbeat <root> <epoch> <state> <tool>
+wds_write_heartbeat() {
+  printf '%s\t%s\t%s\n' "$2" "$3" "$4" > "${1}/.claude/.dev-workflow-heartbeat"
+}
+
+# wds_tick <root> <now> <tick_sec> [sink_file]
+# --tick-once を1回叩く。SLACK_WEBHOOK_URL は常にダミーを設定し、sink未指定時は
+# 使い捨てのsinkへ書かせる（そのtickで通知が発火したかどうかをsinkファイルの
+# 有無だけで判定するため、ケースごとに新しいsinkパスを渡す）。
+wds_tick() {
+  local root="$1" now="$2" tick_sec="$3" sink="${4:-${WDS_WORK}/unused-sink.json}"
+  DEV_WORKFLOW_MARKER_ROOT="$root" \
+  DEV_WORKFLOW_WATCHDOG_NOW="$now" \
+  DEV_WORKFLOW_WATCHDOG_TICK_SEC="$tick_sec" \
+  SLACK_WEBHOOK_URL="https://example.invalid/webhook" \
+  DEV_WORKFLOW_NOTIFY_SINK="$sink" \
+  PATH="${WDS_FAKE_BIN}:${PATH}" \
+  bash "$WD_SCRIPT" --tick-once --epic 47 --label "Epic #47 test" > /dev/null 2>&1
+}
+
+wds_read_sink() {
+  [ -f "$1" ] && cat "$1" || printf ''
+}
+
+# --- ストール検知・エスカレーション・打ち止め・復帰（既定値 idle=900秒・escalate=1800秒） ---
+
+WDS_ROOT1="$(wd_new_root)"
+WDS_T0=1700000000
+wds_write_heartbeat "$WDS_ROOT1" "$WDS_T0" "post" "Bash"
+WDS_LOG1="${WDS_ROOT1}/.claude/.dev-workflow-watchdog.log"
+
+# 初回tick: 基準時刻を記録するだけ（通知は起きない）
+wds_tick "$WDS_ROOT1" "$WDS_T0" 3600
+if grep -q "$(printf '\tstall\t')" "$WDS_LOG1" 2>/dev/null; then
+  fail "watchdog.sh: 初回tickでは通知しない（基準時刻の記録のみ）" "$(cat "$WDS_LOG1" 2>&1)"
+else
+  pass "watchdog.sh: 初回tickでは通知しない（基準時刻の記録のみ）"
+fi
+
+# 無活動14分: 通知されない
+WDS_SINK_14M="${WDS_WORK}/14m.json"
+wds_tick "$WDS_ROOT1" "$((WDS_T0 + 14 * 60))" 3600 "$WDS_SINK_14M"
+if [ -f "$WDS_SINK_14M" ]; then
+  fail "watchdog.sh: 無活動14分では通知されない" "$(wds_read_sink "$WDS_SINK_14M")"
+else
+  pass "watchdog.sh: 無活動14分では通知されない"
+fi
+
+# 無活動16分: 初回通知される（state=post → モデルの応答待ちで停止）
+WDS_NOTIFY1_AT=$((WDS_T0 + 16 * 60))
+WDS_SINK_16M="${WDS_WORK}/16m.json"
+wds_tick "$WDS_ROOT1" "$WDS_NOTIFY1_AT" 3600 "$WDS_SINK_16M"
+WDS_BODY_16M="$(wds_read_sink "$WDS_SINK_16M")"
+case "$WDS_BODY_16M" in
+  *"応答なし"*) pass "watchdog.sh: 無活動16分で初回通知される" ;;
+  *)            fail "watchdog.sh: 無活動16分で初回通知される" "$WDS_BODY_16M" ;;
+esac
+case "$WDS_BODY_16M" in
+  *"モデルの応答待ちで停止"*)
+    pass "watchdog.sh: state=postの通知本文に «モデルの応答待ちで停止» を含む（受け入れ条件2）" ;;
+  *)
+    fail "watchdog.sh: state=postの通知本文に «モデルの応答待ちで停止» を含む" "$WDS_BODY_16M" ;;
+esac
+case "$WDS_BODY_16M" in
+  *"ツール実行中に停止"*)
+    fail "watchdog.sh: state=postの通知本文に «ツール実行中に停止» を誤って含まない" "$WDS_BODY_16M" ;;
+  *)
+    pass "watchdog.sh: state=postの通知本文に «ツール実行中に停止» を誤って含まない" ;;
+esac
+case "$WDS_BODY_16M" in
+  *"Epic #47"*) pass "watchdog.sh: 通知本文にEpic番号（--tick-onceで受け取ったもの）を含む" ;;
+  *)            fail "watchdog.sh: 通知本文にEpic番号を含む" "$WDS_BODY_16M" ;;
+esac
+case "$WDS_BODY_16M" in
+  *0h16m*) pass "watchdog.sh: 通知本文に無活動の継続時間（Nh Mm形式）を含む" ;;
+  *)       fail "watchdog.sh: 通知本文に無活動の継続時間（Nh Mm形式）を含む" "$WDS_BODY_16M" ;;
+esac
+
+# 初回通知の29分後: 再通知されない
+WDS_SINK_29M="${WDS_WORK}/29m.json"
+wds_tick "$WDS_ROOT1" "$((WDS_NOTIFY1_AT + 29 * 60))" 3600 "$WDS_SINK_29M"
+if [ -f "$WDS_SINK_29M" ]; then
+  fail "watchdog.sh: 初回通知後29分では再通知されない" "$(wds_read_sink "$WDS_SINK_29M")"
+else
+  pass "watchdog.sh: 初回通知後29分では再通知されない"
+fi
+
+# 初回通知の30分後: 2回目が通知される
+WDS_NOTIFY2_AT=$((WDS_NOTIFY1_AT + 30 * 60))
+WDS_SINK_30M="${WDS_WORK}/30m.json"
+wds_tick "$WDS_ROOT1" "$WDS_NOTIFY2_AT" 3600 "$WDS_SINK_30M"
+if [ -f "$WDS_SINK_30M" ]; then
+  pass "watchdog.sh: 初回通知後30分経過で2回目が通知される"
+else
+  fail "watchdog.sh: 初回通知後30分経過で2回目が通知される" "sinkが作られなかった"
+fi
+
+# 2回目通知の30分後: 3回目が通知される
+WDS_NOTIFY3_AT=$((WDS_NOTIFY2_AT + 30 * 60))
+WDS_SINK_3RD="${WDS_WORK}/3rd.json"
+wds_tick "$WDS_ROOT1" "$WDS_NOTIFY3_AT" 3600 "$WDS_SINK_3RD"
+if [ -f "$WDS_SINK_3RD" ]; then
+  pass "watchdog.sh: 3回目の通知がされる"
+else
+  fail "watchdog.sh: 3回目の通知がされる" "sinkが作られなかった"
+fi
+
+# 3回目通知の30分後（本来なら4回目のタイミング）: 最大3回で打ち止め、通知されない
+WDS_AFTER_3RD=$((WDS_NOTIFY3_AT + 30 * 60))
+WDS_SINK_4TH="${WDS_WORK}/4th.json"
+wds_tick "$WDS_ROOT1" "$WDS_AFTER_3RD" 3600 "$WDS_SINK_4TH"
+if [ -f "$WDS_SINK_4TH" ]; then
+  fail "watchdog.sh: 3回通知した後は再通知されない（最大3回で打ち止め）" "$(wds_read_sink "$WDS_SINK_4TH")"
+else
+  pass "watchdog.sh: 3回通知した後は再通知されない（最大3回で打ち止め）"
+fi
+
+# さらに先の時刻でtickしても通知されない（打ち止めが続くことの確認）
+WDS_SINK_FAR="${WDS_WORK}/far.json"
+wds_tick "$WDS_ROOT1" "$((WDS_AFTER_3RD + 3000))" 3600 "$WDS_SINK_FAR"
+if [ -f "$WDS_SINK_FAR" ]; then
+  fail "watchdog.sh: 3回打ち止め後はどれだけtickしても通知されない" "$(wds_read_sink "$WDS_SINK_FAR")"
+else
+  pass "watchdog.sh: 3回打ち止め後はどれだけtickしても通知されない"
+fi
+
+WDS_STALL_COUNT_LOG="$(grep -c "$(printf '\tstall\t')" "$WDS_LOG1" 2>/dev/null || true)"
+assert_eq "watchdog.sh: ログに記録されたstall通知は3件（打ち止めの上限どおり）" "3" "${WDS_STALL_COUNT_LOG:-0}"
+
+if [ -f "${WDS_ROOT1}/.claude/.dev-workflow-abort" ]; then
+  fail "watchdog.sh: ストールを3回検知しても .dev-workflow-abort が作られない（自動打ち切りをしない）"
+else
+  pass "watchdog.sh: ストールを3回検知しても .dev-workflow-abort が作られない（自動打ち切りをしない）"
+fi
+
+# --- heartbeat更新による復帰: stall-recoveredが1回だけ通知され、カウンタがリセットされる ---
+
+WDS_RECOVER_AT=$((WDS_AFTER_3RD + 3000 + 10))
+wds_write_heartbeat "$WDS_ROOT1" "$WDS_RECOVER_AT" "pre" "Read"
+
+WDS_SINK_RECOVER="${WDS_WORK}/recovered.json"
+wds_tick "$WDS_ROOT1" "$WDS_RECOVER_AT" 3600 "$WDS_SINK_RECOVER"
+WDS_BODY_RECOVER="$(wds_read_sink "$WDS_SINK_RECOVER")"
+case "$WDS_BODY_RECOVER" in
+  *"応答が再開"*) pass "watchdog.sh: heartbeat更新でstall-recoveredが通知される" ;;
+  *)              fail "watchdog.sh: heartbeat更新でstall-recoveredが通知される" "$WDS_BODY_RECOVER" ;;
+esac
+
+WDS_RECOVERED_COUNT_LOG="$(grep -c "$(printf '\tstall-recovered\t')" "$WDS_LOG1" 2>/dev/null || true)"
+assert_eq "watchdog.sh: stall-recovered通知は1回だけ記録される" "1" "${WDS_RECOVERED_COUNT_LOG:-0}"
+
+# 復帰直後（heartbeatが変わらない間）に再tickしても、stall-recoveredは再通知されない
+WDS_SINK_RECOVER_AGAIN="${WDS_WORK}/recovered-again.json"
+wds_tick "$WDS_ROOT1" "$((WDS_RECOVER_AT + 60))" 3600 "$WDS_SINK_RECOVER_AGAIN"
+if [ -f "$WDS_SINK_RECOVER_AGAIN" ]; then
+  fail "watchdog.sh: 復帰後、heartbeatが変わらない間はstall-recoveredが再通知されない" \
+    "$(wds_read_sink "$WDS_SINK_RECOVER_AGAIN")"
+else
+  pass "watchdog.sh: 復帰後、heartbeatが変わらない間はstall-recoveredが再通知されない"
+fi
+
+# 復帰後に再びストールすると、通知カウンタがリセットされ初回から数え直す
+# （4600秒超まで待たず、復帰後わずか16分の無活動で初回通知が来ることを確認する）
+WDS_SINK_RESTALL="${WDS_WORK}/restall.json"
+wds_tick "$WDS_ROOT1" "$((WDS_RECOVER_AT + 16 * 60))" 3600 "$WDS_SINK_RESTALL"
+if [ -f "$WDS_SINK_RESTALL" ]; then
+  pass "watchdog.sh: 復帰後に再びストールすると初回から数え直して通知される（16分で初回）"
+else
+  fail "watchdog.sh: 復帰後に再びストールすると初回から数え直して通知される" "sinkが作られなかった"
+fi
+
+WDS_STALL_COUNT_LOG2="$(grep -c "$(printf '\tstall\t')" "$WDS_LOG1" 2>/dev/null || true)"
+assert_eq "watchdog.sh: 復帰後の再ストールでstall通知が合計4件になる（打ち止め3件＋復帰後1件）" \
+  "4" "${WDS_STALL_COUNT_LOG2:-0}"
+
+# --- state=pre: 通知本文が «ツール実行中に停止» になる（受け入れ条件2） ---
+
+WDS_ROOT2="$(wd_new_root)"
+WDS_T0_PRE=1700100000
+wds_write_heartbeat "$WDS_ROOT2" "$WDS_T0_PRE" "pre" "Bash"
+wds_tick "$WDS_ROOT2" "$WDS_T0_PRE" 3600
+WDS_SINK_PRE="${WDS_WORK}/pre.json"
+wds_tick "$WDS_ROOT2" "$((WDS_T0_PRE + 16 * 60))" 3600 "$WDS_SINK_PRE"
+WDS_BODY_PRE="$(wds_read_sink "$WDS_SINK_PRE")"
+case "$WDS_BODY_PRE" in
+  *"ツール実行中に停止"*)
+    pass "watchdog.sh: state=preの通知本文に «ツール実行中に停止» を含む（受け入れ条件2）" ;;
+  *)
+    fail "watchdog.sh: state=preの通知本文に «ツール実行中に停止» を含む" "$WDS_BODY_PRE" ;;
+esac
+case "$WDS_BODY_PRE" in
+  *"モデルの応答待ちで停止"*)
+    fail "watchdog.sh: state=preの通知本文に «モデルの応答待ちで停止» を誤って含まない" "$WDS_BODY_PRE" ;;
+  *)
+    pass "watchdog.sh: state=preの通知本文に «モデルの応答待ちで停止» を誤って含まない" ;;
+esac
+
+# --- heartbeatファイルが無い場合はストール判定を行わない（run開始直後の誤報防止） ---
+
+WDS_ROOT3="$(wd_new_root)"
+WDS_TICK3_OK=1
+DEV_WORKFLOW_MARKER_ROOT="$WDS_ROOT3" DEV_WORKFLOW_WATCHDOG_NOW=1700200000 \
+  bash "$WD_SCRIPT" --tick-once > /dev/null 2>&1 || WDS_TICK3_OK=0
+assert_eq "watchdog.sh: heartbeatが無くてもtick-onceはexit 0で返る" "1" "$WDS_TICK3_OK"
+
+WDS_LOG3="${WDS_ROOT3}/.claude/.dev-workflow-watchdog.log"
+if grep -q "$(printf '\tstall\t')" "$WDS_LOG3" 2>/dev/null; then
+  fail "watchdog.sh: heartbeatファイルが無い場合はストール判定を行わない" "$(cat "$WDS_LOG3" 2>&1)"
+else
+  pass "watchdog.sh: heartbeatファイルが無い場合はストール判定を行わない"
+fi
+
+# --- スリープギャップ: 実経過がtick間隔の3倍を超えたら記録・通知され、無活動時間から差し引かれる ---
+
+WDS_ROOT4="$(wd_new_root)"
+WDS_T0_GAP=1700300000
+wds_write_heartbeat "$WDS_ROOT4" "$WDS_T0_GAP" "post" "Bash"
+WDS_LOG4="${WDS_ROOT4}/.claude/.dev-workflow-watchdog.log"
+
+# 初回tick（前回tickの記録が無いので判定なし）+ 通常のtick間隔（60秒に対し実経過50秒）
+wds_tick "$WDS_ROOT4" "$WDS_T0_GAP" 60
+wds_tick "$WDS_ROOT4" "$((WDS_T0_GAP + 50))" 60
+if grep -q "$(printf '\tsleep-gap\t')" "$WDS_LOG4" 2>/dev/null; then
+  fail "watchdog.sh: 通常のtick間隔ではsleep-gapを検知しない" "$(cat "$WDS_LOG4" 2>&1)"
+else
+  pass "watchdog.sh: 通常のtick間隔ではsleep-gapを検知しない"
+fi
+
+# 大きくジャンプ（tick間隔60秒に対し実経過3700秒 > 60*3）→ スリープと判定
+WDS_GAP_NOW=$((WDS_T0_GAP + 50 + 3700))
+WDS_SINK_GAP="${WDS_WORK}/sleep-gap.json"
+wds_tick "$WDS_ROOT4" "$WDS_GAP_NOW" 60 "$WDS_SINK_GAP"
+WDS_BODY_GAP="$(wds_read_sink "$WDS_SINK_GAP")"
+case "$WDS_BODY_GAP" in
+  *"スリープ痕跡"*) pass "watchdog.sh: tick間隔の3倍を超える実経過でsleep-gapが通知される" ;;
+  *)                fail "watchdog.sh: tick間隔の3倍を超える実経過でsleep-gapが通知される" "$WDS_BODY_GAP" ;;
+esac
+case "$WDS_BODY_GAP" in
+  *"応答なし"*)
+    fail "watchdog.sh: sleep-gap通知にstallの見出し «応答なし» が誤って混ざらない" "$WDS_BODY_GAP" ;;
+  *)
+    pass "watchdog.sh: sleep-gap通知にstallの見出し «応答なし» が誤って混ざらない" ;;
+esac
+
+if grep -q "$(printf '\tsleep-gap\t')" "$WDS_LOG4" 2>/dev/null; then
+  pass "watchdog.sh: sleep-gapイベントがログに記録される（差し引き累計を含め後から読める）"
+else
+  fail "watchdog.sh: sleep-gapイベントがログに記録される" "$(cat "$WDS_LOG4" 2>&1)"
+fi
+
+# スリープギャップ直後: 差し引きが効いて誤ってstallとして通知されない
+# （素の経過なら now - heartbeat_epoch = 3750秒 > 900秒でストール誤報になるはずだが、
+#   ギャップ分3640秒（実経過3700秒からtick_sec 60秒を引いた分）を差し引いた110秒は
+#   900秒未満なので通知されない）
+if grep -q "$(printf '\tstall\t')" "$WDS_LOG4" 2>/dev/null; then
+  fail "watchdog.sh: スリープギャップ直後のtickでストール誤報が出ない（差し引きが効いている）" \
+    "$(cat "$WDS_LOG4" 2>&1)"
+else
+  pass "watchdog.sh: スリープギャップ直後のtickでストール誤報が出ない（差し引きが効いている）"
+fi
+
+# --- curlが一度も実行されていないこと（通知はsink経由でのみ検証し、ネットワークに出ない） ---
+if [ -s "$WDS_CURL_LOG" ]; then
+  fail "watchdog.sh: 通知でsink使用時にcurlが呼ばれない（実送信しない）" "$(wds_read_sink "$WDS_CURL_LOG")"
+else
+  pass "watchdog.sh: 通知でsink使用時にcurlが呼ばれない（実送信しない）"
+fi
+
+# ---------------------------------------------------------------------------
 # 結果集計
 # ---------------------------------------------------------------------------
 

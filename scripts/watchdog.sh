@@ -17,14 +17,18 @@
 #     常駐せず、監視ループを1周だけ回して exit 0 で返る（テスト・デバッグ用）。
 #
 # 状態ファイル（マーカールート直下の .claude/。解決は scripts/lib/marker-root.sh を使う）:
-#   .dev-workflow-watchdog.pid  監視デーモンの "<pid> <開始epoch秒>"（1行）
-#   .dev-workflow-watchdog.log  検知イベントの追記ログ（人間可読TSV: <時刻>\t<イベント>\t<詳細>）
+#   .dev-workflow-watchdog.pid    監視デーモンの "<pid> <開始epoch秒>"（1行）
+#   .dev-workflow-watchdog.log    検知イベントの追記ログ（人間可読TSV: <時刻>\t<イベント>\t<詳細>）
+#   .dev-workflow-watchdog-state  ストール判定・スリープギャップ補正の内部状態（key=value、1行1項目）
+#   .dev-workflow-heartbeat       heartbeat.sh（#44）が書く生存信号（<epoch>\t<pre|post>\t<ツール名>）
 #
 # 環境変数:
-#   DEV_WORKFLOW_WATCHDOG_TICK_SEC  tick間隔（秒）。既定60
-#   DEV_WORKFLOW_WATCHDOG_MAX_SEC   監視デーモンの最大寿命（秒）。既定86400（24時間）
-#   DEV_WORKFLOW_WATCHDOG_NOW       現在時刻をepoch秒で注入する（テスト用。実運用では使わない）
-#   DEV_WORKFLOW_MARKER_ROOT        マーカー置き場の解決に使う（scripts/lib/marker-root.sh）
+#   DEV_WORKFLOW_WATCHDOG_TICK_SEC      tick間隔（秒）。既定60
+#   DEV_WORKFLOW_WATCHDOG_MAX_SEC       監視デーモンの最大寿命（秒）。既定86400（24時間）
+#   DEV_WORKFLOW_WATCHDOG_IDLE_SEC      無活動しきい値（秒）。既定900（15分）。超えるとstall通知
+#   DEV_WORKFLOW_WATCHDOG_ESCALATE_SEC  再通知間隔（秒）。既定1800（30分）。最大3回まで
+#   DEV_WORKFLOW_WATCHDOG_NOW           現在時刻をepoch秒で注入する（テスト用。実運用では使わない）
+#   DEV_WORKFLOW_MARKER_ROOT            マーカー置き場の解決に使う（scripts/lib/marker-root.sh）
 #
 # 自己終了条件（run がどの経路で終了しても watchdog が残らないための3条件。受け入れ条件8）:
 #   1. run マーカー（.claude/.dev-workflow-run）が消えたとき（run が完了 or 停止通知済み）
@@ -39,10 +43,9 @@
 # --stop を叩いたときだけ実行され、監視ループの内部（tick・検知処理）から
 # 自動的に呼ばれる経路は存在しない（受け入れ条件6）。
 #
-# ストール判定・エスカレーション・通知は #47、ウェーブ予算は #48、スリープ抑止は #49、
-# 人間が明示的に叩く打ち切り（--abort）は #50 のスコープ。このファイルはそれらが
-# 乗せやすいよう、監視ループに no-op のフック関数（_watchdog_check_stall 等）を
-# 用意するところまでを担う。
+# ストール判定・エスカレーション・スリープギャップ補正は #47 で実装済み（本ファイル）。
+# ウェーブ予算は #48、スリープ抑止は #49、人間が明示的に叩く打ち切り（--abort）は #50 の
+# スコープ。それらはまだ no-op のフック関数（_watchdog_check_wave_budget 等）のままである。
 
 set -u
 
@@ -59,6 +62,8 @@ STATE_DIR="${MARKER_ROOT}/.claude"
 PID_FILE="${STATE_DIR}/.dev-workflow-watchdog.pid"
 LOG_FILE="${STATE_DIR}/.dev-workflow-watchdog.log"
 RUN_MARKER="${STATE_DIR}/.dev-workflow-run"
+STALL_STATE_FILE="${STATE_DIR}/.dev-workflow-watchdog-state"
+HEARTBEAT_FILE="${STATE_DIR}/.dev-workflow-heartbeat"
 
 # ---------------------------------------------------------------------------
 # 引数解析
@@ -164,11 +169,204 @@ _watchdog_read_pid_file() {
 }
 
 # ---------------------------------------------------------------------------
-# 監視ループのフック点（検知ロジックは後続タスクが実装する。ここでは no-op）
+# 監視ループのフック点
 # ---------------------------------------------------------------------------
+#
+# ストール判定・エスカレーション通知・スリープギャップ補正（#47）はこのセクションで
+# 実装する。ウェーブ予算超過の監視（#48）とスリープ抑止（#49）はまだ no-op のまま。
 
-# フック: 無活動（ストール）判定とエスカレーション通知（#47）。現時点では何もしない。
-_watchdog_check_stall() { :; }
+# ---- ストール判定・スリープギャップ補正の内部状態の読み書き ----
+#
+# $STALL_STATE_FILE（key=value を1行ずつ書いたファイル）で、tick をまたいで
+# 「無活動しきい値の超過状況」「これまでの通知回数」「スリープギャップの差し引き累計」
+# 「前回tickの時刻」を保持する。動的なパスを source（`.`）すると shellcheck SC1090 が
+# 飛ぶ上、想定外の内容を誤ってコードとして実行してしまう事故を避けられるため、
+# source はせず自前でパースする。
+
+# _watchdog_state_load  $STALL_STATE_FILE を読み、WD_STATE_* 変数へ反映する。
+# ファイルが無い・壊れている・値が数値でない場合はすべて既定値（0）にする。
+_watchdog_state_load() {
+  WD_STATE_HEARTBEAT_EPOCH=0
+  WD_STATE_STALL_COUNT=0
+  WD_STATE_STALL_NOTIFIED_AT=0
+  WD_STATE_SLEEP_GAP_SEC=0
+  WD_STATE_LAST_TICK=0
+
+  if [ -f "$STALL_STATE_FILE" ]; then
+    local key val
+    while IFS='=' read -r key val; do
+      case "$key" in
+        WD_STATE_HEARTBEAT_EPOCH)   WD_STATE_HEARTBEAT_EPOCH="$val" ;;
+        WD_STATE_STALL_COUNT)       WD_STATE_STALL_COUNT="$val" ;;
+        WD_STATE_STALL_NOTIFIED_AT) WD_STATE_STALL_NOTIFIED_AT="$val" ;;
+        WD_STATE_SLEEP_GAP_SEC)     WD_STATE_SLEEP_GAP_SEC="$val" ;;
+        WD_STATE_LAST_TICK)         WD_STATE_LAST_TICK="$val" ;;
+      esac
+    done < "$STALL_STATE_FILE"
+  fi
+
+  case "$WD_STATE_HEARTBEAT_EPOCH"   in ''|*[!0-9]*) WD_STATE_HEARTBEAT_EPOCH=0 ;; esac
+  case "$WD_STATE_STALL_COUNT"       in ''|*[!0-9]*) WD_STATE_STALL_COUNT=0 ;; esac
+  case "$WD_STATE_STALL_NOTIFIED_AT" in ''|*[!0-9]*) WD_STATE_STALL_NOTIFIED_AT=0 ;; esac
+  case "$WD_STATE_SLEEP_GAP_SEC"     in ''|*[!0-9]*) WD_STATE_SLEEP_GAP_SEC=0 ;; esac
+  case "$WD_STATE_LAST_TICK"         in ''|*[!0-9]*) WD_STATE_LAST_TICK=0 ;; esac
+}
+
+# _watchdog_state_save  現在のWD_STATE_*変数を$STALL_STATE_FILEへ原子的に書き出す
+# （一時ファイル + mv。heartbeat.sh・notify-slack.sh と同じ書き込みパターン）。
+_watchdog_state_save() {
+  mkdir -p "$STATE_DIR"
+  local tmp="${STALL_STATE_FILE}.tmp.$$.${RANDOM}"
+  {
+    printf 'WD_STATE_HEARTBEAT_EPOCH=%s\n' "$WD_STATE_HEARTBEAT_EPOCH"
+    printf 'WD_STATE_STALL_COUNT=%s\n' "$WD_STATE_STALL_COUNT"
+    printf 'WD_STATE_STALL_NOTIFIED_AT=%s\n' "$WD_STATE_STALL_NOTIFIED_AT"
+    printf 'WD_STATE_SLEEP_GAP_SEC=%s\n' "$WD_STATE_SLEEP_GAP_SEC"
+    printf 'WD_STATE_LAST_TICK=%s\n' "$WD_STATE_LAST_TICK"
+  } > "$tmp"
+  mv -f "$tmp" "$STALL_STATE_FILE"
+}
+
+# _watchdog_fmt_duration <seconds>  "<N>h<M>m" 形式に整形する（非数値は0扱い）
+_watchdog_fmt_duration() {
+  local sec="$1" h m
+  case "$sec" in ''|*[!0-9]*) sec=0 ;; esac
+  h=$(( sec / 3600 ))
+  m=$(( (sec % 3600) / 60 ))
+  printf '%dh%dm' "$h" "$m"
+}
+
+# _watchdog_stall_reason <state>  heartbeatのstateから通知本文に載せる理由を返す
+# （受け入れ条件2: state=pre/postで文言を区別する）
+_watchdog_stall_reason() {
+  case "$1" in
+    pre)  printf 'ツール実行中に停止（例: サンドボックスのテストが返らない）' ;;
+    post) printf 'モデルの応答待ちで停止（API のスロットリングの疑い）' ;;
+    *)    printf '不明な状態で停止（state=%s）' "$1" ;;
+  esac
+}
+
+# _watchdog_context_suffix  通知本文に添えるEpic番号・ラベル（--start/--tick-onceで受け取ったもの）
+_watchdog_context_suffix() {
+  local out=""
+  [ -n "$EPIC" ]  && out="${out} / Epic #${EPIC}"
+  [ -n "$LABEL" ] && out="${out} / ${LABEL}"
+  printf '%s' "$out"
+}
+
+# _watchdog_check_sleep_gap <now>
+#
+# tick間隔（DEV_WORKFLOW_WATCHDOG_TICK_SEC、既定60秒）に対して実経過が3倍を超えたら
+# 「スリープしていた」と判定する（Epic #42 仕様書「4.3 スリープ検知」）。超過分
+# （実経過からtick_sec 1回分を引いた残り）をスリープギャップ累計へ加算し、
+# ストール判定（_watchdog_check_stall）がその累計を無活動時間から差し引くことで、
+# 復帰直後に長時間ストールとして誤報しないようにする。前回tickの記録が無い
+# （このマーカールートで初めてのtick）場合は、比較対象が無いため判定しない。
+_watchdog_check_sleep_gap() {
+  local now="$1" tick_sec="${DEV_WORKFLOW_WATCHDOG_TICK_SEC:-60}"
+
+  _watchdog_state_load
+
+  if [ "$WD_STATE_LAST_TICK" -eq 0 ]; then
+    WD_STATE_LAST_TICK="$now"
+    _watchdog_state_save
+    return 0
+  fi
+
+  local elapsed=$(( now - WD_STATE_LAST_TICK ))
+  WD_STATE_LAST_TICK="$now"
+
+  if [ "$elapsed" -gt $(( tick_sec * 3 )) ]; then
+    local gap=$(( elapsed - tick_sec ))
+    [ "$gap" -lt 0 ] && gap=0
+    WD_STATE_SLEEP_GAP_SEC=$(( WD_STATE_SLEEP_GAP_SEC + gap ))
+    local detail
+    detail="tick間隔${tick_sec}秒に対し実経過${elapsed}秒（スリープ復帰と判定・${gap}秒を無活動時間から差し引き。差し引き累計${WD_STATE_SLEEP_GAP_SEC}秒）$(_watchdog_context_suffix)"
+    bash "${WATCHDOG_DIR}/notify-slack.sh" sleep-gap "$detail" >/dev/null 2>&1 || true
+    _watchdog_log "sleep-gap" "elapsed=${elapsed}s tick_sec=${tick_sec}s gap=${gap}s total_gap=${WD_STATE_SLEEP_GAP_SEC}s"
+  fi
+
+  _watchdog_state_save
+}
+
+# _watchdog_notify_stall <now> <idle> <hb_state> <hb_tool> <notify_no>
+# stall通知を1回送り、ログへ記録する（notify_noは1〜3回目の通し番号）
+_watchdog_notify_stall() {
+  local now="$1" idle="$2" hb_state="$3" hb_tool="$4" notify_no="$5"
+  local detail
+  detail="[${notify_no}/3] 無活動$(_watchdog_fmt_duration "$idle")継続。$(_watchdog_stall_reason "$hb_state")（最終ツール: ${hb_tool}）$(_watchdog_context_suffix)"
+  bash "${WATCHDOG_DIR}/notify-slack.sh" stall "$detail" >/dev/null 2>&1 || true
+  _watchdog_log "stall" "count=${notify_no} idle=${idle}s state=${hb_state} tool=${hb_tool} now=${now}"
+}
+
+# _watchdog_notify_recovered <idle_before>
+# stall-recovered通知を1回送り、ログへ記録する
+_watchdog_notify_recovered() {
+  local idle_before="$1"
+  local detail
+  detail="無活動$(_watchdog_fmt_duration "$idle_before")から復帰$(_watchdog_context_suffix)"
+  bash "${WATCHDOG_DIR}/notify-slack.sh" stall-recovered "$detail" >/dev/null 2>&1 || true
+  _watchdog_log "stall-recovered" "idle_before=${idle_before}s"
+}
+
+# フック: 無活動（ストール）判定とエスカレーション通知（#47）。
+#
+# heartbeatファイルが無ければ何もしない（run開始直後の誤報を防ぐ。完了条件）。
+# heartbeatのepochが前回チェック時と変わっていれば「活動が戻った」とみなし、
+# それまでにstall通知を送っていれば stall-recovered を1回だけ通知してカウンタと
+# スリープギャップ累計をリセットする（次にストールするときは初回から数え直す）。
+# epochが変わっていなければ、無活動時間（now - epoch - スリープギャップ累計）を
+# しきい値・エスカレーション間隔と比較し、最大3回まで通知する（Slackを埋めない）。
+_watchdog_check_stall() {
+  local now="$1"
+
+  [ -f "$HEARTBEAT_FILE" ] || return 0
+
+  local hb_epoch="" hb_state="" hb_tool=""
+  IFS=$'\t' read -r hb_epoch hb_state hb_tool < "$HEARTBEAT_FILE" || return 0
+  hb_tool="${hb_tool%$'\r'}"
+  case "$hb_epoch" in
+    ''|*[!0-9]*) return 0 ;;
+  esac
+
+  _watchdog_state_load
+
+  if [ "$hb_epoch" != "$WD_STATE_HEARTBEAT_EPOCH" ]; then
+    if [ "$WD_STATE_STALL_COUNT" -gt 0 ]; then
+      local idle_before=$(( now - WD_STATE_HEARTBEAT_EPOCH - WD_STATE_SLEEP_GAP_SEC ))
+      [ "$idle_before" -lt 0 ] && idle_before=0
+      _watchdog_notify_recovered "$idle_before"
+    fi
+    WD_STATE_HEARTBEAT_EPOCH="$hb_epoch"
+    WD_STATE_STALL_COUNT=0
+    WD_STATE_STALL_NOTIFIED_AT=0
+    WD_STATE_SLEEP_GAP_SEC=0
+    _watchdog_state_save
+    return 0
+  fi
+
+  local idle_sec="${DEV_WORKFLOW_WATCHDOG_IDLE_SEC:-900}"
+  local escalate_sec="${DEV_WORKFLOW_WATCHDOG_ESCALATE_SEC:-1800}"
+  local max_notify=3
+  local idle=$(( now - hb_epoch - WD_STATE_SLEEP_GAP_SEC ))
+  [ "$idle" -lt 0 ] && idle=0
+
+  if [ "$WD_STATE_STALL_COUNT" -eq 0 ]; then
+    if [ "$idle" -ge "$idle_sec" ]; then
+      _watchdog_notify_stall "$now" "$idle" "$hb_state" "$hb_tool" 1
+      WD_STATE_STALL_COUNT=1
+      WD_STATE_STALL_NOTIFIED_AT="$now"
+      _watchdog_state_save
+    fi
+  elif [ "$WD_STATE_STALL_COUNT" -lt "$max_notify" ]; then
+    if [ $(( now - WD_STATE_STALL_NOTIFIED_AT )) -ge "$escalate_sec" ]; then
+      WD_STATE_STALL_COUNT=$(( WD_STATE_STALL_COUNT + 1 ))
+      _watchdog_notify_stall "$now" "$idle" "$hb_state" "$hb_tool" "$WD_STATE_STALL_COUNT"
+      WD_STATE_STALL_NOTIFIED_AT="$now"
+      _watchdog_state_save
+    fi
+  fi
+}
 
 # フック: ウェーブ予算超過の監視（#48）。現時点では何もしない。
 _watchdog_check_wave_budget() { :; }
@@ -180,6 +378,7 @@ _watchdog_sleep_inhibit_tick() { :; }
 _watchdog_tick() {
   local now="$1"
   _watchdog_log "tick" "now=${now}"
+  _watchdog_check_sleep_gap "$now"
   _watchdog_check_stall "$now"
   _watchdog_check_wave_budget "$now"
   _watchdog_sleep_inhibit_tick "$now"
