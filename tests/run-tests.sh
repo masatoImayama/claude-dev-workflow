@@ -3943,6 +3943,17 @@ case "$CRS_HANG_SECTION" in
     fail "SKILL.md(codex): ハング時の節に watchdog.sh --abort の説明がある（#53）" "$CRS_HANG_SECTION" ;;
 esac
 
+# --abort はCodexではツール呼び出しを強制ブロックしない（ソフトな打ち切り依頼にとどまる）
+# ことが明記されていること（レビュー#59。以前はClaude版と同一文面で「次のツール呼び出しで
+# 効く」と誤って書かれていた）
+case "$CRS_HANG_SECTION" in
+  *'ブロックしない'*'ソフトな打ち切り依頼'*)
+    pass "SKILL.md(codex): --abort がハードブロックではなくソフトな打ち切り依頼である旨が明記されている（#59）" ;;
+  *)
+    fail "SKILL.md(codex): --abort がハードブロックではなくソフトな打ち切り依頼である旨が明記されている（#59）" \
+      "$CRS_HANG_SECTION" ;;
+esac
+
 case "$CRS_HANG_SECTION" in
   *'dev-workflow-run'*)
     pass "SKILL.md(codex): ハング時の節に再実行（dev-workflow-run スキル）の手順がある（#53）" ;;
@@ -4522,13 +4533,17 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# scripts/heartbeat.sh: 打ち切り（--abort）判定（Task #50、Epic #42）
+# scripts/heartbeat.sh: 打ち切り（--abort）判定（Task #50、Epic #42。cwd拡張はレビュー#59, #61）
 #
 # .dev-workflow-abort は人間が watchdog.sh --abort を明示的に叩いたときだけ作られる
 # （Epic #42 仕様書「5. 打ち切りの仕様」）。heartbeat.sh pre はこのフラグと、フック入力
-# JSON の cwd が isolation worktree（.claude/worktrees/agent-）を含む場合にのみツール
-# 呼び出しを拒否する。run のメインループ（epic worktree・リポジトリルート）は
-# 絶対に拒否しない。
+# JSON の cwd が Claude のisolation worktree（.claude/worktrees/agent-）または
+# Codex のEpic共有worktree（.codex/worktrees/。Codexにはタスクごとのisolation worktreeが
+# 無いため代わりにこちらを対象にする）を含む場合にのみツール呼び出しを拒否する。
+# run のメインループ（Claude: epic worktree・リポジトリルート／Codex: run-loop.sh自体は
+# codexセッションではなくフックが発火しない）は絶対に拒否しない。
+# Codexのブロック契約はsystemMessageのみでcontinue非対応（後述）のため、実際にはハード
+# ブロックにならないソフトな打ち切り依頼になる点に注意（詳細はheartbeat.sh本体を参照）。
 # ---------------------------------------------------------------------------
 
 echo ""
@@ -4599,6 +4614,32 @@ case "$HBA_CODEX_OUT" in
   *"テスト用の打ち切り理由"*) pass "heartbeat.sh: Codex契約のJSONにも--abortの理由が含まれる" ;;
   *)                          fail "heartbeat.sh: Codex契約のJSONにも--abortの理由が含まれる" "$HBA_CODEX_OUT" ;;
 esac
+
+# --- フラグあり + cwdがCodexのEpic共有worktree（.codex/worktrees/<epic>）→ 打ち切り判定の
+#     対象になる（レビュー#59, #61）。Codexにはタスクごとのisolation worktreeという概念自体が
+#     無く、generator/evaluatorは常にこの共有worktreeで動くため、Claudeの
+#     `.claude/worktrees/agent-` と同じ役割をこのパターンが担う ---
+HBA_CODEX_WT_CWD="${HBA_REPO}/.codex/worktrees/42"
+HBA_JSON_CODEX_WT=$'{\n  "cwd": "'"${HBA_CODEX_WT_CWD}"'",\n  "tool_name": "Bash"\n}'
+HBA_CODEX_WT_OUT="$(DEV_WORKFLOW_MARKER_ROOT="$HBA_REPO" DEV_WORKFLOW_HOOK_VENDOR=codex \
+  bash "$HEARTBEAT_SCRIPT" pre <<< "$HBA_JSON_CODEX_WT" 2>&1)"
+assert_exit_code "heartbeat.sh: abortフラグあり・Codex共有worktree(.codex/worktrees/)のcwd → exit 0で終わる（Codex契約。#59, #61）" \
+  0 $?
+case "$HBA_CODEX_WT_OUT" in
+  *'"continue":false'*) pass "heartbeat.sh: Codex共有worktreeのcwdでもstdoutに\"continue\":falseを含むJSONを出す（#59, #61）" ;;
+  *)                     fail "heartbeat.sh: Codex共有worktreeのcwdでもstdoutに\"continue\":falseを含むJSONを出す（#59, #61）" \
+    "$HBA_CODEX_WT_OUT" ;;
+esac
+case "$HBA_CODEX_WT_OUT" in
+  *"テスト用の打ち切り理由"*) pass "heartbeat.sh: Codex共有worktreeのcwdでも--abortの理由がJSONに含まれる（#59, #61）" ;;
+  *)                          fail "heartbeat.sh: Codex共有worktreeのcwdでも--abortの理由がJSONに含まれる（#59, #61）" \
+    "$HBA_CODEX_WT_OUT" ;;
+esac
+
+# --- フラグが無ければ、cwdがCodex共有worktreeでも拒否されない ---
+HBA_CODEX_WT_NOFLAG_OUT="$(DEV_WORKFLOW_MARKER_ROOT="$HBA_NOFLAG_REPO" DEV_WORKFLOW_HOOK_VENDOR=codex \
+  bash "$HEARTBEAT_SCRIPT" pre <<< "$(printf '{\n  "cwd": "%s/.codex/worktrees/42",\n  "tool_name": "Bash"\n}' "$HBA_NOFLAG_REPO")" 2>&1)"
+assert_exit_code "heartbeat.sh: abortフラグが無ければCodex共有worktreeでも拒否されない" 0 $?
 
 # --- postでは拒否しない（フラグあり・agent worktreeのcwdでも） ---
 HBA_POST_OUT="$(DEV_WORKFLOW_MARKER_ROOT="$HBA_REPO" DEV_WORKFLOW_HOOK_VENDOR=claude \
@@ -5885,13 +5926,29 @@ else
     "$HJ_POSTTOOLUSE"
 fi
 
-# --- hooks.codex.json: CodexにPreToolUseは存在しないため、PostToolUseだけで縮退結線されている ---
+# --- hooks.codex.json: PreToolUse(matcher=*)にheartbeat.sh preが結線されている ---
+#
+# CodexのイベントにPreToolUseは実在する（docs/dev-workflow-multi-vendor-guide.md §3.5.1）。
+# 当初（#52）はこれを「Codexに存在しない」と誤認して縮退させていたが、レビュー#59で
+# タスク間の不整合として指摘され、レビュー#61（state=postしか記録されず原因切り分けが
+# 成立しない）と合わせて結線することにした（詳細はheartbeat.shの打ち切り判定コメントを参照）。
+# ブロック契約自体はClaude Codeと異なり`continue`非対応でsystemMessageのみ（§3.5.2）だが、
+# state=preの記録（pre/postの切り分け）自体はブロック契約と独立して機能するため、
+# 結線するだけで#61の実害（stateが常にpostになる問題）は解消する。
 
-if grep -Fq '"PreToolUse"' "$HJ_HOOKS_CODEX_JSON"; then
-  fail "hooks.codex.json: PreToolUseが無い（CodexにPreToolUseは存在しないため縮退させる。issue #52）" \
-    "$(cat "$HJ_HOOKS_CODEX_JSON")"
+HJ_CODEX_PRETOOLUSE="$(_hj_extract_section "$HJ_HOOKS_CODEX_JSON" "PreToolUse")"
+if printf '%s' "$HJ_CODEX_PRETOOLUSE" | grep -Fq '"matcher": "*"' \
+  && printf '%s' "$HJ_CODEX_PRETOOLUSE" | grep -Fq 'bash \"${CLAUDE_PLUGIN_ROOT}/scripts/heartbeat.sh\" pre'; then
+  pass "hooks.codex.json: PreToolUse(matcher=*)にheartbeat.sh preが結線されている（#59, #61）"
 else
-  pass "hooks.codex.json: PreToolUseが無い（CodexにPreToolUseは存在しないため縮退させる。issue #52）"
+  fail "hooks.codex.json: PreToolUse(matcher=*)にheartbeat.sh preが結線されている（#59, #61）" \
+    "$HJ_CODEX_PRETOOLUSE"
+fi
+
+if printf '%s' "$HJ_CODEX_PRETOOLUSE" | grep -Fq 'heartbeat.sh\" post'; then
+  fail "hooks.codex.json: PreToolUseにheartbeat.sh postが紛れ込んでいない" "$HJ_CODEX_PRETOOLUSE"
+else
+  pass "hooks.codex.json: PreToolUseにheartbeat.sh postが紛れ込んでいない"
 fi
 
 HJ_CODEX_POSTTOOLUSE="$(_hj_extract_section "$HJ_HOOKS_CODEX_JSON" "PostToolUse")"
@@ -5903,10 +5960,9 @@ else
 fi
 
 if printf '%s' "$HJ_CODEX_POSTTOOLUSE" | grep -Fq 'heartbeat.sh\" pre'; then
-  fail "hooks.codex.json: heartbeat.sh preが紛れ込んでいない（PreToolUse非対応のため）" \
-    "$HJ_CODEX_POSTTOOLUSE"
+  fail "hooks.codex.json: PostToolUseにheartbeat.sh preが紛れ込んでいない" "$HJ_CODEX_POSTTOOLUSE"
 else
-  pass "hooks.codex.json: heartbeat.sh preが紛れ込んでいない（PreToolUse非対応のため）"
+  pass "hooks.codex.json: PostToolUseにheartbeat.sh preが紛れ込んでいない"
 fi
 
 if printf '%s' "$HJ_CODEX_POSTTOOLUSE" | grep -Fq '"matcher": "Write|Edit|MultiEdit|apply_patch"' \

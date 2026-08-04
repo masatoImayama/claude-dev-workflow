@@ -388,9 +388,13 @@ Slack に `:rotating_light: 応答なし` が届いたら、人間が次の手�
      `bash "${CLAUDE_PLUGIN_ROOT}/scripts/sandbox-exec.sh" --ls` でコンテナの状態を確認する
    - `モデルの応答待ちで停止` → API 側のスロットリングの疑い。待つか、打ち切るかを判断する
 2. **打ち切る場合**: `bash "${CLAUDE_PLUGIN_ROOT}/scripts/watchdog.sh" --abort "理由"` を実行する。
-   **これはエージェントが次にツールを呼んだ瞬間に効く**（`heartbeat.sh pre` がフラグを見て
-   拒否する経路のため）。**応答待ちの最中には効かない。** 即座に止めたい場合は Codex 側の
-   セッションを中断する
+   **Claude Code版とは異なり、これはツール呼び出しを強制的にブロックしない。** Codex の
+   `PreToolUse` フックは `systemMessage` のみに対応し `continue` は読まないため
+   （`docs/dev-workflow-multi-vendor-guide.md` §3.5.2）、`heartbeat.sh pre` が次にツールを
+   呼んだ瞬間に打ち切り理由入りの `systemMessage` を返しても、そのツール呼び出し自体は
+   そのまま実行される。**モデルがそのメッセージを読んで自発的に停止することを期待する
+   ソフトな打ち切り依頼にとどまる。** 確実に・即座に止めたい場合は Codex 側の
+   セッション（`codex exec` プロセス。無人ループなら `run-loop.sh` ごと）を人間が中断する
 3. **再開する場合**: `dev-workflow-run` スキルを再実行する。次の3点により、中断→再開でも
    安全に途中から続けられる（Task #54）。
    - **残タスクは open な Task issue から再計算される。** クローズ済みのタスクは

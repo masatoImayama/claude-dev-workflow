@@ -26,19 +26,35 @@
 #   watchdog（#45〜#47）はこの区別と最終更新時刻から、「どちらで止まっているか」
 #   （受け入れ条件2）と、無活動・スリープ復帰（受け入れ条件3）を判定する。
 #
-# 打ち切り（--abort）判定（#50。Epic #42 仕様書「5. 打ち切りの仕様」）:
+# 打ち切り（--abort）判定（#50。Epic #42 仕様書「5. 打ち切りの仕様」。
+# cwd拡張・Codexのブロック契約の限界の明記はレビュー#59, #61）:
 #   .dev-workflow-abort は人間が `watchdog.sh --abort` を明示的に叩いたときだけ作られる
 #   （このスクリプトは作らない。watchdog.sh のtick・検知フックも作らない）。
 #   pre（PreToolUse）呼び出しで、そのフラグが存在し、かつフック入力JSONの cwd が
-#   `.claude/worktrees/agent-` を含む場合（＝サブエージェントのisolation worktree）
-#   にのみ、このツール呼び出しを拒否する。run のメインループ（epic worktree・
-#   リポジトリルート）は cwd がこのパターンに一致しないため、絶対に拒否されない。
+#   次のいずれかを含む場合にのみ、このツール呼び出しを拒否する。
+#     - `.claude/worktrees/agent-` … Claudeのサブエージェントisolation worktree
+#     - `.codex/worktrees/`        … Codexのgenerator/evaluatorが動くEpic共有worktree。
+#       Codexにはタスクごとのisolation worktreeという概念自体が無く（adapters/codex/run-loop.sh
+#       のEPIC_WT）、generator/evaluatorは常にこの共有worktreeで動くため、Claudeの
+#       isolation worktreeパターンと同じ役割をこちらが担う
+#   run のメインループは絶対に拒否されない。Claudeはcwdが上記パターンに一致しない
+#   （epic worktree・リポジトリルート）ため。Codexはrun-loop.sh自体がbashスクリプトであり
+#   codexセッション（フックの発火源）ではないため、そもそもこのフックが呼ばれない。
 #   post（PostToolUse）では拒否しない（後から止めても意味が無いため）。
 #   通知方法はCLIごとに契約が異なる（scripts/check-readability.sh と同じ出し分け）:
-#     - Claude Code … exit 2 + stderr にメッセージ
-#     - Codex CLI  … exit 0 + stdout に {"continue": false, ...} のJSON
-#   限界: API 応答待ちで固まっている間はツール呼び出しが発生しないため abort は効かない。
-#   効くのはエージェントが次のツールを呼んだ瞬間である。
+#     - Claude Code … exit 2 + stderr にメッセージ。**ハードブロック**（ツール呼び出しは
+#       確実に拒否される）
+#     - Codex CLI  … exit 0 + stdout に {"continue": false, ...} のJSON。ただし
+#       docs/dev-workflow-multi-vendor-guide.md §3.5.2 のとおり CodexのPreToolUseは
+#       `systemMessage` のみに対応し `continue` は読まない（無視される）ため、
+#       **ハードブロックにはならない。** ツール呼び出し自体はそのまま実行され、
+#       モデルが systemMessage の指示（打ち切り理由・中止と報告の依頼）を読んで
+#       自発的に停止することを期待する**ソフトな打ち切り依頼**にとどまる
+#       （skills-codex/dev-workflow-run/SKILL.md「ハングしたときに人間がすること」に明記）。
+#       確実に止めたい場合は run-loop.sh のセッション（`codex exec` プロセス）を
+#       人間が中断する必要がある
+#   限界（両CLI共通）: API 応答待ちで固まっている間はツール呼び出しが発生しないため
+#   abort は効かない。効くのはエージェントが次のツールを呼んだ瞬間である。
 #
 # 非機能要件（Epic #42 仕様書「7. 非機能要件」）:
 #   - どんな異常があっても必ず exit 0 で終わる（生存信号の記録が run を止めてはならない。
@@ -144,13 +160,14 @@ TMP_FILE="${TARGET}.tmp.$$.${RANDOM}"
 { printf '%s\t%s\t%s\n' "$NOW" "$MODE" "$TOOL" > "$TMP_FILE"; } 2>/dev/null || exit 0
 mv -f "$TMP_FILE" "$TARGET" 2>/dev/null || true
 
-# ── 打ち切り（--abort）判定（#50） ────────────────────────────────────
-# pre（PreToolUse）以外は対象外（postでは拒否しない）。cwdが isolation worktree
-# （.claude/worktrees/agent-）を含まない呼び出し（run のメインループ本体）は
-# ここで素通りする。この case のパターンマッチ自体は外部プロセスを起動しない。
+# ── 打ち切り（--abort）判定（#50。cwdパターンのCodex対応拡張はレビュー#59, #61） ──
+# pre（PreToolUse）以外は対象外（postでは拒否しない）。cwdが対象パターン
+# （Claude: .claude/worktrees/agent- ／ Codex: .codex/worktrees/）を含まない呼び出し
+# （run のメインループ本体）はここで素通りする。この case のパターンマッチ自体は
+# 外部プロセスを起動しない。
 if [ "$MODE" = "pre" ]; then
   case "$CWD" in
-    *'.claude/worktrees/agent-'*)
+    *'.claude/worktrees/agent-'*|*'.codex/worktrees/'*)
       if [ -f "$ABORT_FLAG" ]; then
         # 理由（1行目のみ）を読む。読めなくても拒否自体は行う。
         ABORT_REASON=""

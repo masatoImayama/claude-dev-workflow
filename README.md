@@ -847,6 +847,7 @@ bash "${CLAUDE_PLUGIN_ROOT}/adapters/codex/run-loop.sh" <Epic issue番号>
 | サブエージェント専用worktree | `isolation: worktree`（自動） | **なし。** generator を並行実行しない設計 |
 | 判定JSONの強制 | なし（本文から読み取り） | `--output-schema` でスキーマ強制 |
 | 「入力待ち」Slack通知 | `Notification` フック | **なし**（Codexに該当イベントがない） |
+| `watchdog.sh --abort` のブロック | `PreToolUse`が`exit 2`でハードブロック（ツール呼び出しは確実に拒否される） | **ソフトな打ち切り依頼のみ。**`PreToolUse`は`systemMessage`のみ対応で`continue`は読まれないため、ツール呼び出し自体は実行される。確実に止めるにはセッション（`codex exec`／`run-loop.sh`）を人間が中断する |
 
 ## このプラグイン自体を開発する場合
 
