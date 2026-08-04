@@ -6374,6 +6374,69 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+echo "== DEV_WORKFLOW_TEST_CMD の必須化がREADME/ガイドに反映されている（レビュー#57） =="
+
+# adapters/codex/run-loop.sh は DEV_WORKFLOW_TEST_CMD が未設定なら exit 1 する（#37対応）。
+# この必須化が利用者向けドキュメントに反映されていないと、ドキュメントどおりに起動した
+# 利用者が原因不明の停止に見える形で失敗する。
+
+DOC57_README="${REPO_ROOT}/README.md"
+DOC57_GUIDE="${REPO_ROOT}/docs/dev-workflow-multi-vendor-guide.md"
+DOC57_RUN_LOOP="${REPO_ROOT}/adapters/codex/run-loop.sh"
+
+# run-loop.sh の必須チェックが実在し、「DRY_RUNならcodex起動をスキップする」分岐より前に
+# あることをまず固定する（ドキュメントの「DRY_RUNでも必須」という説明が実装と食い違わない
+# ようにするため）。L72 の `[ "$DRY_RUN" = "1" ] || need codex` は codex コマンドの存在確認を
+# 条件分岐しているだけで「スキップして確認だけする」分岐ではないため対象外とし、
+# 実際に処理をスキップする `if [ "$DRY_RUN" = "1" ]; then` ブロックの初出を基準にする。
+DOC57_RUN_LOOP_REQUIRED_LINE="$(grep -n 'DEV_WORKFLOW_TEST_CMD が未設定です' "$DOC57_RUN_LOOP" | head -1 | cut -d: -f1)"
+DOC57_RUN_LOOP_DRY_RUN_LINE="$(grep -n 'if \[ "\$DRY_RUN" = "1" \]; then' "$DOC57_RUN_LOOP" | head -1 | cut -d: -f1)"
+
+if [ -n "$DOC57_RUN_LOOP_REQUIRED_LINE" ] && [ -n "$DOC57_RUN_LOOP_DRY_RUN_LINE" ] \
+  && [ "$DOC57_RUN_LOOP_REQUIRED_LINE" -lt "$DOC57_RUN_LOOP_DRY_RUN_LINE" ]; then
+  pass "adapters/codex/run-loop.sh: DEV_WORKFLOW_TEST_CMD必須チェック（L${DOC57_RUN_LOOP_REQUIRED_LINE}）がDRY_RUN分岐（L${DOC57_RUN_LOOP_DRY_RUN_LINE}）より前にある（#57）"
+else
+  fail "adapters/codex/run-loop.sh: DEV_WORKFLOW_TEST_CMD必須チェックがDRY_RUN分岐より前にある（#57）" \
+    "required_line=${DOC57_RUN_LOOP_REQUIRED_LINE:-なし} dry_run_line=${DOC57_RUN_LOOP_DRY_RUN_LINE:-なし}"
+fi
+
+if grep -Fq 'DEV_WORKFLOW_TEST_CMD=' "$DOC57_README" && grep -Fq 'run-loop.sh' "$DOC57_README"; then
+  pass "README.md: 「無人で回す」のコマンド例にDEV_WORKFLOW_TEST_CMDが含まれる（#57）"
+else
+  fail "README.md: 「無人で回す」のコマンド例にDEV_WORKFLOW_TEST_CMDが含まれる（#57）"
+fi
+
+if grep -Fq '必須' "$DOC57_README" && grep -Fq 'DEV_WORKFLOW_TEST_CMD' "$DOC57_README"; then
+  pass "README.md: DEV_WORKFLOW_TEST_CMDが必須である旨の説明がある（#57）"
+else
+  fail "README.md: DEV_WORKFLOW_TEST_CMDが必須である旨の説明がある（#57）"
+fi
+
+if grep -Fq 'DRY_RUN より前に走るため' "$DOC57_README"; then
+  pass "README.md: DRY_RUNの案内にもDEV_WORKFLOW_TEST_CMDが必要である旨が明記されている（#57）"
+else
+  fail "README.md: DRY_RUNの案内にもDEV_WORKFLOW_TEST_CMDが必要である旨が明記されている（#57）"
+fi
+
+if grep -Fq 'DEV_WORKFLOW_TEST_CMD=' "$DOC57_GUIDE" && grep -Fq 'run-loop.sh' "$DOC57_GUIDE"; then
+  pass "docs/dev-workflow-multi-vendor-guide.md: 「完全無人で回す場合」のコマンド例にDEV_WORKFLOW_TEST_CMDが含まれる（#57）"
+else
+  fail "docs/dev-workflow-multi-vendor-guide.md: 「完全無人で回す場合」のコマンド例にDEV_WORKFLOW_TEST_CMDが含まれる（#57）"
+fi
+
+if grep -Fq '必須' "$DOC57_GUIDE" && grep -Fq 'DEV_WORKFLOW_TEST_CMD' "$DOC57_GUIDE"; then
+  pass "docs/dev-workflow-multi-vendor-guide.md: DEV_WORKFLOW_TEST_CMDが必須である旨の説明がある（#57）"
+else
+  fail "docs/dev-workflow-multi-vendor-guide.md: DEV_WORKFLOW_TEST_CMDが必須である旨の説明がある（#57）"
+fi
+
+if grep -Fq 'DRY_RUN' "$DOC57_GUIDE" && grep -Fq 'DRY_RUN より前' "$DOC57_GUIDE"; then
+  pass "docs/dev-workflow-multi-vendor-guide.md: DRY_RUNの案内にもDEV_WORKFLOW_TEST_CMDが必要である旨が明記されている（#57）"
+else
+  fail "docs/dev-workflow-multi-vendor-guide.md: DRY_RUNの案内にもDEV_WORKFLOW_TEST_CMDが必要である旨が明記されている（#57）"
+fi
+
+# ---------------------------------------------------------------------------
 # 結果集計
 # ---------------------------------------------------------------------------
 
