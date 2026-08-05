@@ -314,3 +314,55 @@ context7はツールが2つしか無いため、サーバー単位の限定で�
 
 まとめると、絞り込みの**粒度**（ツール単位 vs サーバー単位）はCLI間で異なるが、
 「generatorにのみcontext7が使える」という**結果**は両CLIで一致する。
+
+## Phase 5（#76）: 効果測定のベースラインと「外す判断基準」
+
+3つの任意依存ツール（ponytail / context7 / code-review-graph）を導入する目的は
+「サブエージェントが同じ成果をより少ないトークンで、あるいはより高いレビュー品質で出せる」
+ことである。導入して終わりにせず、**実測して効果を確認し、効かなければ外す**（Epic #66 決定5）。
+
+### 効果測定のベースライン（導入前の実測値）
+
+Epic #42 の run 実績（3つの任意依存ツールを導入する前）から得た実測値。今後の Epic での
+`bash scripts/record-agent-tokens.sh --summary --epic <N>` の出力と比較する基準線として使う。
+
+| 役割 | モード | 実測トークン |
+|---|---|---|
+| generator | タスク実装 | 81k 〜 150k / タスク |
+| evaluator | delta-review | 83k |
+| evaluator | epic-review | 139k |
+
+**evaluator の epic-review が単発で最も重い。** 変更ファイル数が多いEpicでは`docs/optional-mcp-tools.md`
+「レビュー粒度の調整」節のとおりPhase単位分割やcode-review-graphのblast radius算出が効いてくる想定であり、
+この数値がその効果を測る基準になる。
+
+### 記録・集計の仕組み
+
+`scripts/record-agent-tokens.sh`（Task #76）が、Epic/role/mode ごとのトークン消費をTSVで記録し、
+`--summary`で件数・合計・平均を集計する。generator / evaluator の起動が終わるたびに
+`skills/run/SKILL.md`・`skills-codex/dev-workflow-run/SKILL.md`の各Stepから呼ばれ、
+Epic完了時にはPR本文の「トークン消費」節に集計結果を載せる。追加の依存物（`jq`等）は使わず、
+記録先はリポジトリ内のローカル作業領域（`.claude/agent-tokens.tsv`。git管理外。`.gitignore`参照）に限る。
+
+トークン数が取得できない場合（Claude Codeの完了要約が読み取れない、Codexで使用量が取得できない等）は
+記録をスキップする。**記録の成否は自律ループを止めない。**
+
+### 外す判断基準
+
+複数の Epic を通して、当該ツールを有効にした場合のトークン消費が無効時より減らず、
+かつレビュー品質の向上（high/medium の指摘件数、取りこぼしの減少）も観測できない場合、
+そのツールの結線を外してよい。**入れたまま複雑さだけ残すことをしない。**
+
+判断に使う材料は次の2つで、どちらか一方だけでは判断しない（トークン消費が減っても指摘の
+取りこぼしが増えていれば本末転倒であり、逆にトークン消費が多少増えても指摘品質が明確に
+向上していれば残す価値がある）。
+
+1. **トークン消費**: 上記ベースラインと、導入後の複数Epicにおける
+   `record-agent-tokens.sh --summary`の実測値を比較する
+2. **レビュー品質**: Epic一括レビューで挙がった high/medium の指摘件数、および
+   （分かる範囲で）人間のレビュアーが後から見つけた取りこぼしの件数を比較する
+
+いずれのツールも、外す場合は当該ツールの結線箇所（`.claude-plugin/plugin.json`の`mcpServers`、
+`adapters/*/overlays/*`の`tools:`または`mcp_servers`宣言、`core/roles/*.md`の使いどころの記述）を
+まとめて削除し、任意依存の仕組み自体（`check-prerequisites.sh`の非ブロッキング検出等）は
+他のツールのために残す。

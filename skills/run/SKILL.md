@@ -432,6 +432,22 @@ IMPL_SEC=$((IMPL_END_SEC - IMPL_START_SEC))
 
 （レーン内ゲートに失敗したレーンは末尾に `失敗` を添える。例: `C=#11(12:03-12:05 失敗)`）
 
+#### トークン消費の記録（効果測定。Task #76）
+
+各generatorのTask呼び出しが完了すると、ハーネスがツール結果の直後に
+`⎿ Done (N tool uses · Xk tokens · Ym Zs)` 形式でトークン消費を報告する（Claude Code既定の挙動。
+Epic #42のベースライン実測値もこの表示から得ている）。この値が読み取れたレーンについてのみ、
+1レーン1レコードで記録する:
+
+```bash
+bash "${CLAUDE_PLUGIN_ROOT}/scripts/record-agent-tokens.sh" record \
+  --epic "$EPIC_NUM" --role generator --mode "タスク実装" --tokens [読み取ったトークン数] --note "#[タスク番号]"
+```
+
+トークン数が読み取れない場合（表示形式が変わった・要約が省略された等）は、そのレーンの記録を
+スキップしてよい。**`record-agent-tokens.sh` の成否・トークン数の有無に関わらず、
+自律ループは止めない。** 失敗しても標準エラーを読み捨てて次へ進む。
+
 ### Step 5: wave ブランチへレーンを取り込む
 
 全サブバッチ完了後、Epic worktreeでwaveブランチを作成し、（レーン内ゲートに通った）レーンを
@@ -759,6 +775,25 @@ echo "前ウェーブ: 実装 $(fmt_duration "$IMPL_SEC") + 統合 $(fmt_duratio
 並列化タスク（#15・#16・#18・#20・#21・#22）とオーバーヘッド削減タスク（#17・#19・#23）の
 どちらの寄与が大きかったかは、複数Epicでこの集計を比較することで読み取れる。
 
+### PR本文への「トークン消費」集計（効果測定。Task #76）
+
+「実行時間」の隣に、`record-agent-tokens.sh --summary` の出力をそのまま載せる:
+
+```bash
+bash "${CLAUDE_PLUGIN_ROOT}/scripts/record-agent-tokens.sh" --summary --epic "$EPIC_NUM"
+```
+
+```
+## トークン消費
+[record-agent-tokens.sh --summary --epic "$EPIC_NUM" の出力をそのまま貼る]
+
+比較対象（Epic #42実測。docs/optional-mcp-tools.md「効果測定のベースライン」参照）:
+generator タスク実装 81k〜150k / evaluator delta-review 83k / evaluator epic-review 139k。
+```
+
+1件も記録できていない場合（トークン数が一度も読み取れなかった等）は、このセクション自体を
+省略してよい。**記録の有無はPR作成のブロッカーにしない。**
+
 ## Epic一括レビュー（全タスク完了後・PR作成前）
 
 全Task issueがクローズされた時点で、**ここで初めてevaluatorを起動する。**
@@ -790,6 +825,14 @@ Epic #$ARGUMENTS の全変更をレビューしてください。
 - 親Epic issueの仕様書と照合し、実装漏れも指摘すること
 - テストをDocker sandbox内で実行して検証すること
 - 最後に必ずJSONブロック（verdict / reviewed_commit / findings）を出力すること
+```
+
+evaluatorのTask呼び出しが完了したら、Step 4と同じ作法でトークン消費を記録する
+（読み取れた場合のみ。読み取れなくても止めない）:
+
+```bash
+bash "${CLAUDE_PLUGIN_ROOT}/scripts/record-agent-tokens.sh" record \
+  --epic "$EPIC_NUM" --role evaluator --mode epic-review --tokens [読み取ったトークン数]
 ```
 
 ### R2: 指摘をissue化
@@ -843,6 +886,13 @@ Epic #$ARGUMENTS の指摘対応を確認してください。
 - 差分範囲: [R1のreviewed_commit]..[epic/epicXX/機能名]
 - 指定範囲外の蒸し返しはしないこと
 - 最後に必ずJSONブロックを出力すること
+```
+
+R1と同じ作法でこのdelta-review呼び出しのトークン消費も記録する（`--mode delta-review`）:
+
+```bash
+bash "${CLAUDE_PLUGIN_ROOT}/scripts/record-agent-tokens.sh" record \
+  --epic "$EPIC_NUM" --role evaluator --mode delta-review --tokens [読み取ったトークン数]
 ```
 
 3. `APPROVE` → PR作成へ / `REQUEST_CHANGES` → R2 に戻る
@@ -949,6 +999,9 @@ Closes $ARGUMENTS
 - ウェーブ数: [WAVE_NO] / タスク数: [DONE_TASK_COUNT] / 並列度: [LANES]
 - 実装（レーン）合計: [fmt_duration TOTAL_IMPL_SEC] / 統合合計: [fmt_duration TOTAL_MERGE_SEC] / 統合ゲート合計: [fmt_duration TOTAL_GATE_SEC]
 - 総所要時間: [fmt_duration (TOTAL_IMPL_SEC + TOTAL_MERGE_SEC + TOTAL_GATE_SEC)]
+
+## トークン消費
+[record-agent-tokens.sh --summary --epic "$EPIC_NUM" の出力（1件も記録できていない場合は本セクションを省略）]
 
 ## Test plan
 - [ ] 全テスト通過確認済み（Docker sandbox内）

@@ -264,6 +264,21 @@ Task #<番号> を実装してください。
 - 報告には「実際に叩いたテストコマンドの全文」と「ベース検証の実出力」を含めること
 ```
 
+#### トークン消費の記録（効果測定。Task #76・決定3でClaude版と同じ結線を入れる）
+
+Codex にはClaude Codeの「Task完了時に `N tool uses · Xk tokens · Ym Zs` を表示する」に相当する
+既定の要約表示が無い。**Codex側でトークン数が取得できない場合は、その事実を明記した上で
+記録をスキップする。** `codex exec` を JSON 出力形式（`--json` 等、上流の対応状況に応じて）で
+起動し使用量が取得できた場合に限り記録する:
+
+```bash
+bash "${CLAUDE_PLUGIN_ROOT}/scripts/record-agent-tokens.sh" record \
+  --epic "$EPIC_NUM" --role generator --mode "タスク実装" --tokens [取得できたトークン数] --note "#<番号>"
+```
+
+取得できない場合は何も呼ばず、次のStepへ進む。**`record-agent-tokens.sh` の成否・トークン数の
+有無に関わらず、自律ループは止めない。**
+
 ### Step 4: レーンを wave ブランチへ取り込む
 
 ```bash
@@ -462,6 +477,14 @@ codex exec --output-schema "${CLAUDE_PLUGIN_ROOT}/adapters/codex/schemas/evaluat
   "evaluator として Epic #<epic番号> の main...<EPIC_BRANCH> をレビューせよ"
 ```
 
+トークン数が取得できた場合のみ記録する（取得できない場合はその事実を明記し、記録をスキップする。
+Task #76・自律ループは止めない）:
+
+```bash
+bash "${CLAUDE_PLUGIN_ROOT}/scripts/record-agent-tokens.sh" record \
+  --epic "$EPIC_NUM" --role evaluator --mode epic-review --tokens [取得できたトークン数]
+```
+
 ### R2: 指摘をissue化
 
 `high` と `medium` の指摘だけを issue にする。`low` は PR本文に記録するだけ。
@@ -501,6 +524,14 @@ Epic #<epic番号> の指摘対応を確認してください。
 - 差分範囲: <R1のreviewed_commit>..<EPIC_BRANCH>
 - 指定範囲外の蒸し返しはしないこと
 - 最後に必ずJSONを出力すること
+```
+
+R1と同じ作法でこのdelta-review呼び出しのトークン消費も記録する（取得できた場合のみ。
+取得できなければスキップし、自律ループは止めない）:
+
+```bash
+bash "${CLAUDE_PLUGIN_ROOT}/scripts/record-agent-tokens.sh" record \
+  --epic "$EPIC_NUM" --role evaluator --mode delta-review --tokens [取得できたトークン数]
 ```
 
 ### R4: 打ち切り
@@ -553,6 +584,26 @@ gh pr create --base main --head "${EPIC_BRANCH}" --title "Epic: <機能名>" --b
 
 PR本文には Summary（`Closes #<epic番号>`）、完了タスク、レビュー結果、未対応の指摘、
 軽微な指摘、Test plan を含める。**PRを作成せずに終了してはならない。**
+
+### PR本文への「トークン消費」集計（効果測定。Task #76・決定3）
+
+Claude版（`skills/run/SKILL.md`）と同じく、「実行時間」相当の集計の隣に
+`record-agent-tokens.sh --summary` の出力をそのまま載せる:
+
+```bash
+bash "${CLAUDE_PLUGIN_ROOT}/scripts/record-agent-tokens.sh" --summary --epic "$EPIC_NUM"
+```
+
+```
+## トークン消費
+[record-agent-tokens.sh --summary --epic "$EPIC_NUM" の出力をそのまま貼る]
+
+比較対象（Epic #42実測。docs/optional-mcp-tools.md「効果測定のベースライン」参照）:
+generator タスク実装 81k〜150k / evaluator delta-review 83k / evaluator epic-review 139k。
+```
+
+Codex側でトークン数が一度も取得できず1件も記録が無い場合は、その旨を一行明記した上で
+このセクションを省略してよい。**記録の有無はPR作成のブロッカーにしない。**
 
 ## 完了通知
 

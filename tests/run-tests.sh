@@ -7200,6 +7200,199 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+echo "== scripts/record-agent-tokens.sh（サブエージェントのトークン消費記録・集計。#76） =="
+# ---------------------------------------------------------------------------
+
+# Epic #66 Phase 5（#76）: 導入前後のサブエージェントトークン消費を記録・集計する仕組み。
+# jq等の追加依存を使わず素のbashで完結すること、記録先が git 管理外であること、
+# 不正入力は明快なエラーで非0終了することを検査する。
+
+RAT_SCRIPT="${REPO_ROOT}/scripts/record-agent-tokens.sh"
+RAT_TESTDIR="$(mktemp -d "${TMPDIR:-/tmp}/dw-test-agent-tokens.XXXXXX")"
+RAT_FILE="${RAT_TESTDIR}/agent-tokens.tsv"
+
+# --- 静的検査: jq等の追加依存を呼んでいない（コメント行は対象外。単語境界での一致のみ見る） ---
+
+RAT_FORBIDDEN_HITS="$(grep -v '^[[:space:]]*#' "$RAT_SCRIPT" \
+  | grep -E '(^|[^A-Za-z0-9_])jq([^A-Za-z0-9_]|$)' || true)"
+if [ -z "$RAT_FORBIDDEN_HITS" ]; then
+  pass "record-agent-tokens.sh: スクリプト本体が jq を呼んでいない（#76）"
+else
+  fail "record-agent-tokens.sh: スクリプト本体が jq を呼んでいない（#76）" "$RAT_FORBIDDEN_HITS"
+fi
+
+# --- record: 追記した内容がTSVとして読み戻せる（6列） ---
+
+RAT_RECORD_OUT="$(DEV_WORKFLOW_AGENT_TOKENS_FILE="$RAT_FILE" \
+  bash "$RAT_SCRIPT" record --epic 76 --role generator --mode "タスク実装" --tokens 90000 --note "dryrun" 2>&1)"
+RAT_RECORD_EXIT=$?
+assert_exit_code "record-agent-tokens.sh record: 正常入力は exit 0（#76）" 0 "$RAT_RECORD_EXIT"
+
+if [ -f "$RAT_FILE" ]; then
+  RAT_LINE="$(tail -n 1 "$RAT_FILE")"
+  RAT_COL_COUNT="$(printf '%s' "$RAT_LINE" | awk -F'\t' '{print NF}')"
+  assert_eq "record-agent-tokens.sh record: TSVが6列で書かれる（#76）" "6" "$RAT_COL_COUNT"
+
+  RAT_EPIC_COL="$(printf '%s' "$RAT_LINE" | cut -f2)"
+  RAT_ROLE_COL="$(printf '%s' "$RAT_LINE" | cut -f3)"
+  RAT_MODE_COL="$(printf '%s' "$RAT_LINE" | cut -f4)"
+  RAT_TOKENS_COL="$(printf '%s' "$RAT_LINE" | cut -f5)"
+  RAT_NOTE_COL="$(printf '%s' "$RAT_LINE" | cut -f6)"
+  if [ "$RAT_EPIC_COL" = "76" ] && [ "$RAT_ROLE_COL" = "generator" ] \
+    && [ "$RAT_MODE_COL" = "タスク実装" ] && [ "$RAT_TOKENS_COL" = "90000" ] \
+    && [ "$RAT_NOTE_COL" = "dryrun" ]; then
+    pass "record-agent-tokens.sh record: 各列の値が正しく読み戻せる（#76）"
+  else
+    fail "record-agent-tokens.sh record: 各列の値が正しく読み戻せる（#76）" \
+      "epic=${RAT_EPIC_COL} role=${RAT_ROLE_COL} mode=${RAT_MODE_COL} tokens=${RAT_TOKENS_COL} note=${RAT_NOTE_COL}"
+  fi
+else
+  fail "record-agent-tokens.sh record: TSVが6列で書かれる（#76）" "${RAT_FILE} が作られていません"
+  fail "record-agent-tokens.sh record: 各列の値が正しく読み戻せる（#76）" "${RAT_FILE} が作られていません"
+fi
+
+# --- record: --note を省略しても6列で書かれる（noteは空文字列） ---
+
+DEV_WORKFLOW_AGENT_TOKENS_FILE="$RAT_FILE" \
+  bash "$RAT_SCRIPT" record --epic 76 --role evaluator --mode "epic-review" --tokens 139000 >/dev/null 2>&1
+RAT_LINE2="$(tail -n 1 "$RAT_FILE")"
+RAT_COL_COUNT2="$(printf '%s' "$RAT_LINE2" | awk -F'\t' '{print NF}')"
+assert_eq "record-agent-tokens.sh record: --note省略時も6列で書かれる（#76）" "6" "$RAT_COL_COUNT2"
+
+# --- record: 複数レコードを追記できる（1行1レコード。追記であって上書きではない） ---
+
+RAT_TOTAL_LINES="$(wc -l < "$RAT_FILE" | tr -d ' ')"
+assert_eq "record-agent-tokens.sh record: 1行1レコードで追記される（#76）" "2" "$RAT_TOTAL_LINES"
+
+# --- --summary: role・modeごとの件数・合計・平均を出力する ---
+
+DEV_WORKFLOW_AGENT_TOKENS_FILE="$RAT_FILE" \
+  bash "$RAT_SCRIPT" record --epic 76 --role generator --mode "タスク実装" --tokens 150000 >/dev/null 2>&1
+RAT_SUMMARY_OUT="$(DEV_WORKFLOW_AGENT_TOKENS_FILE="$RAT_FILE" bash "$RAT_SCRIPT" --summary --epic 76 2>&1)"
+RAT_SUMMARY_EXIT=$?
+assert_exit_code "record-agent-tokens.sh --summary: exit 0（#76）" 0 "$RAT_SUMMARY_EXIT"
+
+if printf '%s' "$RAT_SUMMARY_OUT" | grep -Fq "generator" \
+  && printf '%s' "$RAT_SUMMARY_OUT" | grep -Fq "240000" \
+  && printf '%s' "$RAT_SUMMARY_OUT" | grep -Fq "120000" \
+  && printf '%s' "$RAT_SUMMARY_OUT" | grep -Fq "evaluator" \
+  && printf '%s' "$RAT_SUMMARY_OUT" | grep -Fq "139000"; then
+  pass "record-agent-tokens.sh --summary: role・modeごとの件数・合計・平均を出力する（#76）"
+else
+  fail "record-agent-tokens.sh --summary: role・modeごとの件数・合計・平均を出力する（#76）" "$RAT_SUMMARY_OUT"
+fi
+
+# --- --summary: 他のEpicのレコードは集計に混ざらない ---
+
+RAT_OTHER_EPIC_FILE="${RAT_TESTDIR}/agent-tokens-other.tsv"
+DEV_WORKFLOW_AGENT_TOKENS_FILE="$RAT_OTHER_EPIC_FILE" \
+  bash "$RAT_SCRIPT" record --epic 999 --role generator --mode "タスク実装" --tokens 1 >/dev/null 2>&1
+RAT_ISOLATION_OUT="$(DEV_WORKFLOW_AGENT_TOKENS_FILE="$RAT_OTHER_EPIC_FILE" bash "$RAT_SCRIPT" --summary --epic 76 2>&1)"
+if printf '%s' "$RAT_ISOLATION_OUT" | grep -Fq "記録が0件です"; then
+  pass "record-agent-tokens.sh --summary: 指定Epic以外のレコードは集計対象外（#76）"
+else
+  fail "record-agent-tokens.sh --summary: 指定Epic以外のレコードは集計対象外（#76）" "$RAT_ISOLATION_OUT"
+fi
+
+# --- 不正入力: --tokens が数値でない場合は非0終了しエラーメッセージを出す ---
+
+RAT_BAD_TOKENS_OUT="$(DEV_WORKFLOW_AGENT_TOKENS_FILE="$RAT_FILE" \
+  bash "$RAT_SCRIPT" record --epic 76 --role generator --mode x --tokens abc 2>&1)"
+RAT_BAD_TOKENS_EXIT=$?
+if [ "$RAT_BAD_TOKENS_EXIT" -ne 0 ] && printf '%s' "$RAT_BAD_TOKENS_OUT" | grep -Fq "数値"; then
+  pass "record-agent-tokens.sh record: --tokensが数値でない場合は非0終了しエラーを出す（#76）"
+else
+  fail "record-agent-tokens.sh record: --tokensが数値でない場合は非0終了しエラーを出す（#76）" \
+    "exit=${RAT_BAD_TOKENS_EXIT} out=${RAT_BAD_TOKENS_OUT}"
+fi
+
+# --- 不正入力: 必須オプション（--tokens）が欠けている場合は非0終了する ---
+
+RAT_MISSING_OUT="$(DEV_WORKFLOW_AGENT_TOKENS_FILE="$RAT_FILE" \
+  bash "$RAT_SCRIPT" record --epic 76 --role generator --mode x 2>&1)"
+RAT_MISSING_EXIT=$?
+assert_exit_code "record-agent-tokens.sh record: 必須オプション欠落は非0終了する（#76）" 2 "$RAT_MISSING_EXIT"
+
+# --- 不正入力: --role が想定外の値の場合は非0終了する ---
+
+RAT_BADROLE_EXIT_OUT="$(DEV_WORKFLOW_AGENT_TOKENS_FILE="$RAT_FILE" \
+  bash "$RAT_SCRIPT" record --epic 76 --role reviewer --mode x --tokens 1 2>&1)"
+RAT_BADROLE_EXIT=$?
+if [ "$RAT_BADROLE_EXIT" -ne 0 ]; then
+  pass "record-agent-tokens.sh record: --roleが想定外の値の場合は非0終了する（#76）"
+else
+  fail "record-agent-tokens.sh record: --roleが想定外の値の場合は非0終了する（#76）" "$RAT_BADROLE_EXIT_OUT"
+fi
+
+# --- --summary: --epic が欠けている場合は非0終了する ---
+
+RAT_SUMMARY_NOEPIC_EXIT_OUT="$(DEV_WORKFLOW_AGENT_TOKENS_FILE="$RAT_FILE" bash "$RAT_SCRIPT" --summary 2>&1)"
+RAT_SUMMARY_NOEPIC_EXIT=$?
+assert_exit_code "record-agent-tokens.sh --summary: --epic欠落は非0終了する（#76）" 2 "$RAT_SUMMARY_NOEPIC_EXIT"
+
+# --- 不正な入力の失敗は記録先ファイルを壊さない（レコード件数が増えていない） ---
+
+RAT_LINES_AFTER_ERRORS="$(wc -l < "$RAT_FILE" | tr -d ' ')"
+assert_eq "record-agent-tokens.sh: 不正入力の失敗はファイルへの書き込みを行わない（#76）" "3" "$RAT_LINES_AFTER_ERRORS"
+
+# --- 記録先が git 管理外であること（.gitignore で除外されている） ---
+# git worktree（サンドボックスや専用worktree）内では .git ファイルがホスト側の絶対パスを
+# 指しており、コンテナ内から親リポジトリを解決できない環境がある（#73のcode-review-graph
+# 検査と同じ理由で `git check-ignore` は使わず、.gitignore の内容を直接検査する）。
+
+if grep -Fq '.claude/agent-tokens.tsv' "${REPO_ROOT}/.gitignore"; then
+  pass "record-agent-tokens.sh: 既定の記録先（.claude/agent-tokens.tsv）が.gitignoreで除外されている（#76）"
+else
+  fail "record-agent-tokens.sh: 既定の記録先（.claude/agent-tokens.tsv）が.gitignoreで除外されている（#76）"
+fi
+
+# --- run への結線: skills/run/SKILL.md と skills-codex/dev-workflow-run/SKILL.md の両方に
+#     record-agent-tokens.sh の呼び出しとPR本文への集計が記述されている ---
+
+RAT_RUN_SKILL="${REPO_ROOT}/skills/run/SKILL.md"
+RAT_CODEX_RUN_SKILL="${REPO_ROOT}/skills-codex/dev-workflow-run/SKILL.md"
+
+for f in "$RAT_RUN_SKILL" "$RAT_CODEX_RUN_SKILL"; do
+  name="${f#"${REPO_ROOT}"/}"
+  if grep -Fq 'record-agent-tokens.sh' "$f" \
+    && grep -Fq 'record-agent-tokens.sh --summary' "$f" \
+    && grep -Fq 'トークン消費' "$f"; then
+    pass "${name}: record-agent-tokens.shの結線とPR本文への集計が記述されている（#76）"
+  else
+    fail "${name}: record-agent-tokens.shの結線とPR本文への集計が記述されている（#76）"
+  fi
+done
+
+# --- 呼び出し側への注記: 記録に失敗しても自律ループを止めない旨が両SKILL.mdに明記されている ---
+
+for f in "$RAT_RUN_SKILL" "$RAT_CODEX_RUN_SKILL"; do
+  name="${f#"${REPO_ROOT}"/}"
+  if grep -Fq '自律ループを止めない' "$f" || grep -Fq 'ループは止めない' "$f"; then
+    pass "${name}: 記録失敗が自律ループを止めない旨が明記されている（#76）"
+  else
+    fail "${name}: 記録失敗が自律ループを止めない旨が明記されている（#76）"
+  fi
+done
+
+# --- docs/optional-mcp-tools.md: ベースライン表と「外す判断基準」が記載されている ---
+
+RAT_DOC="${REPO_ROOT}/docs/optional-mcp-tools.md"
+if grep -Fq '81k' "$RAT_DOC" && grep -Fq '150k' "$RAT_DOC" \
+  && grep -Fq '83k' "$RAT_DOC" && grep -Fq '139k' "$RAT_DOC" \
+  && grep -Fq 'delta-review' "$RAT_DOC" && grep -Fq 'epic-review' "$RAT_DOC"; then
+  pass "docs/optional-mcp-tools.md: ベースライン表（Epic #42実測値）が記載されている（#76）"
+else
+  fail "docs/optional-mcp-tools.md: ベースライン表（Epic #42実測値）が記載されている（#76）"
+fi
+
+if grep -Fq '外す判断基準' "$RAT_DOC" \
+  && grep -Fq 'record-agent-tokens.sh' "$RAT_DOC"; then
+  pass "docs/optional-mcp-tools.md: 「外す判断基準」が明記されている（#76）"
+else
+  fail "docs/optional-mcp-tools.md: 「外す判断基準」が明記されている（#76）"
+fi
+
+# ---------------------------------------------------------------------------
 # 結果集計
 # ---------------------------------------------------------------------------
 
