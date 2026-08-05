@@ -6437,6 +6437,84 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+echo "== ponytail の7段ラダーを generator の正本に規定（#69） =="
+
+# ponytail（DietrichGebert/ponytail, MIT）の「最も怠惰なシニア開発者のように考える」7段の判断ラダーを
+# core/roles/generator.md に日本語で規定する。実装コードのみが対象でテストは対象外。
+# 生成物（agents/generator.md・codex-agents/generator.toml）にも同じ文言が反映されていることを検査する。
+
+DOC69_GENERATOR_ROLE="${REPO_ROOT}/core/roles/generator.md"
+DOC69_AGENT_GENERATOR="${REPO_ROOT}/agents/generator.md"
+DOC69_CODEX_AGENT_GENERATOR="${REPO_ROOT}/codex-agents/generator.toml"
+
+# --- core/roles/generator.md に7段のラダーが日本語で規定されている ---
+
+if grep -Fq '7段のラダー' "$DOC69_GENERATOR_ROLE" \
+  && grep -Fq 'これは存在する必要があるか？' "$DOC69_GENERATOR_ROLE" \
+  && grep -Fq 'ここまで来て初めて: 動く最小限を書く' "$DOC69_GENERATOR_ROLE"; then
+  pass "core/roles/generator.md: 7段のラダーが日本語で規定されている（#69）"
+else
+  fail "core/roles/generator.md: 7段のラダーが日本語で規定されている（#69）"
+fi
+
+# --- 「削ってはいけないもの」にテスト・回帰確認・検証が含まれている ---
+
+if grep -Fq '削ってはいけないもの' "$DOC69_GENERATOR_ROLE" \
+  && grep -Fq 'テスト・回帰確認・検証' "$DOC69_GENERATOR_ROLE"; then
+  pass "core/roles/generator.md: 「削ってはいけないもの」にテスト・回帰確認・検証が含まれている（#69）"
+else
+  fail "core/roles/generator.md: 「削ってはいけないもの」にテスト・回帰確認・検証が含まれている（#69）"
+fi
+
+# --- 実装コードのみ対象、テストコードには適用しない旨が明記されている ---
+
+if grep -Fq '実装コードにのみ適用する' "$DOC69_GENERATOR_ROLE" \
+  && grep -Fq 'テストコードには適用しない' "$DOC69_GENERATOR_ROLE"; then
+  pass "core/roles/generator.md: 「実装コードのみ対象、テストコードには適用しない」旨が明記されている（#69）"
+else
+  fail "core/roles/generator.md: 「実装コードのみ対象、テストコードには適用しない」旨が明記されている（#69）"
+fi
+
+# --- 出典（DietrichGebert/ponytail, MIT）が明記されている ---
+
+if grep -Fq 'DietrichGebert/ponytail' "$DOC69_GENERATOR_ROLE" \
+  && grep -Fq 'MIT License' "$DOC69_GENERATOR_ROLE"; then
+  pass "core/roles/generator.md: 出典（DietrichGebert/ponytail, MIT）が明記されている（#69）"
+else
+  fail "core/roles/generator.md: 出典（DietrichGebert/ponytail, MIT）が明記されている（#69）"
+fi
+
+# --- 完了報告テンプレートに「作らなかったもの」の欄がある ---
+
+if grep -Fq '作らなかったもの（ラダー判定）' "$DOC69_GENERATOR_ROLE"; then
+  pass "core/roles/generator.md: 完了報告テンプレートに「作らなかったもの（ラダー判定）」の欄がある（#69）"
+else
+  fail "core/roles/generator.md: 完了報告テンプレートに「作らなかったもの（ラダー判定）」の欄がある（#69）"
+fi
+
+# --- 生成物（agents/generator.md・codex-agents/generator.toml）に正本の追記内容が反映されている ---
+
+if [ -f "$DOC69_AGENT_GENERATOR" ] \
+  && grep -Fq '7段のラダー' "$DOC69_AGENT_GENERATOR" \
+  && grep -Fq 'DietrichGebert/ponytail' "$DOC69_AGENT_GENERATOR" \
+  && grep -Fq '作らなかったもの（ラダー判定）' "$DOC69_AGENT_GENERATOR"; then
+  pass "agents/generator.md: 正本（core/roles/generator.md）のponytailラダー追記内容が反映されている（#69）"
+else
+  fail "agents/generator.md: 正本（core/roles/generator.md）のponytailラダー追記内容が反映されている（#69）" \
+    "見つかりません: ${DOC69_AGENT_GENERATOR}"
+fi
+
+if [ -f "$DOC69_CODEX_AGENT_GENERATOR" ] \
+  && grep -Fq '7段のラダー' "$DOC69_CODEX_AGENT_GENERATOR" \
+  && grep -Fq 'DietrichGebert/ponytail' "$DOC69_CODEX_AGENT_GENERATOR" \
+  && grep -Fq '作らなかったもの（ラダー判定）' "$DOC69_CODEX_AGENT_GENERATOR"; then
+  pass "codex-agents/generator.toml: 正本のponytailラダー追記内容が反映されている（#69）"
+else
+  fail "codex-agents/generator.toml: 正本のponytailラダー追記内容が反映されている（#69）" \
+    "見つかりません: ${DOC69_CODEX_AGENT_GENERATOR}"
+fi
+
+# ---------------------------------------------------------------------------
 # 結果集計
 # ---------------------------------------------------------------------------
 
