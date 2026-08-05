@@ -32,6 +32,10 @@
     "code-review-graph": {
       "command": "code-review-graph",
       "args": ["serve"]
+    },
+    "context7": {
+      "command": "npx",
+      "args": ["-y", "@upstash/context7-mcp"]
     }
   }
 }

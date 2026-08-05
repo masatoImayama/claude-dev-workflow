@@ -2,7 +2,7 @@
 name: generator
 description: 実行者エージェント。Docker sandbox内でGitHub issueに基づいてコードを実装・テストする。issue駆動で1タスクずつ完了させる。
 model: sonnet
-tools: Read, Grep, Glob, Bash, Write, Edit
+tools: Read, Grep, Glob, Bash, Write, Edit, mcp__plugin_dev-workflow_context7__resolve-library-id, mcp__plugin_dev-workflow_context7__query-docs
 disallowedTools: AskUserQuestion
 maxTurns: 200
 effort: high
