@@ -33,12 +33,15 @@ MSG
 optional_tools_notice() {
   # optional_tools_notice
   # 任意ツール（context7 / code-review-graph）の導入状況を非ブロッキングで通知する。
-  # docs/optional-mcp-tools.md「## 対象ツール」節に記録した起動コマンドの先頭コマンド名
-  # （context7: npx / code-review-graph: code-review-graph）の有無を command -v で判定する。
+  # docs/optional-mcp-tools.md「## 対象ツール」節・「## 申し送りに対してどう応えたか（#80 レビュー対応）」節に
+  # 記録したとおり、dev-workflowが実際に`.claude-plugin/plugin.json`等の`command`に指定する
+  # コマンド名（context7: context7-mcp / code-review-graph: code-review-graph）の有無を
+  # command -v で判定する（#80で`npx -y ...`からの自動取得をやめ、導入済みバイナリ`context7-mcp`を
+  # 直接指す方式に変更したため、`npx`ではなく`context7-mcp`の有無で判定する。#82）。
   # 両方とも利用可能なら何も出力しない（黙って通す）。エラーとして扱わないため、
   # 呼び出し側は errors 配列に追加してはならない（exit 2 を返さない）。
   local missing_context7=0 missing_code_review_graph=0
-  command -v npx &> /dev/null || missing_context7=1
+  command -v context7-mcp &> /dev/null || missing_context7=1
   command -v code-review-graph &> /dev/null || missing_code_review_graph=1
 
   [ "$missing_context7" -eq 0 ] && [ "$missing_code_review_graph" -eq 0 ] && return 0

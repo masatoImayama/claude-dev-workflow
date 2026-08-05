@@ -2036,8 +2036,10 @@ fi
 # ---------------------------------------------------------------------------
 # optional_tools_notice（任意ツールの非ブロッキング検出、Epic #66 Phase1・Task #68）
 #
-# context7 / code-review-graph の導入状況（docs/optional-mcp-tools.md「## 対象ツール」節の
-# 起動コマンドの先頭コマンド名: npx / code-review-graph）を command -v で判定する純粋関数。
+# context7 / code-review-graph の導入状況（docs/optional-mcp-tools.md「## 申し送りに対してどう応えたか
+# （#80 レビュー対応）」節のとおり、dev-workflowが実際に`command`へ指定するコマンド名:
+# context7-mcp / code-review-graph）を command -v で判定する純粋関数。`npx`はNode.js同梱でほぼ
+# 常に存在し「context7 = 常に導入済み」と誤判定するため使わない（レビュー指摘 #82）。
 # crlf_warning_message と同じく check-prerequisites.sh を source して単体テストする。
 # ---------------------------------------------------------------------------
 
@@ -2070,7 +2072,7 @@ optional_tools_notice_with_path() {
 }
 
 # --- 両方とも利用可能な環境では何も出力しない ---
-OPT_TOOLS_BOTH_DIR="$(make_tool_stub_dir npx code-review-graph)"
+OPT_TOOLS_BOTH_DIR="$(make_tool_stub_dir context7-mcp code-review-graph)"
 OPT_TOOLS_BOTH_NOTICE="$(optional_tools_notice_with_path "$OPT_TOOLS_BOTH_DIR")"
 assert_eq "context7 / code-review-graph が両方利用可能なら何も出力しない" "" "$OPT_TOOLS_BOTH_NOTICE"
 
@@ -2094,7 +2096,7 @@ case "$OPT_TOOLS_NO_CONTEXT7_NOTICE" in
 esac
 
 # --- code-review-graph のみ未導入な環境でも同様（片方が未導入なら未導入分だけ列挙する） ---
-OPT_TOOLS_NO_CRG_DIR="$(make_tool_stub_dir npx)"
+OPT_TOOLS_NO_CRG_DIR="$(make_tool_stub_dir context7-mcp)"
 OPT_TOOLS_NO_CRG_NOTICE="$(optional_tools_notice_with_path "$OPT_TOOLS_NO_CRG_DIR")"
 
 case "$OPT_TOOLS_NO_CRG_NOTICE" in
@@ -2107,17 +2109,36 @@ case "$OPT_TOOLS_NO_CRG_NOTICE" in
   *) fail "code-review-graph 未導入時、警告に『従来どおり』の文言が含まれる" "notice=[${OPT_TOOLS_NO_CRG_NOTICE}]" ;;
 esac
 
+# --- レビュー指摘 #82 の再発防止: npx はあるが context7-mcp が無い環境では、
+#     context7 が「未導入」と正しく通知されること（npx の有無を context7 の代わりに
+#     見てしまう歪みが直したはずなのに戻っていないかを検出する） ---
+OPT_TOOLS_NPX_ONLY_DIR="$(make_tool_stub_dir npx code-review-graph)"
+OPT_TOOLS_NPX_ONLY_NOTICE="$(optional_tools_notice_with_path "$OPT_TOOLS_NPX_ONLY_DIR")"
+
+case "$OPT_TOOLS_NPX_ONLY_NOTICE" in
+  *"context7"*) pass "npx はあるが context7-mcp が無い環境で、context7 が未導入と正しく通知される（#82再発防止）" ;;
+  *) fail "npx はあるが context7-mcp が無い環境で、context7 が未導入と正しく通知される（#82再発防止）" \
+    "notice=[${OPT_TOOLS_NPX_ONLY_NOTICE}]" ;;
+esac
+
+case "$OPT_TOOLS_NPX_ONLY_NOTICE" in
+  *"code-review-graph"*) fail "npx はあるが context7-mcp が無い環境で、code-review-graph には言及しない（#82再発防止）" \
+    "notice=[${OPT_TOOLS_NPX_ONLY_NOTICE}]" ;;
+  *) pass "npx はあるが context7-mcp が無い環境で、code-review-graph には言及しない（#82再発防止）" ;;
+esac
+
 # --- 両方未導入でも check-prerequisites.sh 全体の終了コードは 2 にならない ---
 #
 # 他の必須依存（gh/docker）は満たされている前提を再現するため、CRLF警告テストと同じ
-# 偽 gh / 偽 docker を使う。npx / code-review-graph が「未導入」であることを環境非依存で
-# 保証するため、実際の $PATH からこの2つの実行ファイルを含むディレクトリだけを取り除いた
-# PATH を組み立てる（git / sed / cat / grep 等、他に必要な外部コマンドはそのまま残す）。
+# 偽 gh / 偽 docker を使う。context7-mcp / code-review-graph が「未導入」であることを
+# 環境非依存で保証するため、実際の $PATH からこの2つの実行ファイルを含むディレクトリだけを
+# 取り除いた PATH を組み立てる（git / sed / cat / grep 等、他に必要な外部コマンドはそのまま残す）。
+# npx は取り除かない（context7 の判定に npx を使わないことの確認を兼ねる。#82）。
 strip_optional_tools_from_path() {
   local dir out=""
   local IFS=':'
   for dir in $PATH; do
-    if [ -x "${dir}/npx" ] || [ -x "${dir}/code-review-graph" ]; then
+    if [ -x "${dir}/context7-mcp" ] || [ -x "${dir}/code-review-graph" ]; then
       continue
     fi
     out="${out:+${out}:}${dir}"
