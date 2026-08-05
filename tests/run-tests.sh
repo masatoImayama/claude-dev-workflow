@@ -6574,6 +6574,39 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+echo "== プラグイン宣言MCPの未導入時挙動を実測しdocs/optional-mcp-tools.mdに記録している（#67） =="
+
+# Epic #66 Phase 1（#67）: MCP結線方式（方式A: 宣言方式 / 方式B: 非宣言方式）を実測して確定し、
+# 後続タスク（#71 context7 / #73 code-review-graph）が同じ文書を参照できるようにする。
+# 決め打ちで方式名だけ書いていないか、必須6節が揃っているかを機械的に検査する。
+
+DOC67_MCP="${REPO_ROOT}/docs/optional-mcp-tools.md"
+
+if [ -f "$DOC67_MCP" ]; then
+  pass "docs/optional-mcp-tools.md が存在する（#67）"
+
+  for section in "## 対象ツール" "## 実測手順" "## 実測結果" "## 採用方式" "## MCP ツール名" "## 任意依存であることの保証"; do
+    if grep -Fq "$section" "$DOC67_MCP"; then
+      pass "docs/optional-mcp-tools.md: 「${section}」節がある（#67）"
+    else
+      fail "docs/optional-mcp-tools.md: 「${section}」節がある（#67）"
+    fi
+  done
+
+  DOC67_ADOPTED_SECTION="$(awk '/^## 採用方式/{flag=1; next} /^## /{flag=0} flag' "$DOC67_MCP")"
+  if printf '%s' "$DOC67_ADOPTED_SECTION" | grep -Fq '方式A: 宣言方式' \
+    || printf '%s' "$DOC67_ADOPTED_SECTION" | grep -Fq '方式B: 非宣言方式'; then
+    pass "docs/optional-mcp-tools.md: 「## 採用方式」節に方式A/Bいずれかが明記されている（#67）"
+  else
+    fail "docs/optional-mcp-tools.md: 「## 採用方式」節に方式A/Bいずれかが明記されている（#67）"
+  fi
+else
+  fail "docs/optional-mcp-tools.md が存在する（#67）"
+  skip "docs/optional-mcp-tools.md: 必須節の検査（#67）" "ファイルが存在しないためスキップ"
+  skip "docs/optional-mcp-tools.md: 採用方式の検査（#67）" "ファイルが存在しないためスキップ"
+fi
+
+# ---------------------------------------------------------------------------
 # 結果集計
 # ---------------------------------------------------------------------------
 
