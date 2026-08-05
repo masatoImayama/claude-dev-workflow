@@ -779,6 +779,8 @@ BODY
 
 ### R1: 一括レビューの実行
 
+起動前に「レビュー粒度の調整」の3分岐に従う（変更50ファイル以下なら以下の基本形のまま起動する）。
+
 ```
 @evaluator
 Epic #$ARGUMENTS の全変更をレビューしてください。
@@ -860,8 +862,34 @@ Epic #$ARGUMENTS の指摘対応を確認してください。
 
 ### レビュー粒度の調整
 
-Epicが大きく差分が膨大になる場合（目安: 変更50ファイル超）は、
-R1をPhase単位に分割して起動してよい。その場合も**タスク単位には戻さない**。
+R1の起動前に変更ファイル数を数え、既存のしきい値（目安: 変更50ファイル超）で3つに分岐する。
+**新しいしきい値の軸は増やさず、この50ファイル超のしきい値に相乗りする。**
+
+```bash
+CHANGED_FILES="$(git diff --name-only master..."$EPIC_BRANCH" | wc -l)"
+```
+
+| 条件 | 挙動 |
+|---|---|
+| `CHANGED_FILES` <= 50 | **従来どおり。** code-review-graphには一切触れない（グラフ構築もしない） |
+| `CHANGED_FILES` > 50 かつ code-review-graphが利用可能（`command -v code-review-graph`） | evaluatorのプロンプトに「blast radiusの算出を使って読む優先順位を付けてよい」旨を含めて起動する |
+| `CHANGED_FILES` > 50 かつ code-review-graphが未導入 | **従来どおり**、R1をPhase単位に分割して起動する（下記の既存の回避策） |
+
+code-review-graphが利用可能な場合でも、Phase単位の分割を**禁止はしない**（両立してよい）。
+どちらの場合も**タスク単位には戻さない**。
+
+blast radiusを使う場合のプロンプト例（R1の基本形に1行加えるだけでよい）:
+
+```
+@evaluator
+Epic #$ARGUMENTS の全変更をレビューしてください。
+- モード: epic-review
+- 差分範囲: main...[epic/epicXX/機能名]
+- 変更ファイル数が50超のため、code-review-graphのblast radiusの算出を使って読む優先順位を付けてよい
+- 最後に必ずJSONブロック（verdict / reviewed_commit / findings）を出力すること
+```
+
+code-review-graphが未導入の場合（従来どおりPhase単位に分割する既存の回避策）:
 
 ```
 @evaluator

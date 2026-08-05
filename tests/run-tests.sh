@@ -6969,6 +6969,96 @@ else
     "見つかりません: ${DOC72_CODEX_AGENT_GENERATOR}"
 fi
 
+echo "== Epic一括レビューに「変更50ファイル超」しきい値の3分岐を入れる（#74） =="
+
+# Epic #66 Phase 4（#74）: R1起動前の変更ファイル数しきい値を、既存の「変更50ファイル超」に
+# 相乗りさせて3分岐（<=50は従来どおり / >50かつ利用可能ならblast radius / >50かつ未導入なら
+# 従来どおりPhase分割）にする。新しいしきい値の軸を増やさないこと、Claude版とCodex版で
+# 機能差を作らないこと（決定3）を検査する。
+
+DOC74_RUN_SKILL="${REPO_ROOT}/skills/run/SKILL.md"
+DOC74_CODEX_RUN_SKILL="${REPO_ROOT}/skills-codex/dev-workflow-run/SKILL.md"
+
+# --- skills/run/SKILL.md: 3分岐（<=50 / >50かつ利用可能 / >50かつ未導入）が記述されている ---
+
+if grep -Fq '<= 50' "$DOC74_RUN_SKILL" \
+  && grep -Fq '従来どおり' "$DOC74_RUN_SKILL" \
+  && grep -Fq 'code-review-graphが利用可能' "$DOC74_RUN_SKILL" \
+  && grep -Fq 'blast radius' "$DOC74_RUN_SKILL" \
+  && grep -Fq 'code-review-graphが未導入' "$DOC74_RUN_SKILL"; then
+  pass "skills/run/SKILL.md: 変更ファイル数50を境にした3分岐が記述されている（#74）"
+else
+  fail "skills/run/SKILL.md: 変更ファイル数50を境にした3分岐が記述されている（#74）"
+fi
+
+# --- skills/run/SKILL.md: 未導入ならPhase分割にフォールバックする旨が明記されている ---
+
+if grep -Fq '未導入' "$DOC74_RUN_SKILL" && grep -Fq 'Phase単位に分割して起動する' "$DOC74_RUN_SKILL"; then
+  pass "skills/run/SKILL.md: code-review-graph未導入ならPhase分割にフォールバックする旨が明記されている（#74）"
+else
+  fail "skills/run/SKILL.md: code-review-graph未導入ならPhase分割にフォールバックする旨が明記されている（#74）"
+fi
+
+# --- skills/run/SKILL.md: 「新しいしきい値の軸は増やさない」旨が明記され、しきい値が50のみである ---
+
+if grep -Fq '新しいしきい値の軸は増やさず' "$DOC74_RUN_SKILL"; then
+  pass "skills/run/SKILL.md: 新しいしきい値の軸を増やさない旨が明記されている（#74）"
+else
+  fail "skills/run/SKILL.md: 新しいしきい値の軸を増やさない旨が明記されている（#74）"
+fi
+
+DOC74_THRESHOLD_NUMBERS="$(grep -oE '[0-9]+ファイル超' "$DOC74_RUN_SKILL" | sort -u)"
+if [ "$DOC74_THRESHOLD_NUMBERS" = "50ファイル超" ]; then
+  pass "skills/run/SKILL.md: 「Xファイル超」しきい値が50のみである（新しい軸が増えていない）（#74）"
+else
+  fail "skills/run/SKILL.md: 「Xファイル超」しきい値が50のみである（新しい軸が増えていない）（#74）" \
+    "検出したしきい値: ${DOC74_THRESHOLD_NUMBERS}"
+fi
+
+# --- skills-codex/dev-workflow-run/SKILL.md: 同等の3分岐が記述されている（決定3: 機能差を作らない） ---
+
+if grep -Fq '<= 50' "$DOC74_CODEX_RUN_SKILL" \
+  && grep -Fq '従来どおり' "$DOC74_CODEX_RUN_SKILL" \
+  && grep -Fq 'code-review-graph が利用可能' "$DOC74_CODEX_RUN_SKILL" \
+  && grep -Fq 'blast radius' "$DOC74_CODEX_RUN_SKILL" \
+  && grep -Fq 'code-review-graph が未導入' "$DOC74_CODEX_RUN_SKILL"; then
+  pass "skills-codex/dev-workflow-run/SKILL.md: 変更ファイル数50を境にした3分岐が記述されている（#74）"
+else
+  fail "skills-codex/dev-workflow-run/SKILL.md: 変更ファイル数50を境にした3分岐が記述されている（#74）"
+fi
+
+# --- skills-codex/dev-workflow-run/SKILL.md: 未導入ならPhase分割にフォールバックする旨が明記されている ---
+
+if grep -Fq '未導入' "$DOC74_CODEX_RUN_SKILL" && grep -Fq 'R1 を Phase 単位に分割して起動する' "$DOC74_CODEX_RUN_SKILL"; then
+  pass "skills-codex/dev-workflow-run/SKILL.md: code-review-graph未導入ならPhase分割にフォールバックする旨が明記されている（#74）"
+else
+  fail "skills-codex/dev-workflow-run/SKILL.md: code-review-graph未導入ならPhase分割にフォールバックする旨が明記されている（#74）"
+fi
+
+# --- Claude版とCodex版で分岐の有無が一致している（決定3: 機能差を作らない） ---
+
+DOC74_CLAUDE_HAS_SECTION="no"
+DOC74_CODEX_HAS_SECTION="no"
+grep -Fq '### レビュー粒度の調整' "$DOC74_RUN_SKILL" && DOC74_CLAUDE_HAS_SECTION="yes"
+grep -Fq '### レビュー粒度の調整' "$DOC74_CODEX_RUN_SKILL" && DOC74_CODEX_HAS_SECTION="yes"
+
+if [ "$DOC74_CLAUDE_HAS_SECTION" = "yes" ] && [ "$DOC74_CODEX_HAS_SECTION" = "yes" ]; then
+  pass "skills/run/SKILL.md と skills-codex/dev-workflow-run/SKILL.md の両方に「レビュー粒度の調整」節があり分岐の有無が一致する（#74）"
+else
+  fail "skills/run/SKILL.md と skills-codex/dev-workflow-run/SKILL.md の両方に「レビュー粒度の調整」節があり分岐の有無が一致する（#74）" \
+    "claude=${DOC74_CLAUDE_HAS_SECTION} codex=${DOC74_CODEX_HAS_SECTION}"
+fi
+
+# --- しきい値の値は既存記述と同じ50であり、Codex版側にも50以外の新しい軸が増えていない ---
+
+DOC74_CODEX_THRESHOLD_NUMBERS="$(grep -oE '[0-9]+ファイル超' "$DOC74_CODEX_RUN_SKILL" | sort -u)"
+if [ "$DOC74_CODEX_THRESHOLD_NUMBERS" = "50ファイル超" ]; then
+  pass "skills-codex/dev-workflow-run/SKILL.md: 「Xファイル超」しきい値が50のみである（新しい軸が増えていない）（#74）"
+else
+  fail "skills-codex/dev-workflow-run/SKILL.md: 「Xファイル超」しきい値が50のみである（新しい軸が増えていない）（#74）" \
+    "検出したしきい値: ${DOC74_CODEX_THRESHOLD_NUMBERS}"
+fi
+
 # ---------------------------------------------------------------------------
 # 結果集計
 # ---------------------------------------------------------------------------

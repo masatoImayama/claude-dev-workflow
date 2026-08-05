@@ -508,6 +508,42 @@ Epic #<epic番号> の指摘対応を確認してください。
 2巡目でも `REQUEST_CHANGES` が残る場合は**打ち切ってPRを作成する。** 未対応の指摘は
 issue をオープンのまま残し、PR本文に列挙して人間の判断に委ねる。
 
+### レビュー粒度の調整
+
+R1 の起動前に変更ファイル数を数え、しきい値（目安: 変更50ファイル超。`skills/run/SKILL.md`
+の既存しきい値と同じ）で3つに分岐する。**新しいしきい値の軸は増やさず、この50ファイル超の
+しきい値に相乗りする。**
+
+```bash
+CHANGED_FILES="$(git diff --name-only master..."$EPIC_BRANCH" | wc -l)"
+```
+
+| 条件 | 挙動 |
+|---|---|
+| `CHANGED_FILES` <= 50 | **従来どおり。** code-review-graph には一切触れない（グラフ構築もしない） |
+| `CHANGED_FILES` > 50 かつ code-review-graph が利用可能（`command -v code-review-graph`） | evaluator への指示に「blast radius の算出を使って読む優先順位を付けてよい」旨を含めて起動する |
+| `CHANGED_FILES` > 50 かつ code-review-graph が未導入 | **従来どおり**、R1 を Phase 単位に分割して起動する |
+
+code-review-graph が利用可能な場合でも、Phase 単位の分割を**禁止はしない**（両立してよい）。
+どちらの場合も**タスク単位には戻さない**。
+
+blast radius を使う場合の指示例（R1 の基本形に1行加えるだけでよい）:
+
+```
+Epic #<epic番号> の全変更をレビューしてください。
+- モード: epic-review
+- 差分範囲: main...<EPIC_BRANCH>
+- 変更ファイル数が50超のため、code-review-graph の blast radius の算出を使って読む優先順位を付けてよい
+- 最後に必ずJSON（verdict / reviewed_commit / findings）を出力すること
+```
+
+code-review-graph が未導入の場合（従来どおり Phase 単位に分割する既存の回避策）:
+
+```
+Epic #<epic番号> のうち Phase 1 の変更をレビューしてください。
+- 差分範囲: main...<EPIC_BRANCH> のうち <Phase1で変更されたファイル群>
+```
+
 ## PR作成（最終責務）
 
 ```bash
