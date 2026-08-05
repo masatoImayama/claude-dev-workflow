@@ -6607,6 +6607,94 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+echo "== context7 を generator にのみ結線している（#71） =="
+
+# Epic #66 Phase 3（#71）: #67 で確定した方式A（宣言方式）でcontext7を結線し、
+# generatorにのみ与える（決定6）。planner / evaluatorには一切現れないことを検査する。
+# Codex側はサーバー単位でしか絞れないため、絞り込み方式そのものは異なるが（詳細は
+# docs/optional-mcp-tools.md「Phase 3（#71）」節）、結果として「generatorにのみ与える」ことは
+# 両CLIで一致していることを検査する。
+
+DOC71_CLAUDE_PLUGIN_JSON="${REPO_ROOT}/.claude-plugin/plugin.json"
+DOC71_CODEX_PLUGIN_JSON="${REPO_ROOT}/.codex-plugin/plugin.json"
+DOC71_MCP_DOC="${REPO_ROOT}/docs/optional-mcp-tools.md"
+DOC71_AGENT_GENERATOR="${REPO_ROOT}/agents/generator.md"
+DOC71_AGENT_PLANNER="${REPO_ROOT}/agents/planner.md"
+DOC71_AGENT_EVALUATOR="${REPO_ROOT}/agents/evaluator.md"
+DOC71_CODEX_AGENT_GENERATOR="${REPO_ROOT}/codex-agents/generator.toml"
+DOC71_CODEX_AGENT_PLANNER="${REPO_ROOT}/codex-agents/planner.toml"
+DOC71_CODEX_AGENT_EVALUATOR="${REPO_ROOT}/codex-agents/evaluator.toml"
+
+# --- .claude-plugin/plugin.json が方式Aどおりcontext7を宣言しており、変更後もJSONとして妥当 ---
+
+if _hj_json_syntax_ok "$DOC71_CLAUDE_PLUGIN_JSON"; then
+  pass ".claude-plugin/plugin.json: 変更後もJSON構文として妥当（括弧の対応が取れている）（#71）"
+else
+  fail ".claude-plugin/plugin.json: 変更後もJSON構文として妥当（括弧の対応が取れている）（#71）" \
+    "$(cat "$DOC71_CLAUDE_PLUGIN_JSON" 2>&1)"
+fi
+
+if grep -Fq '"mcpServers"' "$DOC71_CLAUDE_PLUGIN_JSON" && grep -Fq '"context7"' "$DOC71_CLAUDE_PLUGIN_JSON"; then
+  pass ".claude-plugin/plugin.json: mcpServersにcontext7が宣言されている（方式A）（#71）"
+else
+  fail ".claude-plugin/plugin.json: mcpServersにcontext7が宣言されている（方式A）（#71）"
+fi
+
+# --- context7のツールがgeneratorにのみ与えられている（Claude Code版） ---
+
+if grep -Fq 'mcp__plugin_dev-workflow_context7__resolve-library-id' "$DOC71_AGENT_GENERATOR" \
+  && grep -Fq 'mcp__plugin_dev-workflow_context7__query-docs' "$DOC71_AGENT_GENERATOR"; then
+  pass "agents/generator.md: context7の2ツール（resolve-library-id / query-docs）がtools:にある（#71）"
+else
+  fail "agents/generator.md: context7の2ツール（resolve-library-id / query-docs）がtools:にある（#71）" \
+    "見つかりません: ${DOC71_AGENT_GENERATOR}"
+fi
+
+for f in "$DOC71_AGENT_PLANNER" "$DOC71_AGENT_EVALUATOR"; do
+  label="agents/$(basename "$f")"
+  if grep -Fq 'context7' "$f"; then
+    fail "${label}: context7が現れない（#71）" "見つかりました: ${f}"
+  else
+    pass "${label}: context7が現れない（#71）"
+  fi
+done
+
+# --- context7のツールがgeneratorにのみ与えられている（Codex版） ---
+
+if grep -Fq 'mcp_servers.context7' "$DOC71_CODEX_AGENT_GENERATOR"; then
+  pass "codex-agents/generator.toml: mcp_servers.context7が宣言されている（#71）"
+else
+  fail "codex-agents/generator.toml: mcp_servers.context7が宣言されている（#71）" \
+    "見つかりません: ${DOC71_CODEX_AGENT_GENERATOR}"
+fi
+
+for f in "$DOC71_CODEX_AGENT_PLANNER" "$DOC71_CODEX_AGENT_EVALUATOR"; do
+  label="codex-agents/$(basename "$f")"
+  if grep -Fq 'context7' "$f"; then
+    fail "${label}: context7が現れない（#71）" "見つかりました: ${f}"
+  else
+    pass "${label}: context7が現れない（#71）"
+  fi
+done
+
+# --- .codex-plugin/plugin.json にはcontext7を宣言しない（宣言すると全サブエージェントに継承されるため） ---
+
+if grep -Fq 'context7' "$DOC71_CODEX_PLUGIN_JSON"; then
+  fail ".codex-plugin/plugin.json: context7を宣言していない（宣言するとplanner/evaluatorにも継承されるため）（#71）"
+else
+  pass ".codex-plugin/plugin.json: context7を宣言していない（宣言するとplanner/evaluatorにも継承されるため）（#71）"
+fi
+
+# --- Claude/Codex間の機能差が無い（同等にできない場合はdocsに理由が明記されている） ---
+
+if grep -Fq '## Phase 3（#71）' "$DOC71_MCP_DOC" \
+  && grep -Fq 'Codex にはサブエージェント単位でMCPの「ツール名」を絞り込む機構が無い' "$DOC71_MCP_DOC"; then
+  pass "docs/optional-mcp-tools.md: Codex側で同等にできない理由と回避策が明記されている（#71）"
+else
+  fail "docs/optional-mcp-tools.md: Codex側で同等にできない理由と回避策が明記されている（#71）"
+fi
+
+# ---------------------------------------------------------------------------
 # 結果集計
 # ---------------------------------------------------------------------------
 

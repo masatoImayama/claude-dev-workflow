@@ -203,3 +203,41 @@ mcp__plugin_<plugin-name>_<server-name>__<tool-name>
 - コマンドが存在するのに応答しない状態（壊れた導入・ネットワーク未接続でのオンデマンド取得待ち等）では、
   セッション開始が最大約30秒（既定タイムアウト）遅れうる。これはセッションの起動そのものを妨げるもの
   ではなく、開始が遅れるだけで、一度きり（他のツール呼び出しの繰り返しをブロックするものではない）
+
+## Phase 3（#71）: context7 の結線方式（Claude / Codex の差分）
+
+Epic本文はcontext7のMCPツール名を `resolve-library-id` / `get-library-docs` と想定していたが、
+上記「対象ツール」節のとおり実際は `resolve-library-id` / **`query-docs`** である。
+generator にのみ結線し、planner / evaluator には与えない（決定6）。
+
+### Claude Code 側
+
+`.claude-plugin/plugin.json` の `mcpServers.context7` にサーバーを宣言し、
+`adapters/claude/overlays/generator.md` の frontmatter `tools:` にツール名を2つとも明示的に
+列挙する（サーバー全体のワイルドカードは使わない）。
+
+```
+mcp__plugin_dev-workflow_context7__resolve-library-id
+mcp__plugin_dev-workflow_context7__query-docs
+```
+
+セッション全体（`.claude-plugin/plugin.json`）にサーバーを宣言しても、`tools:` に列挙していない
+planner / evaluator のサブエージェントはそのツールを呼べない（実測結果4のとおり、`tools:` に
+存在しないツール名を含めてもエラーにならないのと同じ理屈で、逆に列挙しなければ単に使えないだけ）。
+
+### Codex CLI 側（Claude Code との差分と回避策）
+
+**Codex にはサブエージェント単位でMCPの「ツール名」を絞り込む機構が無い。**
+`docs/dev-workflow-multi-vendor-guide.md` 3.3.2 のとおり、Codex のサブエージェント定義（TOML）は
+Claude Code の `tools:` allowlist に相当する項目を持たず、`sandbox_mode`（ファイルアクセス等の
+粗い粒度）しか無い。したがって「ツール単位でallowlistする」ことはできない（できない理由）。
+
+**回避策:** Codex のエージェントTOMLは `mcp_servers` キーを個別に持てる（省略時は親セッションから
+継承する）。この性質を使い、`.codex-plugin/plugin.json` にはcontext7を宣言せず（宣言すると
+セッション全体・全サブエージェントに継承されてしまう）、`adapters/codex/overlays/generator.toml`
+にだけ `[mcp_servers.context7]` を書く。これにより **サーバー単位**でgeneratorだけに絞り込める。
+context7はツールが2つしか無いため、サーバー単位の限定でもClaude版のツール単位限定と実質的に
+同じ結果になり、機能差は生じない。
+
+まとめると、絞り込みの**粒度**（ツール単位 vs サーバー単位）はCLI間で異なるが、
+「generatorにのみcontext7が使える」という**結果**は両CLIで一致する。
