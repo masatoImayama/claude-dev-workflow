@@ -73,16 +73,31 @@ _is_nonneg_int() {
   esac
 }
 
+# オプションに値が続いているかを検証する。末尾に値なしでオプション名だけが
+# 置かれた場合、呼び出し元の $# は1のまま（残りはオプション名自身のみ）になる。
+# これを検出せずに `shift 2` すると、bash の `shift 2` は $# が2未満だと
+# 何もせず非0を返すため、while ループが同じ分岐を無限に回り続けてハングする。
+# 使い方: _require_opt_value "<コマンド名（エラー接頭辞）>" "<オプション名>" "<残り引数の個数=$#>"
+_require_opt_value() {
+  local prefix="$1" opt="$2" remaining="$3"
+  if [ "$remaining" -lt 2 ]; then
+    echo "ERROR: ${prefix}: ${opt} に値がありません" >&2
+    usage >&2
+    return 2
+  fi
+  return 0
+}
+
 cmd_record() {
   local epic="" role="" mode="" tokens="" note=""
 
   while [ $# -gt 0 ]; do
     case "$1" in
-      --epic) epic="${2:-}"; shift 2 ;;
-      --role) role="${2:-}"; shift 2 ;;
-      --mode) mode="${2:-}"; shift 2 ;;
-      --tokens) tokens="${2:-}"; shift 2 ;;
-      --note) note="${2:-}"; shift 2 ;;
+      --epic) _require_opt_value "record" "$1" "$#" || return 2; epic="$2"; shift 2 ;;
+      --role) _require_opt_value "record" "$1" "$#" || return 2; role="$2"; shift 2 ;;
+      --mode) _require_opt_value "record" "$1" "$#" || return 2; mode="$2"; shift 2 ;;
+      --tokens) _require_opt_value "record" "$1" "$#" || return 2; tokens="$2"; shift 2 ;;
+      --note) _require_opt_value "record" "$1" "$#" || return 2; note="$2"; shift 2 ;;
       *)
         echo "ERROR: record: 不明な引数: $1" >&2
         usage >&2
@@ -140,7 +155,7 @@ cmd_summary() {
 
   while [ $# -gt 0 ]; do
     case "$1" in
-      --epic) epic="${2:-}"; shift 2 ;;
+      --epic) _require_opt_value "--summary" "$1" "$#" || return 2; epic="$2"; shift 2 ;;
       *)
         echo "ERROR: --summary: 不明な引数: $1" >&2
         usage >&2

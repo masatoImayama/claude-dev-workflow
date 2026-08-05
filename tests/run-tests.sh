@@ -7313,6 +7313,63 @@ RAT_MISSING_OUT="$(DEV_WORKFLOW_AGENT_TOKENS_FILE="$RAT_FILE" \
 RAT_MISSING_EXIT=$?
 assert_exit_code "record-agent-tokens.sh record: 必須オプション欠落は非0終了する（#76）" 2 "$RAT_MISSING_EXIT"
 
+# --- 不正入力: 末尾に値の無いオプションを置いても無限ループしない（ハングしない）（#79） ---
+# bash の `shift 2` は $# が2未満のとき何もせず非0を返す。値なしでオプション名だけが
+# 末尾に置かれた場合にこれを検出しないと while ループが同じ分岐を回り続けてハングする
+# 不具合があった（実測: timeout 5 bash record-agent-tokens.sh record --epic 66 --role
+# generator --mode impl --tokens は exit 124 だった）。「必須オプション欠落」テスト（直上）
+# はオプションを丸ごと省く形なのでこのケースを通り抜けていた。cmd_record の全オプション
+# （--epic/--role/--mode/--tokens/--note）を、他は有効な値を与えたまま1つだけ末尾で
+# 値なしにする形で網羅する。
+
+if command -v timeout >/dev/null 2>&1; then
+  RAT_NOVAL_OPTS=(--epic --role --mode --tokens --note)
+  for RAT_NOVAL_OPT in "${RAT_NOVAL_OPTS[@]}"; do
+    RAT_NOVAL_ARGS=(record)
+    for RAT_OTHER_OPT in "${RAT_NOVAL_OPTS[@]}"; do
+      [ "$RAT_OTHER_OPT" = "$RAT_NOVAL_OPT" ] && continue
+      case "$RAT_OTHER_OPT" in
+        --epic) RAT_NOVAL_ARGS+=(--epic 76) ;;
+        --role) RAT_NOVAL_ARGS+=(--role generator) ;;
+        --mode) RAT_NOVAL_ARGS+=(--mode x) ;;
+        --tokens) RAT_NOVAL_ARGS+=(--tokens 1) ;;
+        --note) RAT_NOVAL_ARGS+=(--note y) ;;
+      esac
+    done
+    RAT_NOVAL_ARGS+=("$RAT_NOVAL_OPT")
+
+    RAT_NOVAL_OUT="$(DEV_WORKFLOW_AGENT_TOKENS_FILE="$RAT_FILE" \
+      timeout 5 bash "$RAT_SCRIPT" "${RAT_NOVAL_ARGS[@]}" 2>&1)"
+    RAT_NOVAL_EXIT=$?
+
+    if [ "$RAT_NOVAL_EXIT" -eq 124 ]; then
+      fail "record-agent-tokens.sh record: ${RAT_NOVAL_OPT}が末尾で値なしでも無限ループしない（#79）" \
+        "timeout（exit 124）で停止しました"
+    elif [ "$RAT_NOVAL_EXIT" -eq 0 ]; then
+      fail "record-agent-tokens.sh record: ${RAT_NOVAL_OPT}が末尾で値なしの場合は非0終了する（#79）" \
+        "exit=0 out=${RAT_NOVAL_OUT}"
+    else
+      pass "record-agent-tokens.sh record: ${RAT_NOVAL_OPT}が末尾で値なしでも無限ループせず非0終了する（#79）"
+    fi
+  done
+
+  RAT_SUMMARY_NOVAL_OUT="$(DEV_WORKFLOW_AGENT_TOKENS_FILE="$RAT_FILE" \
+    timeout 5 bash "$RAT_SCRIPT" --summary --epic 2>&1)"
+  RAT_SUMMARY_NOVAL_EXIT=$?
+
+  if [ "$RAT_SUMMARY_NOVAL_EXIT" -eq 124 ]; then
+    fail "record-agent-tokens.sh --summary: --epicが末尾で値なしでも無限ループしない（#79）" \
+      "timeout（exit 124）で停止しました"
+  elif [ "$RAT_SUMMARY_NOVAL_EXIT" -eq 0 ]; then
+    fail "record-agent-tokens.sh --summary: --epicが末尾で値なしの場合は非0終了する（#79）" \
+      "exit=0 out=${RAT_SUMMARY_NOVAL_OUT}"
+  else
+    pass "record-agent-tokens.sh --summary: --epicが末尾で値なしでも無限ループせず非0終了する（#79）"
+  fi
+else
+  skip "record-agent-tokens.sh: 末尾に値の無いオプションでも無限ループしない（#79）" "timeout コマンドが利用できません"
+fi
+
 # --- 不正入力: --role が想定外の値の場合は非0終了する ---
 
 RAT_BADROLE_EXIT_OUT="$(DEV_WORKFLOW_AGENT_TOKENS_FILE="$RAT_FILE" \
