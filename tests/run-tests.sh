@@ -6515,6 +6515,65 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+echo "== 「過剰実装・過剰設計」をレビュー観点に追加（#70） =="
+
+# ponytail のラダー（#69）と対になる、evaluator 側の「作らなくてよいものを作った差分」の
+# 検出観点を core/roles/evaluator.md と core/instructions.md に規定する。
+# core/instructions.md は agents/*.md と codex-agents/*.toml の全ファイルに反映される。
+
+DOC70_EVALUATOR_ROLE="${REPO_ROOT}/core/roles/evaluator.md"
+DOC70_INSTRUCTIONS="${REPO_ROOT}/core/instructions.md"
+DOC70_AGENT_EVALUATOR="${REPO_ROOT}/agents/evaluator.md"
+DOC70_CODEX_AGENT_EVALUATOR="${REPO_ROOT}/codex-agents/evaluator.toml"
+
+# --- core/roles/evaluator.md のレビューチェックリストに「過剰実装・過剰設計」の小節がある ---
+
+if grep -Fq '#### 過剰実装・過剰設計' "$DOC70_EVALUATOR_ROLE"; then
+  pass "core/roles/evaluator.md: レビューチェックリストに「過剰実装・過剰設計」の小節がある（#70）"
+else
+  fail "core/roles/evaluator.md: レビューチェックリストに「過剰実装・過剰設計」の小節がある（#70）"
+fi
+
+# --- チェックリストに「削ってはいけないものを削っていないか」の項目が含まれている ---
+
+if grep -Fq 'テスト・回帰確認・検証・セキュリティ・データ損失の扱いを「削減」していないか' "$DOC70_EVALUATOR_ROLE"; then
+  pass "core/roles/evaluator.md: 「削ってはいけないものを削っていないか」の項目が含まれている（#70）"
+else
+  fail "core/roles/evaluator.md: 「削ってはいけないものを削っていないか」の項目が含まれている（#70）"
+fi
+
+# --- core/instructions.md のレビュー基準に、過剰実装・過剰設計の重要度の当てはめが明記されている ---
+
+if grep -Fq '過剰実装・過剰設計の重要度の当てはめ' "$DOC70_INSTRUCTIONS" \
+  && grep -Fq '仕様・Task issue に無い機能を足している（明確な仕様逸脱） | high' "$DOC70_INSTRUCTIONS" \
+  && grep -Fq '重複実装・不要な抽象化・自前実装で済ませられた標準機能の再実装 | medium' "$DOC70_INSTRUCTIONS" \
+  && grep -Fq '好みの範囲の簡潔さ（1行にできた等） | low' "$DOC70_INSTRUCTIONS"; then
+  pass "core/instructions.md: レビュー基準に過剰実装・過剰設計の重要度の当てはめが明記されている（#70）"
+else
+  fail "core/instructions.md: レビュー基準に過剰実装・過剰設計の重要度の当てはめが明記されている（#70）"
+fi
+
+# --- 生成物（agents/evaluator.md・codex-agents/evaluator.toml）に反映されている ---
+
+if [ -f "$DOC70_AGENT_EVALUATOR" ] \
+  && grep -Fq '#### 過剰実装・過剰設計' "$DOC70_AGENT_EVALUATOR" \
+  && grep -Fq '過剰実装・過剰設計の重要度の当てはめ' "$DOC70_AGENT_EVALUATOR"; then
+  pass "agents/evaluator.md: 正本の「過剰実装・過剰設計」追記内容が反映されている（#70）"
+else
+  fail "agents/evaluator.md: 正本の「過剰実装・過剰設計」追記内容が反映されている（#70）" \
+    "見つかりません: ${DOC70_AGENT_EVALUATOR}"
+fi
+
+if [ -f "$DOC70_CODEX_AGENT_EVALUATOR" ] \
+  && grep -Fq '#### 過剰実装・過剰設計' "$DOC70_CODEX_AGENT_EVALUATOR" \
+  && grep -Fq '過剰実装・過剰設計の重要度の当てはめ' "$DOC70_CODEX_AGENT_EVALUATOR"; then
+  pass "codex-agents/evaluator.toml: 正本の「過剰実装・過剰設計」追記内容が反映されている（#70）"
+else
+  fail "codex-agents/evaluator.toml: 正本の「過剰実装・過剰設計」追記内容が反映されている（#70）" \
+    "見つかりません: ${DOC70_CODEX_AGENT_EVALUATOR}"
+fi
+
+# ---------------------------------------------------------------------------
 # 結果集計
 # ---------------------------------------------------------------------------
 
