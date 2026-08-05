@@ -335,6 +335,51 @@ codex plugin marketplace upgrade <marketplace-name>
 2. そのコミットSHAを `.claude-plugin/marketplace.json` と
    `.agents/plugins/marketplace.json` の**両方**に書いてコミット・push
 
+### 3.7. 任意依存の外部 MCP ツール（Epic #66）
+
+context7（generator のみ）・code-review-graph（evaluator のみ）は**任意依存**として結線している
+（決定は Epic #66 本文、実測は `docs/optional-mcp-tools.md` を参照）。設定場所と絞り込みの
+「粒度」は Claude / Codex で異なるが、「どのエージェントに使えるか」という**結果は一致**しており、
+機能差は無い。
+
+#### 3.7.1. 設定場所の違い
+
+| 項目 | Claude Code | Codex |
+| --- | --- | --- |
+| サーバー宣言 | `.claude-plugin/plugin.json` の `mcpServers`（セッション全体に1回宣言） | `adapters/codex/overlays/<role>.toml` の `[mcp_servers.<name>]`（結線したいエージェントのTOMLにだけ個別に書く。`.codex-plugin/plugin.json` には宣言しない） |
+| エージェントへの絞り込み | サブエージェント frontmatter の `tools:` allowlist（ツール単位。例: `mcp__plugin_dev-workflow_context7__resolve-library-id`） | エージェントTOMLの `mcp_servers` キー自体の有無（サーバー単位。省略時は親セッションから継承） |
+| 絞り込みの粒度 | **ツール単位**（context7 の2ツールを個別に列挙できる） | **サーバー単位**（ツール名での限定は不可。TOMLキー自体を書くか書かないかの二択） |
+
+#### 3.7.2. 機能差の有無
+
+**絞り込みの粒度は異なるが、機能差は無い。** 理由は次の2点。
+
+1. Claude Code 側で `tools:` に列挙していないサブエージェントは、サーバーがセッション全体に
+   宣言されていても当該ツールを呼べない（実測は `docs/optional-mcp-tools.md` 参照）。
+   これは「セッション全体宣言＋ツール単位限定」で `generator にのみ使える` という結果を作る
+2. Codex 側は `mcp_servers` をエージェントTOMLに個別に書くことで、そのエージェントにだけ
+   サーバーを渡せる（`.codex-plugin/plugin.json` に宣言しなければ、キーを書いていない
+   planner/evaluator には一切渡らない）。context7 はツールが2つしか無いため、
+   サーバー単位の限定でも実質的にツール単位限定と同じ結果になる
+
+したがって「context7 は generator にのみ、code-review-graph は evaluator にのみ使える」という
+**結果**は両CLIで一致する（決定6・決定4）。詳細な実装は `core/roles/generator.md`
+「Phase 3（#71）: context7 の結線方式（Claude / Codex の差分）」節、および
+`core/roles/generator.md` 「Phase 4: code-review-graph の結線（#73）」節を参照（正本はそちら）。
+
+#### 3.7.3. 同等にできない箇所とその理由・回避策
+
+**Codex にはツール単位のallowlist機構が無い**（3.3.2の`tools:`対応表のとおり）。
+仮に code-review-graph のように1サーバーに30ツールあるケースで「特定の数ツールだけ渡したい」
+という要求が生じても、Codex 側はサーバー単位でしか絞り込めない（回避策なし。上流の
+`mcp_servers.<id>.enabled_tools` 相当の機構が追加されない限り原理的に不可能）。
+
+今回結線した2ツールはこの限界の影響を受けない。context7 はツールが2個しか無く実質的に
+サーバー単位＝ツール単位が一致し、code-review-graph は「evaluatorに全30ツールを一括で渡す」
+という設計（`core/roles/generator.md` 参照。恣意的に間引かない方針）のため、そもそも
+ツール単位の絞り込みを必要としない。**将来、1サーバーの一部ツールだけをエージェントに
+渡したいケースが出た場合は、Codex 側では実現できないことを設計時点で確認すること。**
+
 ---
 
 ## 4. dev-workflowの改修設計

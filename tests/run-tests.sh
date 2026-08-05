@@ -6294,13 +6294,13 @@ DOC55_README="${REPO_ROOT}/README.md"
 DOC55_AGENT_GENERATOR="${REPO_ROOT}/agents/generator.md"
 DOC55_CODEX_AGENT_GENERATOR="${REPO_ROOT}/codex-agents/generator.toml"
 
-# --- 両 plugin.json のバージョンが 0.13.0 で一致している ---
+# --- 両 plugin.json のバージョンが 0.14.0 で一致している（#77でv0.13.0から更新） ---
 
 DOC55_CLAUDE_VERSION="$(grep -m1 '"version"' "$DOC55_CLAUDE_PLUGIN_JSON" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+')"
 DOC55_CODEX_VERSION="$(grep -m1 '"version"' "$DOC55_CODEX_PLUGIN_JSON" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+')"
 
-assert_eq ".claude-plugin/plugin.json のバージョンが0.13.0である" "0.13.0" "$DOC55_CLAUDE_VERSION"
-assert_eq ".codex-plugin/plugin.json のバージョンが0.13.0である" "0.13.0" "$DOC55_CODEX_VERSION"
+assert_eq ".claude-plugin/plugin.json のバージョンが0.14.0である" "0.14.0" "$DOC55_CLAUDE_VERSION"
+assert_eq ".codex-plugin/plugin.json のバージョンが0.14.0である" "0.14.0" "$DOC55_CODEX_VERSION"
 assert_eq "両plugin.jsonのバージョンが一致している" "$DOC55_CLAUDE_VERSION" "$DOC55_CODEX_VERSION"
 
 # --- core/instructions.md に watchdog の3点の記述がある ---
@@ -7390,6 +7390,103 @@ if grep -Fq '外す判断基準' "$RAT_DOC" \
   pass "docs/optional-mcp-tools.md: 「外す判断基準」が明記されている（#76）"
 else
   fail "docs/optional-mcp-tools.md: 「外す判断基準」が明記されている（#76）"
+fi
+
+# ---------------------------------------------------------------------------
+# ドキュメント更新・v0.14.0・両アダプタ再生成（#77）
+# ---------------------------------------------------------------------------
+
+echo "== ドキュメント更新・v0.14.0・両アダプタ再生成（#77） =="
+
+DOC77_CLAUDE_PLUGIN_JSON="${REPO_ROOT}/.claude-plugin/plugin.json"
+DOC77_CODEX_PLUGIN_JSON="${REPO_ROOT}/.codex-plugin/plugin.json"
+DOC77_README="${REPO_ROOT}/README.md"
+DOC77_GUIDE="${REPO_ROOT}/docs/dev-workflow-multi-vendor-guide.md"
+
+# --- 両 plugin.json の version が一致している（片方だけ上がる事故の検出。値そのものは固定しない） ---
+
+DOC77_CLAUDE_VERSION="$(grep -m1 '"version"' "$DOC77_CLAUDE_PLUGIN_JSON" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+')"
+DOC77_CODEX_VERSION="$(grep -m1 '"version"' "$DOC77_CODEX_PLUGIN_JSON" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+')"
+
+if [ -n "$DOC77_CLAUDE_VERSION" ] && [ "$DOC77_CLAUDE_VERSION" = "$DOC77_CODEX_VERSION" ]; then
+  pass ".claude-plugin/plugin.json と .codex-plugin/plugin.json の version が一致している（#77）"
+else
+  fail ".claude-plugin/plugin.json と .codex-plugin/plugin.json の version が一致している（#77）" \
+    "claude=[${DOC77_CLAUDE_VERSION}] codex=[${DOC77_CODEX_VERSION}]"
+fi
+
+assert_eq "両plugin.jsonのversionが0.14.0である（#77）" "0.14.0" "$DOC77_CLAUDE_VERSION"
+
+# --- README.md に「任意依存の外部ツール」節があり、4点（任意依存・未導入時の挙動・入れ方・外す基準）が書かれている ---
+
+if grep -Fq '## 任意依存の外部ツール' "$DOC77_README"; then
+  pass "README.md: 「任意依存の外部ツール」節がある（#77）"
+else
+  fail "README.md: 「任意依存の外部ツール」節がある（#77）"
+fi
+
+if grep -Fq '必須依存ではありません' "$DOC77_README"; then
+  pass "README.md: 任意依存であり必須依存ではない旨が明記されている（#77）"
+else
+  fail "README.md: 任意依存であり必須依存ではない旨が明記されている（#77）"
+fi
+
+if grep -Fq 'context7 で確認しません' "$DOC77_README" && grep -Fq 'blast radius' "$DOC77_README" \
+  && grep -Fq 'Phase 単位に分割' "$DOC77_README"; then
+  pass "README.md: 未導入時にcontext7/code-review-graphがどう動かないかが明記されている（#77）"
+else
+  fail "README.md: 未導入時にcontext7/code-review-graphがどう動かないかが明記されている（#77）"
+fi
+
+# --- README に「未導入でも従来どおり動く」旨の記述がある ---
+
+if grep -Fq '入れなくても dev-workflow は従来どおり動作します' "$DOC77_README" \
+  || grep -Fq 'いずれもワークフローを止めません' "$DOC77_README"; then
+  pass "README.md: 「未導入でも従来どおり動く」旨の記述がある（#77）"
+else
+  fail "README.md: 「未導入でも従来どおり動く」旨の記述がある（#77）"
+fi
+
+if grep -Fq 'optional-mcp-tools.md' "$DOC77_README"; then
+  pass "README.md: 入れ方としてdocs/optional-mcp-tools.mdを参照している（#77）"
+else
+  fail "README.md: 入れ方としてdocs/optional-mcp-tools.mdを参照している（#77）"
+fi
+
+if grep -Fq '外す判断基準' "$DOC77_README"; then
+  pass "README.md: 「外す判断基準」への参照がある（#77）"
+else
+  fail "README.md: 「外す判断基準」への参照がある（#77）"
+fi
+
+# --- README.md に ponytail のラダー・出典（MIT）・テスト対象外の旨が書かれている ---
+
+if grep -Fq 'DietrichGebert/ponytail' "$DOC77_README" && grep -Fq 'MIT' "$DOC77_README" \
+  && grep -Fq '7段の判断ラダー' "$DOC77_README"; then
+  pass "README.md: ponytailのラダーと出典（MIT）が明記されている（#77）"
+else
+  fail "README.md: ponytailのラダーと出典（MIT）が明記されている（#77）"
+fi
+
+if grep -Fq 'テスト・回帰確認・検証・セキュリティは削減対象外' "$DOC77_README"; then
+  pass "README.md: テスト・検証・安全性は削減対象外である旨が明記されている（#77）"
+else
+  fail "README.md: テスト・検証・安全性は削減対象外である旨が明記されている（#77）"
+fi
+
+# --- docs/dev-workflow-multi-vendor-guide.md にClaude/Codex双方の任意依存の扱いが書かれている ---
+
+if grep -Fq '任意依存の外部 MCP ツール' "$DOC77_GUIDE" \
+  && grep -Fq 'ツール単位' "$DOC77_GUIDE" && grep -Fq 'サーバー単位' "$DOC77_GUIDE"; then
+  pass "docs/dev-workflow-multi-vendor-guide.md: Claude/Codexの設定場所の違いが書かれている（#77）"
+else
+  fail "docs/dev-workflow-multi-vendor-guide.md: Claude/Codexの設定場所の違いが書かれている（#77）"
+fi
+
+if grep -Fq '機能差は無い' "$DOC77_GUIDE" && grep -Fq '同等にできない箇所' "$DOC77_GUIDE"; then
+  pass "docs/dev-workflow-multi-vendor-guide.md: 機能差の有無と同等にできない箇所の理由・回避策が書かれている（#77）"
+else
+  fail "docs/dev-workflow-multi-vendor-guide.md: 機能差の有無と同等にできない箇所の理由・回避策が書かれている（#77）"
 fi
 
 # ---------------------------------------------------------------------------

@@ -61,6 +61,21 @@ claude --plugin-dir /path/to/dev-workflow
 - **`gh auth setup-git`** — gitの認証をgh CLIに委任し、push/PR作成時のアカウント選択ポップアップを防止
 - **Docker起動チェック** — Docker デーモンが未起動の場合にブロック
 
+## 任意依存の外部ツール
+
+dev-workflow は2つの外部 MCP ツール（context7 / code-review-graph）を**任意依存**として利用します。
+**必須依存ではありません。入れなくても dev-workflow は従来どおり動作します。**
+
+| ツール | 結線先 | 未導入時の挙動 |
+|---|---|---|
+| [context7](https://github.com/upstash/context7)（MIT） | generator のみ | generator はライブラリ API を context7 で確認しません。推測に頼らず、既存利用箇所・公式ドキュメントで確認する従来どおりの手順になります |
+| [code-review-graph](https://github.com/tirth8205/code-review-graph)（MIT） | evaluator のみ（大規模差分のみ） | evaluator は blast radius（影響範囲）を使った優先順位付けをしません。従来どおり Phase 単位に分割してレビューする手順になります |
+
+**いずれもワークフローを止めません。** テスト・レビューはツールの有無に関わらず従来どおり完走します。
+
+- **入れ方**: 導入手順・結線方式の実測結果・MCPツール名は [`docs/optional-mcp-tools.md`](docs/optional-mcp-tools.md) が正本です（README では二重管理しません）
+- **効かなければ外す判断基準**: `docs/optional-mcp-tools.md` の「外す判断基準」節を参照してください。複数 Epic を通してトークン消費が減らず、レビュー品質の向上も観測できない場合は結線を外してかまいません
+
 ## Docker sandbox のセットアップ
 
 プロジェクトルートに開発用Dockerfileを配置してください:
@@ -128,6 +143,12 @@ services:
 | **planner** (紫) | 仕様ヒアリング・計画・issue管理 | Opus | 書き込み可 |
 | **generator** (青) | Docker sandbox内でコード実装・テスト | Sonnet | worktree隔離 + Docker |
 | **evaluator** (緑) | Epic完了時に全差分を一括レビュー | Opus | 読み取り専用 + Docker |
+
+generator は実装コードに手を付ける前に、`DietrichGebert/ponytail`（MIT）に由来する7段の判断ラダー
+（存在する必要があるか → コードベースに既にあるか → 標準ライブラリ → プラットフォーム標準機能 →
+導入済みの依存 → 1行で書けるか → 最小限の実装）で「作るべきか・再利用すべきか」を判定します。
+**テスト・回帰確認・検証・セキュリティは削減対象外**で、ラダーは実装コードにのみ適用され、
+これらを省く理由には使われません。
 
 ## ワークフロー
 
