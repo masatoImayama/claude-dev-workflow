@@ -55,6 +55,24 @@ assert_exit_code() {
   fi
 }
 
+assert_no_hang() {
+  # assert_no_hang <説明> <期待する終了コード> <実際の終了コード> <実際のstderr(またはstdout+stderr)> <stderrに含まれるべき文字列>
+  #
+  # 「無限ループしない（ハングしない）」ことを検証するテストは `timeout` でコマンドを
+  # 打ち切って回帰を防ぐが、timeout がタイムアウト時に返す終了コードは環境依存
+  # （GNU coreutils=124, BusyBox=143 など SIGTERM由来の 128+シグナル番号）であり、
+  # 「タイムアウトで打ち切られた（=ハングしたまま殺された）」ことを終了コードだけで
+  # 判定できない。ハングした場合はエラーメッセージも出力されないため、
+  # 「期待する終了コードちょうどであること」と「期待するエラーメッセージが出ていること」の
+  # 両方を assert することで、ハング（timeoutによる強制終了）を確実に不合格にする。
+  local desc="$1" expected_exit="$2" actual_exit="$3" actual_output="$4" expected_msg="$5"
+  if [ "$actual_exit" -eq "$expected_exit" ] && printf '%s' "$actual_output" | grep -Fq -- "$expected_msg"; then
+    pass "$desc"
+  else
+    fail "$desc" "expected exit=${expected_exit}（メッセージに[${expected_msg}]を含む） actual exit=${actual_exit} output=[${actual_output}]"
+  fi
+}
+
 # ---------------------------------------------------------------------------
 # 一時 git リポジトリ / worktree を組み立てるヘルパ。
 # 後続タスク（epic worktree / agent worktree / リポジトリ外 worktree のケース追加）で再利用する。
@@ -277,7 +295,9 @@ fi
 
 # --- --epic に値が無いまま渡された場合は無限ループせず明快なエラーで停止する ---
 # shift 2 が失敗して $# が減らないまま while ループが回り続ける不具合があった
-# （実測: timeout 8 bash scripts/sandbox-exec.sh --epic は exit 124 だった）。
+# （実測: timeout 8 bash scripts/sandbox-exec.sh --epic は exit 124 だった。
+# ただし sandbox 内の BusyBox timeout は exit 143 を返すため、終了コードのみでは
+# 「ハングして timeout に強制終了させられた」ことを判定できない。詳細は assert_no_hang 参照）。
 if command -v timeout >/dev/null 2>&1; then
   EPIC_NO_VALUE_STDERR="$(
     cd "$PRINT_PLAN_REPO" || exit 1
@@ -285,18 +305,8 @@ if command -v timeout >/dev/null 2>&1; then
   )"
   EPIC_NO_VALUE_EXIT=$?
 
-  if [ "$EPIC_NO_VALUE_EXIT" -eq 124 ]; then
-    fail "--epic に値が無い場合は無限ループしない" "timeout（exit 124）で停止しました"
-  elif [ "$EPIC_NO_VALUE_EXIT" -eq 0 ]; then
-    fail "--epic に値が無い場合は非0で終了する" "exit=0"
-  else
-    pass "--epic に値が無い場合は無限ループせず非0で終了する"
-  fi
-
-  case "$EPIC_NO_VALUE_STDERR" in
-    *"--epic"*) pass "--epic に値が無い場合のエラーに --epic の記載がある" ;;
-    *) fail "--epic に値が無い場合のエラーに --epic の記載がある" "stderr=[${EPIC_NO_VALUE_STDERR}]" ;;
-  esac
+  assert_no_hang "--epic に値が無い場合は無限ループせず exit 2 かつ --epic の記載があるエラーで停止する" \
+    2 "$EPIC_NO_VALUE_EXIT" "$EPIC_NO_VALUE_STDERR" "--epic には値が必要です"
 else
   skip "--epic に値が無い場合は無限ループせず明快なエラーで停止する" "timeout コマンドが利用できません"
 fi
@@ -7437,7 +7447,9 @@ assert_exit_code "record-agent-tokens.sh record: 必須オプション欠落は�
 # bash の `shift 2` は $# が2未満のとき何もせず非0を返す。値なしでオプション名だけが
 # 末尾に置かれた場合にこれを検出しないと while ループが同じ分岐を回り続けてハングする
 # 不具合があった（実測: timeout 5 bash record-agent-tokens.sh record --epic 66 --role
-# generator --mode impl --tokens は exit 124 だった）。「必須オプション欠落」テスト（直上）
+# generator --mode impl --tokens は exit 124 だった。ただし sandbox 内の BusyBox timeout
+# は exit 143 を返すため、終了コードのみでは「ハングして timeout に強制終了させられた」
+# ことを判定できない。詳細は assert_no_hang 参照）。「必須オプション欠落」テスト（直上）
 # はオプションを丸ごと省く形なのでこのケースを通り抜けていた。cmd_record の全オプション
 # （--epic/--role/--mode/--tokens/--note）を、他は有効な値を与えたまま1つだけ末尾で
 # 値なしにする形で網羅する。
@@ -7462,30 +7474,16 @@ if command -v timeout >/dev/null 2>&1; then
       timeout 5 bash "$RAT_SCRIPT" "${RAT_NOVAL_ARGS[@]}" 2>&1)"
     RAT_NOVAL_EXIT=$?
 
-    if [ "$RAT_NOVAL_EXIT" -eq 124 ]; then
-      fail "record-agent-tokens.sh record: ${RAT_NOVAL_OPT}が末尾で値なしでも無限ループしない（#79）" \
-        "timeout（exit 124）で停止しました"
-    elif [ "$RAT_NOVAL_EXIT" -eq 0 ]; then
-      fail "record-agent-tokens.sh record: ${RAT_NOVAL_OPT}が末尾で値なしの場合は非0終了する（#79）" \
-        "exit=0 out=${RAT_NOVAL_OUT}"
-    else
-      pass "record-agent-tokens.sh record: ${RAT_NOVAL_OPT}が末尾で値なしでも無限ループせず非0終了する（#79）"
-    fi
+    assert_no_hang "record-agent-tokens.sh record: ${RAT_NOVAL_OPT}が末尾で値なしでも無限ループせず exit 2 かつエラーメッセージを出す（#79）" \
+      2 "$RAT_NOVAL_EXIT" "$RAT_NOVAL_OUT" "${RAT_NOVAL_OPT} に値がありません"
   done
 
   RAT_SUMMARY_NOVAL_OUT="$(DEV_WORKFLOW_AGENT_TOKENS_FILE="$RAT_FILE" \
     timeout 5 bash "$RAT_SCRIPT" --summary --epic 2>&1)"
   RAT_SUMMARY_NOVAL_EXIT=$?
 
-  if [ "$RAT_SUMMARY_NOVAL_EXIT" -eq 124 ]; then
-    fail "record-agent-tokens.sh --summary: --epicが末尾で値なしでも無限ループしない（#79）" \
-      "timeout（exit 124）で停止しました"
-  elif [ "$RAT_SUMMARY_NOVAL_EXIT" -eq 0 ]; then
-    fail "record-agent-tokens.sh --summary: --epicが末尾で値なしの場合は非0終了する（#79）" \
-      "exit=0 out=${RAT_SUMMARY_NOVAL_OUT}"
-  else
-    pass "record-agent-tokens.sh --summary: --epicが末尾で値なしでも無限ループせず非0終了する（#79）"
-  fi
+  assert_no_hang "record-agent-tokens.sh --summary: --epicが末尾で値なしでも無限ループせず exit 2 かつエラーメッセージを出す（#79）" \
+    2 "$RAT_SUMMARY_NOVAL_EXIT" "$RAT_SUMMARY_NOVAL_OUT" "--epic に値がありません"
 else
   skip "record-agent-tokens.sh: 末尾に値の無いオプションでも無限ループしない（#79）" "timeout コマンドが利用できません"
 fi
