@@ -30,6 +30,31 @@ lf に固定されていません。Windows で生成した .sh が CRLF のま�
 MSG
 }
 
+optional_tools_notice() {
+  # optional_tools_notice
+  # 任意ツール（context7 / code-review-graph）の導入状況を非ブロッキングで通知する。
+  # docs/optional-mcp-tools.md「## 対象ツール」節に記録した起動コマンドの先頭コマンド名
+  # （context7: npx / code-review-graph: code-review-graph）の有無を command -v で判定する。
+  # 両方とも利用可能なら何も出力しない（黙って通す）。エラーとして扱わないため、
+  # 呼び出し側は errors 配列に追加してはならない（exit 2 を返さない）。
+  local missing_context7=0 missing_code_review_graph=0
+  command -v npx &> /dev/null || missing_context7=1
+  command -v code-review-graph &> /dev/null || missing_code_review_graph=1
+
+  [ "$missing_context7" -eq 0 ] && [ "$missing_code_review_graph" -eq 0 ] && return 0
+
+  echo "[dev-workflow] 情報: 任意ツールが未導入です（未導入でも dev-workflow は従来どおり動作します）:"
+  if [ "$missing_context7" -eq 1 ]; then
+    echo "  - context7: 未導入です。generator は未知のライブラリ・バージョン依存APIの確認に"
+    echo "    context7 を使わず、従来どおり（リポジトリ内の既存利用箇所・公式ドキュメントの確認）で動作します。"
+  fi
+  if [ "$missing_code_review_graph" -eq 1 ]; then
+    echo "  - code-review-graph: 未導入です。evaluator は大規模差分（変更50ファイル超）でも"
+    echo "    blast radius の算出を使わず、従来どおり Phase 単位に分割してレビューします。"
+  fi
+  echo "  導入方法は docs/optional-mcp-tools.md を参照してください。"
+}
+
 if [ "${BASH_SOURCE[0]}" != "${0}" ]; then
   return 0
 fi
@@ -82,6 +107,13 @@ if git rev-parse --is-inside-work-tree &> /dev/null 2>&1; then
   if [ -n "$crlf_warning" ]; then
     echo "$crlf_warning" >&2
   fi
+fi
+
+# 任意ツール（context7 / code-review-graph）の未導入通知（非ブロッキング。Epic #66 Phase 1 / #68）。
+# crlf_warning_message と同じ作法: errors 配列には絶対に追加しない。
+optional_tools="$(optional_tools_notice)"
+if [ -n "$optional_tools" ]; then
+  echo "$optional_tools" >&2
 fi
 
 # エラーがあればブロック

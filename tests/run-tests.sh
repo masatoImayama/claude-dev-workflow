@@ -2034,6 +2034,123 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+# optional_tools_notice（任意ツールの非ブロッキング検出、Epic #66 Phase1・Task #68）
+#
+# context7 / code-review-graph の導入状況（docs/optional-mcp-tools.md「## 対象ツール」節の
+# 起動コマンドの先頭コマンド名: npx / code-review-graph）を command -v で判定する純粋関数。
+# crlf_warning_message と同じく check-prerequisites.sh を source して単体テストする。
+# ---------------------------------------------------------------------------
+
+echo "== optional_tools_notice（任意ツールの非ブロッキング検出。Task #68） =="
+
+make_tool_stub_dir() {
+  # make_tool_stub_dir <ツール名...>  指定した名前の実行可能スタブだけを持つ一時ディレクトリを作る。
+  local dir tool
+  dir="$(mktemp -d "${TMPDIR:-/tmp}/dw-test-optional-tools.XXXXXX")"
+  for tool in "$@"; do
+    cat > "${dir}/${tool}" <<'STUB'
+#!/bin/bash
+exit 0
+STUB
+    chmod +x "${dir}/${tool}"
+  done
+  printf '%s' "$dir"
+}
+
+optional_tools_notice_with_path() {
+  # optional_tools_notice_with_path <PATH>
+  # 指定した PATH だけを使って optional_tools_notice を呼び出し、標準出力を返す（stderr は捨てる）。
+  # 関数内部は command -v の判定しか行わないため、PATH をこのスタブだけに絞っても安全。
+  local fake_path="$1"
+  (
+    # shellcheck source=../scripts/check-prerequisites.sh
+    source "$CHECK_PREREQS_SCRIPT"
+    PATH="$fake_path" optional_tools_notice
+  ) 2>/dev/null
+}
+
+# --- 両方とも利用可能な環境では何も出力しない ---
+OPT_TOOLS_BOTH_DIR="$(make_tool_stub_dir npx code-review-graph)"
+OPT_TOOLS_BOTH_NOTICE="$(optional_tools_notice_with_path "$OPT_TOOLS_BOTH_DIR")"
+assert_eq "context7 / code-review-graph が両方利用可能なら何も出力しない" "" "$OPT_TOOLS_BOTH_NOTICE"
+
+# --- context7 のみ未導入な環境では、context7 と「従来どおり」を含む警告を返す ---
+OPT_TOOLS_NO_CONTEXT7_DIR="$(make_tool_stub_dir code-review-graph)"
+OPT_TOOLS_NO_CONTEXT7_NOTICE="$(optional_tools_notice_with_path "$OPT_TOOLS_NO_CONTEXT7_DIR")"
+
+case "$OPT_TOOLS_NO_CONTEXT7_NOTICE" in
+  *"context7"*) pass "context7 未導入時、警告に context7 という文字列が含まれる" ;;
+  *) fail "context7 未導入時、警告に context7 という文字列が含まれる" "notice=[${OPT_TOOLS_NO_CONTEXT7_NOTICE}]" ;;
+esac
+
+case "$OPT_TOOLS_NO_CONTEXT7_NOTICE" in
+  *"従来どおり"*) pass "context7 未導入時、警告に『従来どおり』の文言が含まれる" ;;
+  *) fail "context7 未導入時、警告に『従来どおり』の文言が含まれる" "notice=[${OPT_TOOLS_NO_CONTEXT7_NOTICE}]" ;;
+esac
+
+case "$OPT_TOOLS_NO_CONTEXT7_NOTICE" in
+  *"code-review-graph"*) fail "context7 のみ未導入なら code-review-graph には言及しない" "notice=[${OPT_TOOLS_NO_CONTEXT7_NOTICE}]" ;;
+  *) pass "context7 のみ未導入なら code-review-graph には言及しない" ;;
+esac
+
+# --- code-review-graph のみ未導入な環境でも同様（片方が未導入なら未導入分だけ列挙する） ---
+OPT_TOOLS_NO_CRG_DIR="$(make_tool_stub_dir npx)"
+OPT_TOOLS_NO_CRG_NOTICE="$(optional_tools_notice_with_path "$OPT_TOOLS_NO_CRG_DIR")"
+
+case "$OPT_TOOLS_NO_CRG_NOTICE" in
+  *"code-review-graph"*) pass "code-review-graph 未導入時、警告に code-review-graph という文字列が含まれる" ;;
+  *) fail "code-review-graph 未導入時、警告に code-review-graph という文字列が含まれる" "notice=[${OPT_TOOLS_NO_CRG_NOTICE}]" ;;
+esac
+
+case "$OPT_TOOLS_NO_CRG_NOTICE" in
+  *"従来どおり"*) pass "code-review-graph 未導入時、警告に『従来どおり』の文言が含まれる" ;;
+  *) fail "code-review-graph 未導入時、警告に『従来どおり』の文言が含まれる" "notice=[${OPT_TOOLS_NO_CRG_NOTICE}]" ;;
+esac
+
+# --- 両方未導入でも check-prerequisites.sh 全体の終了コードは 2 にならない ---
+#
+# 他の必須依存（gh/docker）は満たされている前提を再現するため、CRLF警告テストと同じ
+# 偽 gh / 偽 docker を使う。npx / code-review-graph が「未導入」であることを環境非依存で
+# 保証するため、実際の $PATH からこの2つの実行ファイルを含むディレクトリだけを取り除いた
+# PATH を組み立てる（git / sed / cat / grep 等、他に必要な外部コマンドはそのまま残す）。
+strip_optional_tools_from_path() {
+  local dir out=""
+  local IFS=':'
+  for dir in $PATH; do
+    if [ -x "${dir}/npx" ] || [ -x "${dir}/code-review-graph" ]; then
+      continue
+    fi
+    out="${out:+${out}:}${dir}"
+  done
+  printf '%s' "$out"
+}
+
+OPT_TOOLS_STRIPPED_PATH="$(strip_optional_tools_from_path)"
+OPT_TOOLS_FULL_STDERR="$(mktemp "${TMPDIR:-/tmp}/dw-test-optional-tools-full-stderr.XXXXXX")"
+OPT_TOOLS_FULL_EXIT=0
+(
+  cd "$CRLF_WITHATTR_REPO" || exit 1
+  HOME="$CRLF_FAKE_HOME" PATH="${CRLF_FAKE_BIN_DIR}:${OPT_TOOLS_STRIPPED_PATH}" \
+    bash "$CHECK_PREREQS_SCRIPT" 1>/dev/null 2>"$OPT_TOOLS_FULL_STDERR"
+) || OPT_TOOLS_FULL_EXIT=$?
+
+assert_exit_code "context7 / code-review-graph が両方未導入でも exit 0（ブロックしない）" 0 "$OPT_TOOLS_FULL_EXIT"
+
+if grep -q "任意ツールが未導入です" "$OPT_TOOLS_FULL_STDERR"; then
+  pass "check-prerequisites.sh 本体からも任意ツールの未導入通知が stderr に出る"
+else
+  fail "check-prerequisites.sh 本体からも任意ツールの未導入通知が stderr に出る" "stderr=[$(cat "$OPT_TOOLS_FULL_STDERR")]"
+fi
+
+# --- errors 配列に context7 / code-review-graph という文字列が追加されていないこと（静的検査） ---
+if grep -n "errors+=" "$CHECK_PREREQS_SCRIPT" | grep -qiE "context7|code-review-graph"; then
+  fail "errors 配列に任意ツール（context7 / code-review-graph）が追加されていない" \
+    "$(grep -n "errors+=" "$CHECK_PREREQS_SCRIPT" | grep -iE "context7|code-review-graph")"
+else
+  pass "errors 配列に任意ツール（context7 / code-review-graph）が追加されていない"
+fi
+
+# ---------------------------------------------------------------------------
 # check-readability.sh の非対話ハング修正（Task #10、Epic #3 仕様書 4.9）
 #
 # `--git` / `--staged` / ファイル引数が1つでもあれば stdin を一切読まない。
