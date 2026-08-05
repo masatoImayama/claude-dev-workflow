@@ -766,8 +766,15 @@ codex          # そのまま作業を継続
 ### 6.3. 完全無人で回す場合
 
 ```bash
-bash <plugin-root>/adapters/codex/run-loop.sh 123   # Epic issue 番号
+DEV_WORKFLOW_TEST_CMD='<プロジェクトの全テストコマンド>' \
+  bash <plugin-root>/adapters/codex/run-loop.sh 123   # Epic issue 番号
 ```
+
+`DEV_WORKFLOW_TEST_CMD` は**必須**（例: `DEV_WORKFLOW_TEST_CMD='bash tests/run-tests.sh'`）。
+未設定だと起動直後に `exit 1` する。既定値を置かないのは、対象テストの選定を generator に
+委ねると一部しか実行されず回帰を見逃すため（#37 の再発防止）で、統合ゲートは常にこのコマンドで
+プロジェクトの全テストを実行する。`DEV_WORKFLOW_DRY_RUN=1` で確認する場合も、必須チェックは
+DRY_RUN より前に走るため `DEV_WORKFLOW_TEST_CMD` の設定が要る。
 
 ---
 

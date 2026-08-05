@@ -831,11 +831,20 @@ Codex 側のスキルは `dev-workflow-plan` / `dev-workflow-run` / `dev-workflo
 ### 無人で回す
 
 ```bash
-bash "${CLAUDE_PLUGIN_ROOT}/adapters/codex/run-loop.sh" <Epic issue番号>
+DEV_WORKFLOW_TEST_CMD='<プロジェクトの全テストコマンド>' \
+  bash "${CLAUDE_PLUGIN_ROOT}/adapters/codex/run-loop.sh" <Epic issue番号>
 ```
 
 ループをシェル側に置き、1回の `codex exec` = 1役として起動するため、役割ごとに文脈が分離されます。
-`DEV_WORKFLOW_DRY_RUN=1` を付けると実行内容の確認だけができます。
+
+`DEV_WORKFLOW_TEST_CMD` は**必須**です（例: `DEV_WORKFLOW_TEST_CMD='bash tests/run-tests.sh'`）。
+未設定だと `run-loop.sh` は起動直後に `exit 1` します。既定値を置いていないのは、対象テストの選定を
+generator に委ねると一部しか実行されず回帰を見逃すため（#37 の再発防止）で、統合ゲートは常に
+このコマンドでプロジェクトの全テストを実行します。
+
+`DEV_WORKFLOW_DRY_RUN=1` を付けると実行内容の確認だけができますが、
+`DEV_WORKFLOW_TEST_CMD` の必須チェックは DRY_RUN より前に走るため、DRY_RUN で確認する場合も
+`DEV_WORKFLOW_TEST_CMD` は設定してください。
 
 ### Claude Code との差分
 

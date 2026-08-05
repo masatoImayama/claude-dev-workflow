@@ -4003,6 +4003,40 @@ case "$CRS_HANG_SECTION" in
     fail "SKILL.md(codex): セッション中断時にStopフックが走らずrunマーカーが残る旨の説明がある（#62）" "$CRS_HANG_SECTION" ;;
 esac
 
+# --abort が届く保証は run-loop.sh 経由の generator/evaluator セッションに限られ、
+# このスキルをセッション内で直接回す経路では依存できない旨が明記されていること（レビュー#63）
+case "$CRS_HANG_SECTION" in
+  *'run-loop.sh'*'に限られる'*)
+    pass "SKILL.md(codex): --abort が届く保証はrun-loop.sh経由のセッションに限られる旨の記述がある（#63）" ;;
+  *)
+    fail "SKILL.md(codex): --abort が届く保証はrun-loop.sh経由のセッションに限られる旨の記述がある（#63）" \
+      "$CRS_HANG_SECTION" ;;
+esac
+
+case "$CRS_HANG_SECTION" in
+  *'このスキル'*'セッション内で直接回している場合は'*'--abort'*'依存できない'*)
+    pass "SKILL.md(codex): スキルをセッション内で直接回す経路では--abortに依存できない旨の記述がある（#63）" ;;
+  *)
+    fail "SKILL.md(codex): スキルをセッション内で直接回す経路では--abortに依存できない旨の記述がある（#63）" \
+      "$CRS_HANG_SECTION" ;;
+esac
+
+case "$CRS_HANG_SECTION" in
+  *'cwd で'*'区別できず'*)
+    pass "SKILL.md(codex): メインループとサブエージェントをcwdで区別できない旨の記述がある（#63）" ;;
+  *)
+    fail "SKILL.md(codex): メインループとサブエージェントをcwdで区別できない旨の記述がある（#63）" \
+      "$CRS_HANG_SECTION" ;;
+esac
+
+case "$CRS_HANG_SECTION" in
+  *'確実に止められる唯一の手段は'*'セッションそのものを中断し'*'watchdog.sh --stop'*)
+    pass "SKILL.md(codex): スキル直接実行時の唯一の確実な打ち切り手段がセッション中断+watchdog.sh --stopである旨の記述がある（#63）" ;;
+  *)
+    fail "SKILL.md(codex): スキル直接実行時の唯一の確実な打ち切り手段がセッション中断+watchdog.sh --stopである旨の記述がある（#63）" \
+      "$CRS_HANG_SECTION" ;;
+esac
+
 # Claude Code版と挙動が同じ（アダプタ間に機能差を作らない）旨の記述が
 # ハング節・自律実行開始節のいずれかに存在すること
 CRS_FULL_SRC="$(cat "$CODEX_RUN_SKILL")"
@@ -4725,6 +4759,47 @@ HBA_WIN_EPIC_OUT="$(DEV_WORKFLOW_MARKER_ROOT="$HBA_REPO" DEV_WORKFLOW_HOOK_VENDO
 assert_exit_code "heartbeat.sh: abortフラグあり・Windows表現のepic worktreeのcwd → 拒否されない（exit 0。#60）" \
   0 $?
 assert_eq "heartbeat.sh: abortフラグあり・Windows表現のepic worktreeのcwd → 無出力（#60）" "" "$HBA_WIN_EPIC_OUT"
+
+# --- heartbeat.sh冒頭コメント: Codexのrun経路2つ（run-loop.sh経由 / スキルをセッション内で
+#     直接回す経路）を区別した記述になっていること（レビュー#63）。以前は「Codexではrun-loop.sh
+#     自体がbashスクリプトでフックの発火源ではないため、そもそもこのフックが呼ばれない」という
+#     包括的な主張をしていたが、スキル`dev-workflow-run`をセッション内で直接回す経路では
+#     メインループ自身がcodexセッションであり、この主張が成立しない。 ---
+HB_COMMENT="$(cat "$HEARTBEAT_SCRIPT")"
+
+case "$HB_COMMENT" in
+  *'codex exec -C "$EPIC_WT"'*'generator/evaluator'*)
+    pass "heartbeat.sh: .codex/worktrees/パターンがrun-loop.shのcodex exec -Cで起動するgenerator/evaluatorセッションを対象にする旨の記述がある（#63）" ;;
+  *)
+    fail "heartbeat.sh: .codex/worktrees/パターンがrun-loop.shのcodex exec -Cで起動するgenerator/evaluatorセッションを対象にする旨の記述がある（#63）" \
+      "$HB_COMMENT" ;;
+esac
+
+case "$HB_COMMENT" in
+  *'dev-workflow-run'*'セッション内で直接回す経路'*'同一セッション内'*)
+    pass "heartbeat.sh: スキルをセッション内で直接回す経路ではメインループとサブエージェントが同一セッションである旨の記述がある（#63）" ;;
+  *)
+    fail "heartbeat.sh: スキルをセッション内で直接回す経路ではメインループとサブエージェントが同一セッションである旨の記述がある（#63）" \
+      "$HB_COMMENT" ;;
+esac
+
+case "$HB_COMMENT" in
+  *'区別できるcwdの差を持たず'*)
+    pass "heartbeat.sh: スキル直接実行経路ではメインループとサブエージェントをcwdで区別できない旨の記述がある（#63）" ;;
+  *)
+    fail "heartbeat.sh: スキル直接実行経路ではメインループとサブエージェントをcwdで区別できない旨の記述がある（#63）" \
+      "$HB_COMMENT" ;;
+esac
+
+# レビュー#63以前の「Codexではフックがそもそも呼ばれない」という無限定の主張のまま
+# 放置されていないこと（スキル直接実行経路への言及なしにこの一文だけが単独で成立していると
+# 誤りになる。#63の指摘そのものの再発防止）
+if printf '%s' "$HB_COMMENT" | grep -q 'セッション内で直接回す経路'; then
+  pass "heartbeat.sh: 「Codexではフックが呼ばれない」という主張がスキル直接実行経路の言及なしに単独で残っていない（#63）"
+else
+  fail "heartbeat.sh: 「Codexではフックが呼ばれない」という主張がスキル直接実行経路の言及なしに単独で残っていない（#63）" \
+    "$HB_COMMENT"
+fi
 
 # --- watchdog.sh --abort / --clear との結合: 実際にwatchdog.shで作った/消したフラグで動く ---
 HBA_WD_SCRIPT="${REPO_ROOT}/scripts/watchdog.sh"
@@ -6234,6 +6309,131 @@ if bash "${REPO_ROOT}/adapters/codex/build.sh" --check >"$DOC55_CODEX_BUILD_CHEC
 else
   fail "adapters/codex/build.sh --check: 生成物が正本と一致している（再生成後に差分が無い）" \
     "$(cat "$DOC55_CODEX_BUILD_CHECK_LOG")"
+fi
+
+# ---------------------------------------------------------------------------
+echo "== Task issueテンプレートの「- Epic: #N」行規定（レビュー#56） =="
+
+# plan-waves.sh の load_from_gh は本文の「- Epic: #N」行で他Epicのタスクを除外する
+# （行が無ければフェイルオープンで含める）。この行がどの成果物にも規定されていないと、
+# テンプレートどおりに作った Task issue が別Epicの実行中にウェーブ計画へ混入する
+# （#39 の再発）。テンプレート・役割定義側に規定があることを固定する。
+
+DOC56_EPIC_SKILL="${REPO_ROOT}/skills/epic/SKILL.md"
+DOC56_PLANNER_ROLE="${REPO_ROOT}/core/roles/planner.md"
+DOC56_PLAN_SKILL="${REPO_ROOT}/skills/plan/SKILL.md"
+DOC56_CODEX_PLAN_SKILL="${REPO_ROOT}/skills-codex/dev-workflow-plan/SKILL.md"
+DOC56_PLAN_WAVES="${REPO_ROOT}/scripts/plan-waves.sh"
+DOC56_AGENT_PLANNER="${REPO_ROOT}/agents/planner.md"
+DOC56_CODEX_AGENT_PLANNER="${REPO_ROOT}/codex-agents/planner.toml"
+
+if grep -Fq -e '- Epic: #[epic番号]' "$DOC56_EPIC_SKILL"; then
+  pass "skills/epic/SKILL.md: Task issue本文テンプレートに「- Epic: #[epic番号]」行がある（#56）"
+else
+  fail "skills/epic/SKILL.md: Task issue本文テンプレートに「- Epic: #[epic番号]」行がある（#56）"
+fi
+
+if grep -Fq '`- Epic: #N`' "$DOC56_PLANNER_ROLE"; then
+  pass "core/roles/planner.md: 依存宣言の節に「- Epic: #N」の必須化が明記されている（#56）"
+else
+  fail "core/roles/planner.md: 依存宣言の節に「- Epic: #N」の必須化が明記されている（#56）"
+fi
+
+if grep -Fq '`- Epic: #N`' "$DOC56_PLAN_SKILL"; then
+  pass "skills/plan/SKILL.md: Task issue要件に「- Epic: #N」が明記されている（#56）"
+else
+  fail "skills/plan/SKILL.md: Task issue要件に「- Epic: #N」が明記されている（#56）"
+fi
+
+if grep -Fq '`- Epic: #N`' "$DOC56_CODEX_PLAN_SKILL"; then
+  pass "skills-codex/dev-workflow-plan/SKILL.md: Task issue要件に「- Epic: #N」が明記されている（#56）"
+else
+  fail "skills-codex/dev-workflow-plan/SKILL.md: Task issue要件に「- Epic: #N」が明記されている（#56）"
+fi
+
+if grep -Fq 'skills/epic/SKILL.md' "$DOC56_PLAN_WAVES" && grep -Fq 'Task issue テンプレート' "$DOC56_PLAN_WAVES"; then
+  pass "scripts/plan-waves.sh: ヘッダコメントが「- Epic:」行の出所をskills/epic/SKILL.mdに正しく記載している（#56）"
+else
+  fail "scripts/plan-waves.sh: ヘッダコメントが「- Epic:」行の出所をskills/epic/SKILL.mdに正しく記載している（#56）"
+fi
+
+# core/roles/planner.md の追記は adapters/*/build.sh の再生成対象であるため、
+# 生成物側にも同じ記述が反映されていることを固定する（生成漏れの検出）。
+if [ -f "$DOC56_AGENT_PLANNER" ] && grep -Fq '`- Epic: #N`' "$DOC56_AGENT_PLANNER"; then
+  pass "agents/planner.md: 正本（core/roles/planner.md）の「- Epic: #N」追記内容が反映されている（#56）"
+else
+  fail "agents/planner.md: 正本（core/roles/planner.md）の「- Epic: #N」追記内容が反映されている（#56）" \
+    "見つかりません: ${DOC56_AGENT_PLANNER}"
+fi
+
+if [ -f "$DOC56_CODEX_AGENT_PLANNER" ] && grep -Fq '`- Epic: #N`' "$DOC56_CODEX_AGENT_PLANNER"; then
+  pass "codex-agents/planner.toml: 正本の「- Epic: #N」追記内容が反映されている（#56）"
+else
+  fail "codex-agents/planner.toml: 正本の「- Epic: #N」追記内容が反映されている（#56）" \
+    "見つかりません: ${DOC56_CODEX_AGENT_PLANNER}"
+fi
+
+# ---------------------------------------------------------------------------
+echo "== DEV_WORKFLOW_TEST_CMD の必須化がREADME/ガイドに反映されている（レビュー#57） =="
+
+# adapters/codex/run-loop.sh は DEV_WORKFLOW_TEST_CMD が未設定なら exit 1 する（#37対応）。
+# この必須化が利用者向けドキュメントに反映されていないと、ドキュメントどおりに起動した
+# 利用者が原因不明の停止に見える形で失敗する。
+
+DOC57_README="${REPO_ROOT}/README.md"
+DOC57_GUIDE="${REPO_ROOT}/docs/dev-workflow-multi-vendor-guide.md"
+DOC57_RUN_LOOP="${REPO_ROOT}/adapters/codex/run-loop.sh"
+
+# run-loop.sh の必須チェックが実在し、「DRY_RUNならcodex起動をスキップする」分岐より前に
+# あることをまず固定する（ドキュメントの「DRY_RUNでも必須」という説明が実装と食い違わない
+# ようにするため）。L72 の `[ "$DRY_RUN" = "1" ] || need codex` は codex コマンドの存在確認を
+# 条件分岐しているだけで「スキップして確認だけする」分岐ではないため対象外とし、
+# 実際に処理をスキップする `if [ "$DRY_RUN" = "1" ]; then` ブロックの初出を基準にする。
+DOC57_RUN_LOOP_REQUIRED_LINE="$(grep -n 'DEV_WORKFLOW_TEST_CMD が未設定です' "$DOC57_RUN_LOOP" | head -1 | cut -d: -f1)"
+DOC57_RUN_LOOP_DRY_RUN_LINE="$(grep -n 'if \[ "\$DRY_RUN" = "1" \]; then' "$DOC57_RUN_LOOP" | head -1 | cut -d: -f1)"
+
+if [ -n "$DOC57_RUN_LOOP_REQUIRED_LINE" ] && [ -n "$DOC57_RUN_LOOP_DRY_RUN_LINE" ] \
+  && [ "$DOC57_RUN_LOOP_REQUIRED_LINE" -lt "$DOC57_RUN_LOOP_DRY_RUN_LINE" ]; then
+  pass "adapters/codex/run-loop.sh: DEV_WORKFLOW_TEST_CMD必須チェック（L${DOC57_RUN_LOOP_REQUIRED_LINE}）がDRY_RUN分岐（L${DOC57_RUN_LOOP_DRY_RUN_LINE}）より前にある（#57）"
+else
+  fail "adapters/codex/run-loop.sh: DEV_WORKFLOW_TEST_CMD必須チェックがDRY_RUN分岐より前にある（#57）" \
+    "required_line=${DOC57_RUN_LOOP_REQUIRED_LINE:-なし} dry_run_line=${DOC57_RUN_LOOP_DRY_RUN_LINE:-なし}"
+fi
+
+if grep -Fq 'DEV_WORKFLOW_TEST_CMD=' "$DOC57_README" && grep -Fq 'run-loop.sh' "$DOC57_README"; then
+  pass "README.md: 「無人で回す」のコマンド例にDEV_WORKFLOW_TEST_CMDが含まれる（#57）"
+else
+  fail "README.md: 「無人で回す」のコマンド例にDEV_WORKFLOW_TEST_CMDが含まれる（#57）"
+fi
+
+if grep -Fq '必須' "$DOC57_README" && grep -Fq 'DEV_WORKFLOW_TEST_CMD' "$DOC57_README"; then
+  pass "README.md: DEV_WORKFLOW_TEST_CMDが必須である旨の説明がある（#57）"
+else
+  fail "README.md: DEV_WORKFLOW_TEST_CMDが必須である旨の説明がある（#57）"
+fi
+
+if grep -Fq 'DRY_RUN より前に走るため' "$DOC57_README"; then
+  pass "README.md: DRY_RUNの案内にもDEV_WORKFLOW_TEST_CMDが必要である旨が明記されている（#57）"
+else
+  fail "README.md: DRY_RUNの案内にもDEV_WORKFLOW_TEST_CMDが必要である旨が明記されている（#57）"
+fi
+
+if grep -Fq 'DEV_WORKFLOW_TEST_CMD=' "$DOC57_GUIDE" && grep -Fq 'run-loop.sh' "$DOC57_GUIDE"; then
+  pass "docs/dev-workflow-multi-vendor-guide.md: 「完全無人で回す場合」のコマンド例にDEV_WORKFLOW_TEST_CMDが含まれる（#57）"
+else
+  fail "docs/dev-workflow-multi-vendor-guide.md: 「完全無人で回す場合」のコマンド例にDEV_WORKFLOW_TEST_CMDが含まれる（#57）"
+fi
+
+if grep -Fq '必須' "$DOC57_GUIDE" && grep -Fq 'DEV_WORKFLOW_TEST_CMD' "$DOC57_GUIDE"; then
+  pass "docs/dev-workflow-multi-vendor-guide.md: DEV_WORKFLOW_TEST_CMDが必須である旨の説明がある（#57）"
+else
+  fail "docs/dev-workflow-multi-vendor-guide.md: DEV_WORKFLOW_TEST_CMDが必須である旨の説明がある（#57）"
+fi
+
+if grep -Fq 'DRY_RUN' "$DOC57_GUIDE" && grep -Fq 'DRY_RUN より前' "$DOC57_GUIDE"; then
+  pass "docs/dev-workflow-multi-vendor-guide.md: DRY_RUNの案内にもDEV_WORKFLOW_TEST_CMDが必要である旨が明記されている（#57）"
+else
+  fail "docs/dev-workflow-multi-vendor-guide.md: DRY_RUNの案内にもDEV_WORKFLOW_TEST_CMDが必要である旨が明記されている（#57）"
 fi
 
 # ---------------------------------------------------------------------------
