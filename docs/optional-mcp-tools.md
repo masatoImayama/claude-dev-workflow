@@ -203,3 +203,69 @@ mcp__plugin_<plugin-name>_<server-name>__<tool-name>
 - コマンドが存在するのに応答しない状態（壊れた導入・ネットワーク未接続でのオンデマンド取得待ち等）では、
   セッション開始が最大約30秒（既定タイムアウト）遅れうる。これはセッションの起動そのものを妨げるもの
   ではなく、開始が遅れるだけで、一度きり（他のツール呼び出しの繰り返しをブロックするものではない）
+
+## Phase 4: code-review-graph の結線（#73）
+
+上記「採用方式」（方式A: 宣言方式）に従い、code-review-graph を **evaluator にのみ**結線した。
+planner / generator には与えない（Epic #66 決定4）。
+
+### 上流の起動コマンド（上流 README で確認した値）
+
+`code-review-graph serve`（`args: ["serve"]`）。ホストの `PATH` 上の `code-review-graph`
+コマンドをそのまま `command` に指定する（`pip install code-review-graph` 等で導入されていれば
+解決される。未導入なら「コマンドが見つからない」という、上記「実測結果」で確認済みの
+最も典型的な未導入ケースに落ちる）。
+
+### Claude Code側: サーバー単位のツール許可
+
+`.claude-plugin/plugin.json` の `mcpServers` に `code-review-graph` を宣言し、
+`adapters/claude/overlays/evaluator.md` の frontmatter `tools:` に
+`mcp__plugin_dev-workflow_code-review-graph`（`mcp__<server>` パターン。個別ツール名の
+`__<tool-name>` を付けずサーバー名までで止める）を追加した。これは Claude Code 公式ドキュメント
+（`sub-agents.md`）に明記された「MCPサーバー単位のパターンはサーバーの全ツールを一括で
+許可/除外する」という仕様に基づく。
+
+上流 `docs/COMMANDS.md` を確認したところ、code-review-graph のMCPツールは実際に30個
+（`#### \`...\`` 見出し30件）であり、Epic本文の記載と一致した。30個を個別に列挙せずサーバー単位で
+許可したのは、列挙の手間を惜しんだからではなく、Epic本文が明記する「ツールが多いから絞る、という
+理由で恣意的に間引かない」という方針に従い、evaluatorに全30ツールへのアクセスを一括で与えるためである
+（個別列挙してもサーバー単位許可しても、結果として与えるツールの集合は同じ30個になる）。
+
+### Codex側: エージェント単位の `mcp_servers` 宣言
+
+Codex はサブエージェント定義自体をプラグインで配布できない
+（`docs/dev-workflow-multi-vendor-guide.md` 3.3.4）。したがって `.codex-plugin/plugin.json` の
+`mcpServers`（セッション全体に効くグローバル宣言）は使わず、代わりに
+`adapters/codex/overlays/evaluator.toml` に直接 `[mcp_servers.code-review-graph]` テーブルを
+宣言した。config.toml のキー（`mcp_servers` を含む）はエージェント定義に併記でき、
+省略した場合のみ親セッションから継承される（同ガイド 3.3.2）。`planner.toml` / `generator.toml`
+には何も追加していないため、code-review-graph はグローバルにもそれらのエージェントにも渡らない。
+Claude Code側の「セッション全体に宣言し、サブエージェント単位のツール許可で絞る」方式とは
+機構が異なるが、**「evaluatorだけが使える」という結果は同じであり、機能差は無い。**
+
+Codex公式の設定リファレンス（`mcp_servers.<id>.required`）によれば、`required` を明示しない
+MCPサーバーは既定で非必須接続であり、起動できなくてもエージェントの起動をブロックしない。
+これは Claude Code側で実測した「起動失敗でもセッションが継続する」という挙動と整合する。
+ただし、この既定挙動は公式ドキュメント記載を根拠にしたものであり、Claude Code CLIのように
+実際に起動して観測してはいない（#67の実測はClaude Code CLIのみを対象にしている）。将来
+Codex側でも同様の実測を行う場合は、この記述を実測結果で更新すること。
+
+### `.gitignore`
+
+code-review-graph の生成物（SQLiteグラフDB・キャッシュ）は `.code-review-graph/` に置かれる
+（上流READMEで確認済み）。`.gitignore` に追加した。
+
+### evaluator にのみ与えることの検証
+
+`agents/planner.md` / `agents/generator.md` / `codex-agents/planner.toml` /
+`codex-agents/generator.toml` に `code-review-graph` という文字列が一切現れないことを
+`tests/run-tests.sh` で検査する。
+
+### dev-workflow 自身では発火しないのが正常
+
+code-review-graph は Tree-sitter による AST 解析が中核であり、dev-workflow 自身のロジックの大半は
+`core/*.md` と `skills/*/SKILL.md`（markdown）および bash に載っている。したがって
+**dev-workflow自身の開発では、code-review-graphの呼び出しグラフからほとんど情報が出ず、
+発火しないのが正常である。** この限界は `core/roles/evaluator.md` の
+「## 任意ツール: code-review-graph」節にも明記した。効果が出るのは dev-workflow が駆動する側の
+プロジェクト（実コードを持つプロジェクト）である。

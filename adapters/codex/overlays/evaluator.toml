@@ -40,3 +40,14 @@ developer_instructions = '''
 `verdict` / `reviewed_commit` / `findings` を含むJSONを**必ず**返すこと。
 `findings` が空でもキーを省略しない。
 '''
+
+# code-review-graph（任意依存。#73）を evaluator にのみ結線する。
+# セッション全体ではなくこのエージェント定義に限定して宣言することで、
+# planner / generator には渡さない（Claude Code版の tools: によるサーバー単位許可と同じ意図。
+# `.codex-plugin/plugin.json` には宣言しない。plugin.json はエージェント配布に対応していないため
+# （docs/dev-workflow-multi-vendor-guide.md 3.3.4参照）、この agents/*.toml 側の宣言だけで完結する）。
+# `required` を明示しない場合は既定で非必須接続なので、未導入（コマンドが見つからない）でも
+# エージェントの起動をブロックしない（公式設定リファレンス: mcp_servers.<id>.required）。
+[mcp_servers.code-review-graph]
+command = "code-review-graph"
+args = ["serve"]

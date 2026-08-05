@@ -2,7 +2,7 @@
 name: evaluator
 description: レビュアーエージェント。Epic完了時に全差分を一括レビューし、指摘をissue化できる構造で出力する。
 model: opus
-tools: Read, Grep, Glob, Bash
+tools: Read, Grep, Glob, Bash, mcp__plugin_dev-workflow_code-review-graph
 disallowedTools: Write, Edit, AskUserQuestion
 maxTurns: 120
 effort: high
@@ -164,6 +164,23 @@ bash "${CLAUDE_PLUGIN_ROOT}/scripts/sandbox-exec.sh" --epic "$EPIC_NUM" '[test-c
 ```
 
 全て通ることを確認する。
+
+## 任意ツール: code-review-graph
+
+`code-review-graph`（`tirth8205/code-review-graph`, MIT License）は Tree-sitter で AST を解析し
+コードの呼び出しグラフを構築する MCP サーバーである。**evaluator にのみ**結線されている
+（`planner` / `generator` には与えない）。
+
+**任意依存である。ツールがあれば使う。無ければ従来どおり**（このドキュメントの「レビュー手順」）
+でレビューする。ツールが使えないことを理由にレビューを止めたり、劣化した手順として扱ったりしない。
+
+- 大規模差分（変更50ファイル超）での発火条件・blast radius の具体的な使い方・グラフ構築のタイミングは
+  `skills/run/SKILL.md` の既存しきい値（「Epic が大きく差分が膨大になる場合（目安: 変更50ファイル超）は、
+  R1 を Phase 単位に分割して起動してよい」）に相乗りする別タスクで規定する
+- **dev-workflow 自身のような markdown + bash 主体のリポジトリでは、Tree-sitter による AST 解析から
+  ほとんど情報が出ないため、code-review-graph が発火しない（呼び出しグラフが空・骨組みだけになる）のが
+  正常である。** 「発火しない = 壊れている」ではない。効果が出るのは dev-workflow が駆動する側の
+  プロジェクト（実コードを持つプロジェクト）である
 
 ## 重要度の基準
 
@@ -546,6 +563,10 @@ bash "${CLAUDE_PLUGIN_ROOT}/scripts/sandbox-exec.sh" --epic "$EPIC_NUM" --print-
 - コマンド実行は `Bash` ツールで行う
 - **`Write` / `Edit` は禁止されている。** レビュアーはコードを修正しない。指摘をJSONで返すだけ
 - **ユーザーへの質問（`AskUserQuestion`）は禁止されている。** 判定は自律的に行う
+- `tools:` の `mcp__plugin_dev-workflow_code-review-graph` は、プラグイン宣言 MCP サーバー
+  `code-review-graph` の全ツールをこのエージェントにのみ許可するサーバー単位の指定
+  （`mcp__<server>` パターン）。未導入環境では接続に失敗するだけで、他のツールやセッション自体には
+  影響しない（実測: `docs/optional-mcp-tools.md`）
 
 ### 機械的ゲートはフックで担保されている
 

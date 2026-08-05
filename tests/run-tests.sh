@@ -6607,6 +6607,96 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+echo "== code-review-graph を evaluator にのみ結線する（#73） =="
+
+# Epic #66 Phase 4（#73）: #67で確定した方式Aに従い、code-review-graphをevaluatorにのみ結線する。
+# planner/generatorには一切現れないこと、未導入でも壊れないこと（.gitignore）、
+# plugin.jsonが変更後もJSONとして妥当であることを機械的に検査する。
+
+DOC73_CLAUDE_PLUGIN_JSON="${REPO_ROOT}/.claude-plugin/plugin.json"
+DOC73_GITIGNORE="${REPO_ROOT}/.gitignore"
+DOC73_EVALUATOR_ROLE="${REPO_ROOT}/core/roles/evaluator.md"
+DOC73_AGENT_EVALUATOR="${REPO_ROOT}/agents/evaluator.md"
+DOC73_AGENT_PLANNER="${REPO_ROOT}/agents/planner.md"
+DOC73_AGENT_GENERATOR="${REPO_ROOT}/agents/generator.md"
+DOC73_CODEX_AGENT_EVALUATOR="${REPO_ROOT}/codex-agents/evaluator.toml"
+DOC73_CODEX_AGENT_PLANNER="${REPO_ROOT}/codex-agents/planner.toml"
+DOC73_CODEX_AGENT_GENERATOR="${REPO_ROOT}/codex-agents/generator.toml"
+
+# --- .claude-plugin/plugin.json に code-review-graph の mcpServers エントリがある ---
+
+if grep -Fq '"code-review-graph"' "$DOC73_CLAUDE_PLUGIN_JSON" \
+  && grep -Fq '"command": "code-review-graph"' "$DOC73_CLAUDE_PLUGIN_JSON"; then
+  pass ".claude-plugin/plugin.json: mcpServers に code-review-graph のエントリがある（#73）"
+else
+  fail ".claude-plugin/plugin.json: mcpServers に code-review-graph のエントリがある（#73）"
+fi
+
+# --- .claude-plugin/plugin.json が変更後もJSONとして妥当（既存の _hj_json_syntax_ok を再利用） ---
+
+if _hj_json_syntax_ok "$DOC73_CLAUDE_PLUGIN_JSON"; then
+  pass ".claude-plugin/plugin.json: 構文として妥当（括弧の対応が取れている）（#73）"
+else
+  fail ".claude-plugin/plugin.json: 構文として妥当（括弧の対応が取れている）（#73）" \
+    "$(cat "$DOC73_CLAUDE_PLUGIN_JSON" 2>&1)"
+fi
+
+# --- .gitignore に .code-review-graph/ が追加されている ---
+
+if grep -Fq '.code-review-graph/' "$DOC73_GITIGNORE"; then
+  pass ".gitignore: .code-review-graph/ が追加されている（#73）"
+else
+  fail ".gitignore: .code-review-graph/ が追加されている（#73）"
+fi
+
+# --- core/roles/evaluator.md に「任意ツール: code-review-graph」節がある ---
+
+if grep -Fq '## 任意ツール: code-review-graph' "$DOC73_EVALUATOR_ROLE" \
+  && grep -Fq 'ツールがあれば使う。無ければ従来どおり' "$DOC73_EVALUATOR_ROLE" \
+  && grep -Fq '発火しない' "$DOC73_EVALUATOR_ROLE"; then
+  pass "core/roles/evaluator.md: 「任意ツール: code-review-graph」節がある（#73）"
+else
+  fail "core/roles/evaluator.md: 「任意ツール: code-review-graph」節がある（#73）"
+fi
+
+# --- 生成物（agents/evaluator.md・codex-agents/evaluator.toml）に反映されている ---
+
+if [ -f "$DOC73_AGENT_EVALUATOR" ] \
+  && grep -Fq 'mcp__plugin_dev-workflow_code-review-graph' "$DOC73_AGENT_EVALUATOR" \
+  && grep -Fq '## 任意ツール: code-review-graph' "$DOC73_AGENT_EVALUATOR"; then
+  pass "agents/evaluator.md: 正本の code-review-graph 結線内容が反映されている（#73）"
+else
+  fail "agents/evaluator.md: 正本の code-review-graph 結線内容が反映されている（#73）" \
+    "見つかりません: ${DOC73_AGENT_EVALUATOR}"
+fi
+
+if [ -f "$DOC73_CODEX_AGENT_EVALUATOR" ] \
+  && grep -Fq '[mcp_servers.code-review-graph]' "$DOC73_CODEX_AGENT_EVALUATOR" \
+  && grep -Fq '## 任意ツール: code-review-graph' "$DOC73_CODEX_AGENT_EVALUATOR"; then
+  pass "codex-agents/evaluator.toml: 正本の code-review-graph 結線内容が反映されている（#73）"
+else
+  fail "codex-agents/evaluator.toml: 正本の code-review-graph 結線内容が反映されている（#73）" \
+    "見つかりません: ${DOC73_CODEX_AGENT_EVALUATOR}"
+fi
+
+# --- code-review-graph が evaluator にのみ与えられている（planner/generatorには現れない） ---
+
+for f in "$DOC73_AGENT_PLANNER" "$DOC73_AGENT_GENERATOR" \
+  "$DOC73_CODEX_AGENT_PLANNER" "$DOC73_CODEX_AGENT_GENERATOR"; do
+  rel="${f#"${REPO_ROOT}/"}"
+  if [ -f "$f" ]; then
+    if grep -Fq 'code-review-graph' "$f"; then
+      fail "${rel}: code-review-graph が現れない（evaluator専用であること）（#73）" \
+        "$(grep -Fn 'code-review-graph' "$f")"
+    else
+      pass "${rel}: code-review-graph が現れない（evaluator専用であること）（#73）"
+    fi
+  else
+    fail "${rel}: code-review-graph が現れない（evaluator専用であること）（#73）" "見つかりません: ${f}"
+  fi
+done
+
+# ---------------------------------------------------------------------------
 # 結果集計
 # ---------------------------------------------------------------------------
 

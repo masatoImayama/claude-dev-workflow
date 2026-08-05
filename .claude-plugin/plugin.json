@@ -27,5 +27,11 @@
       "title": "Docker Compose ファイル",
       "description": "DB等の依存サービスが必要な場合に使用する docker-compose.yml のパス。"
     }
+  },
+  "mcpServers": {
+    "code-review-graph": {
+      "command": "code-review-graph",
+      "args": ["serve"]
+    }
   }
 }

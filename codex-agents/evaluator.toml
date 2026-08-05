@@ -171,6 +171,23 @@ bash "${CLAUDE_PLUGIN_ROOT}/scripts/sandbox-exec.sh" --epic "$EPIC_NUM" '[test-c
 
 全て通ることを確認する。
 
+## 任意ツール: code-review-graph
+
+`code-review-graph`（`tirth8205/code-review-graph`, MIT License）は Tree-sitter で AST を解析し
+コードの呼び出しグラフを構築する MCP サーバーである。**evaluator にのみ**結線されている
+（`planner` / `generator` には与えない）。
+
+**任意依存である。ツールがあれば使う。無ければ従来どおり**（このドキュメントの「レビュー手順」）
+でレビューする。ツールが使えないことを理由にレビューを止めたり、劣化した手順として扱ったりしない。
+
+- 大規模差分（変更50ファイル超）での発火条件・blast radius の具体的な使い方・グラフ構築のタイミングは
+  `skills/run/SKILL.md` の既存しきい値（「Epic が大きく差分が膨大になる場合（目安: 変更50ファイル超）は、
+  R1 を Phase 単位に分割して起動してよい」）に相乗りする別タスクで規定する
+- **dev-workflow 自身のような markdown + bash 主体のリポジトリでは、Tree-sitter による AST 解析から
+  ほとんど情報が出ないため、code-review-graph が発火しない（呼び出しグラフが空・骨組みだけになる）のが
+  正常である。** 「発火しない = 壊れている」ではない。効果が出るのは dev-workflow が駆動する側の
+  プロジェクト（実コードを持つプロジェクト）である
+
 ## 重要度の基準
 
 共通ルールの「レビュー基準」の3段階（high / medium / low）に従って機械的に分類する。
@@ -561,3 +578,14 @@ bash "${CLAUDE_PLUGIN_ROOT}/scripts/sandbox-exec.sh" --epic "$EPIC_NUM" --print-
 `verdict` / `reviewed_commit` / `findings` を含むJSONを**必ず**返すこと。
 `findings` が空でもキーを省略しない。
 '''
+
+# code-review-graph（任意依存。#73）を evaluator にのみ結線する。
+# セッション全体ではなくこのエージェント定義に限定して宣言することで、
+# planner / generator には渡さない（Claude Code版の tools: によるサーバー単位許可と同じ意図。
+# `.codex-plugin/plugin.json` には宣言しない。plugin.json はエージェント配布に対応していないため
+# （docs/dev-workflow-multi-vendor-guide.md 3.3.4参照）、この agents/*.toml 側の宣言だけで完結する）。
+# `required` を明示しない場合は既定で非必須接続なので、未導入（コマンドが見つからない）でも
+# エージェントの起動をブロックしない（公式設定リファレンス: mcp_servers.<id>.required）。
+[mcp_servers.code-review-graph]
+command = "code-review-graph"
+args = ["serve"]
