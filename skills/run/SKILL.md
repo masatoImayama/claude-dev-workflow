@@ -915,12 +915,32 @@ bash "${CLAUDE_PLUGIN_ROOT}/scripts/record-agent-tokens.sh" record \
 R1の起動前に変更ファイル数を数え、既存のしきい値（目安: 変更50ファイル超）で3つに分岐する。
 **新しいしきい値の軸は増やさず、この50ファイル超のしきい値に相乗りする。**
 
+dev-workflowは**駆動先プロジェクト**でこのSKILL.mdを実行するプラグインであり、駆動先の
+デフォルトブランチが `main` とは限らない。**ベースブランチを `master`/`main` に決め打ちしない**
+（dev-workflow自身のリポジトリのデフォルトブランチが `master` であっても、それを駆動先の値として
+埋め込んではならない）。`gh repo view` で駆動先の実際のデフォルトブランチを解決する:
+
 ```bash
-CHANGED_FILES="$(git diff --name-only master..."$EPIC_BRANCH" | wc -l)"
+BASE_BRANCH="$(gh repo view --json defaultBranchRef -q .defaultBranchRef.name 2>/dev/null)"
+BASE_BRANCH="${BASE_BRANCH:-main}"
+
+if CHANGED_FILES_LIST="$(git diff --name-only "${BASE_BRANCH}...${EPIC_BRANCH}")"; then
+  CHANGED_FILES="$(printf '%s\n' "$CHANGED_FILES_LIST" | grep -c '.')"
+else
+  echo "WARN: git diff ${BASE_BRANCH}...${EPIC_BRANCH} に失敗し、変更ファイル数を数えられなかった。Phase単位分割にフォールバックする" >&2
+  CHANGED_FILES=""
+fi
 ```
+
+`git diff` を `wc -l` に直接パイプしない。パイプすると `git diff` が失敗しても `wc -l` は0を
+返して**失敗を握り潰し**、「CHANGED_FILES <= 50 → 従来どおり」に誤判定してしまう
+（ベースブランチが存在しない等で起きうる）。上記のとおり `git diff` 自体の終了コードを見て、
+失敗時は `CHANGED_FILES` を空にし、**サイズ不明のまま「従来どおり（分割なし）」に倒さず**
+Phase単位分割へフォールバックする。
 
 | 条件 | 挙動 |
 |---|---|
+| `CHANGED_FILES` を数えられなかった（`git diff` 失敗） | **Phase単位分割にフォールバックする**（下記の既存の回避策。サイズ不明の場合に安全側へ倒す） |
 | `CHANGED_FILES` <= 50 | **従来どおり。** code-review-graphには一切触れない（グラフ構築もしない） |
 | `CHANGED_FILES` > 50 かつ code-review-graphが利用可能（`command -v code-review-graph`） | evaluatorのプロンプトに「blast radiusの算出を使って読む優先順位を付けてよい」旨を含めて起動する |
 | `CHANGED_FILES` > 50 かつ code-review-graphが未導入 | **従来どおり**、R1をPhase単位に分割して起動する（下記の既存の回避策） |

@@ -7100,6 +7100,105 @@ else
     "検出したしきい値: ${DOC74_CODEX_THRESHOLD_NUMBERS}"
 fi
 
+echo "== CHANGED_FILESのしきい値算出がベースブランチを決め打ちしない（#81） =="
+
+# レビュー指摘 #81: 「変更50ファイル超」しきい値算出（#74）が
+# `git diff --name-only master...` とベースブランチを決め打ちしていた。dev-workflowは
+# 他プロジェクトを駆動するプラグインでありSKILL.mdは駆動先で実行されるテンプレートなので、
+# dev-workflow自身のリポジトリ固有の値（master）を埋め込んではならない。
+# また `git diff | wc -l` のパイプはgit diffの失敗を握り潰し0に化けさせるため、
+# 失敗時にPhase単位分割へ安全側フォールバックできるよう終了コードを直接見る形にする。
+
+# --- skills/run/SKILL.md: `master...` によるベースブランチ決め打ちが残っていない ---
+
+if grep -Eq 'git diff --name-only master\.\.\.' "$DOC74_RUN_SKILL"; then
+  fail "skills/run/SKILL.md: CHANGED_FILES算出がmasterブランチを決め打ちしていない（#81）" \
+    "'git diff --name-only master...' が残っている"
+else
+  pass "skills/run/SKILL.md: CHANGED_FILES算出がmasterブランチを決め打ちしていない（#81）"
+fi
+
+# --- skills/run/SKILL.md: ベースブランチを動的に解決している（gh repo view で駆動先の実際の値を使う） ---
+
+if grep -Fq 'gh repo view --json defaultBranchRef' "$DOC74_RUN_SKILL" \
+  && grep -Fq 'BASE_BRANCH' "$DOC74_RUN_SKILL"; then
+  pass "skills/run/SKILL.md: ベースブランチをgh repo viewで動的に解決している（#81）"
+else
+  fail "skills/run/SKILL.md: ベースブランチをgh repo viewで動的に解決している（#81）"
+fi
+
+# --- skills/run/SKILL.md: git diffをwc -lへ直接パイプしていない（失敗を握り潰さない） ---
+
+if grep -Eq 'git diff --name-only "\$\{BASE_BRANCH\}\.\.\.\$\{EPIC_BRANCH\}" \| wc -l' "$DOC74_RUN_SKILL"; then
+  fail "skills/run/SKILL.md: git diffの失敗がwc -lで握り潰されない（#81）" \
+    "git diffの出力を直接wc -lにパイプしている箇所が残っている"
+else
+  pass "skills/run/SKILL.md: git diffの失敗がwc -lで握り潰されない（#81）"
+fi
+
+# --- skills/run/SKILL.md: git diff失敗時に「数えられなかった」旨を出しPhase分割へ倒す記述がある ---
+
+if grep -Fq '数えられなかった' "$DOC74_RUN_SKILL" \
+  && grep -Fq 'Phase単位分割にフォールバックする' "$DOC74_RUN_SKILL"; then
+  pass "skills/run/SKILL.md: git diff失敗時にPhase単位分割へフォールバックする旨が明記されている（#81）"
+else
+  fail "skills/run/SKILL.md: git diff失敗時にPhase単位分割へフォールバックする旨が明記されている（#81）"
+fi
+
+# --- skills-codex/dev-workflow-run/SKILL.md: 同様にmaster決め打ちが残っていない（決定3: 機能差を作らない） ---
+
+if grep -Eq 'git diff --name-only master\.\.\.' "$DOC74_CODEX_RUN_SKILL"; then
+  fail "skills-codex/dev-workflow-run/SKILL.md: CHANGED_FILES算出がmasterブランチを決め打ちしていない（#81）" \
+    "'git diff --name-only master...' が残っている"
+else
+  pass "skills-codex/dev-workflow-run/SKILL.md: CHANGED_FILES算出がmasterブランチを決め打ちしていない（#81）"
+fi
+
+# --- skills-codex/dev-workflow-run/SKILL.md: ベースブランチを動的に解決している ---
+
+if grep -Fq 'gh repo view --json defaultBranchRef' "$DOC74_CODEX_RUN_SKILL" \
+  && grep -Fq 'BASE_BRANCH' "$DOC74_CODEX_RUN_SKILL"; then
+  pass "skills-codex/dev-workflow-run/SKILL.md: ベースブランチをgh repo viewで動的に解決している（#81）"
+else
+  fail "skills-codex/dev-workflow-run/SKILL.md: ベースブランチをgh repo viewで動的に解決している（#81）"
+fi
+
+# --- skills-codex/dev-workflow-run/SKILL.md: git diffをwc -lへ直接パイプしていない ---
+
+if grep -Eq 'git diff --name-only "\$\{BASE_BRANCH\}\.\.\.\$\{EPIC_BRANCH\}" \| wc -l' "$DOC74_CODEX_RUN_SKILL"; then
+  fail "skills-codex/dev-workflow-run/SKILL.md: git diffの失敗がwc -lで握り潰されない（#81）" \
+    "git diffの出力を直接wc -lにパイプしている箇所が残っている"
+else
+  pass "skills-codex/dev-workflow-run/SKILL.md: git diffの失敗がwc -lで握り潰されない（#81）"
+fi
+
+# --- skills-codex/dev-workflow-run/SKILL.md: git diff失敗時のフォールバック記述がある ---
+
+if grep -Fq '数えられなかった' "$DOC74_CODEX_RUN_SKILL" \
+  && grep -Fq 'Phase 単位分割にフォールバックする' "$DOC74_CODEX_RUN_SKILL"; then
+  pass "skills-codex/dev-workflow-run/SKILL.md: git diff失敗時にPhase単位分割へフォールバックする旨が明記されている（#81）"
+else
+  fail "skills-codex/dev-workflow-run/SKILL.md: git diff失敗時にPhase単位分割へフォールバックする旨が明記されている（#81）"
+fi
+
+# --- 「Xファイル超」しきい値が依然として50のみである（#81の修正でしきい値の軸が増えていない） ---
+
+DOC81_THRESHOLD_NUMBERS="$(grep -oE '[0-9]+ファイル超' "$DOC74_RUN_SKILL" | sort -u)"
+if [ "$DOC81_THRESHOLD_NUMBERS" = "50ファイル超" ]; then
+  pass "skills/run/SKILL.md: #81修正後も「Xファイル超」しきい値が50のみである（#81）"
+else
+  fail "skills/run/SKILL.md: #81修正後も「Xファイル超」しきい値が50のみである（#81）" \
+    "検出したしきい値: ${DOC81_THRESHOLD_NUMBERS}"
+fi
+
+DOC81_CODEX_THRESHOLD_NUMBERS="$(grep -oE '[0-9]+ファイル超' "$DOC74_CODEX_RUN_SKILL" | sort -u)"
+if [ "$DOC81_CODEX_THRESHOLD_NUMBERS" = "50ファイル超" ]; then
+  pass "skills-codex/dev-workflow-run/SKILL.md: #81修正後も「Xファイル超」しきい値が50のみである（#81）"
+else
+  fail "skills-codex/dev-workflow-run/SKILL.md: #81修正後も「Xファイル超」しきい値が50のみである（#81）" \
+    "検出したしきい値: ${DOC81_CODEX_THRESHOLD_NUMBERS}"
+fi
+
 echo "== グラフ構築をEpic開始時の準備に載せ限界を明記する（#75） =="
 
 # Epic #66 Phase 4（#75）: code-review-graphのグラフ構築はEpic開始時に1回だけ、
