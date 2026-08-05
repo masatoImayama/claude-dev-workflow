@@ -1,2 +1,8 @@
 # Claude Code / dev-workflow のローカル作業領域
 .claude/worktrees/
+
+# code-review-graph（任意依存。#73）が生成するグラフDB・キャッシュ
+.code-review-graph/
+
+# サブエージェントのトークン消費記録（効果測定用。#76）
+.claude/agent-tokens.tsv

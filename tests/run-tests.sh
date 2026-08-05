@@ -55,6 +55,24 @@ assert_exit_code() {
   fi
 }
 
+assert_no_hang() {
+  # assert_no_hang <説明> <期待する終了コード> <実際の終了コード> <実際のstderr(またはstdout+stderr)> <stderrに含まれるべき文字列>
+  #
+  # 「無限ループしない（ハングしない）」ことを検証するテストは `timeout` でコマンドを
+  # 打ち切って回帰を防ぐが、timeout がタイムアウト時に返す終了コードは環境依存
+  # （GNU coreutils=124, BusyBox=143 など SIGTERM由来の 128+シグナル番号）であり、
+  # 「タイムアウトで打ち切られた（=ハングしたまま殺された）」ことを終了コードだけで
+  # 判定できない。ハングした場合はエラーメッセージも出力されないため、
+  # 「期待する終了コードちょうどであること」と「期待するエラーメッセージが出ていること」の
+  # 両方を assert することで、ハング（timeoutによる強制終了）を確実に不合格にする。
+  local desc="$1" expected_exit="$2" actual_exit="$3" actual_output="$4" expected_msg="$5"
+  if [ "$actual_exit" -eq "$expected_exit" ] && printf '%s' "$actual_output" | grep -Fq -- "$expected_msg"; then
+    pass "$desc"
+  else
+    fail "$desc" "expected exit=${expected_exit}（メッセージに[${expected_msg}]を含む） actual exit=${actual_exit} output=[${actual_output}]"
+  fi
+}
+
 # ---------------------------------------------------------------------------
 # 一時 git リポジトリ / worktree を組み立てるヘルパ。
 # 後続タスク（epic worktree / agent worktree / リポジトリ外 worktree のケース追加）で再利用する。
@@ -277,7 +295,9 @@ fi
 
 # --- --epic に値が無いまま渡された場合は無限ループせず明快なエラーで停止する ---
 # shift 2 が失敗して $# が減らないまま while ループが回り続ける不具合があった
-# （実測: timeout 8 bash scripts/sandbox-exec.sh --epic は exit 124 だった）。
+# （実測: timeout 8 bash scripts/sandbox-exec.sh --epic は exit 124 だった。
+# ただし sandbox 内の BusyBox timeout は exit 143 を返すため、終了コードのみでは
+# 「ハングして timeout に強制終了させられた」ことを判定できない。詳細は assert_no_hang 参照）。
 if command -v timeout >/dev/null 2>&1; then
   EPIC_NO_VALUE_STDERR="$(
     cd "$PRINT_PLAN_REPO" || exit 1
@@ -285,18 +305,8 @@ if command -v timeout >/dev/null 2>&1; then
   )"
   EPIC_NO_VALUE_EXIT=$?
 
-  if [ "$EPIC_NO_VALUE_EXIT" -eq 124 ]; then
-    fail "--epic に値が無い場合は無限ループしない" "timeout（exit 124）で停止しました"
-  elif [ "$EPIC_NO_VALUE_EXIT" -eq 0 ]; then
-    fail "--epic に値が無い場合は非0で終了する" "exit=0"
-  else
-    pass "--epic に値が無い場合は無限ループせず非0で終了する"
-  fi
-
-  case "$EPIC_NO_VALUE_STDERR" in
-    *"--epic"*) pass "--epic に値が無い場合のエラーに --epic の記載がある" ;;
-    *) fail "--epic に値が無い場合のエラーに --epic の記載がある" "stderr=[${EPIC_NO_VALUE_STDERR}]" ;;
-  esac
+  assert_no_hang "--epic に値が無い場合は無限ループせず exit 2 かつ --epic の記載があるエラーで停止する" \
+    2 "$EPIC_NO_VALUE_EXIT" "$EPIC_NO_VALUE_STDERR" "--epic には値が必要です"
 else
   skip "--epic に値が無い場合は無限ループせず明快なエラーで停止する" "timeout コマンドが利用できません"
 fi
@@ -2031,6 +2041,144 @@ if grep -q "core.autocrlf=true" "$CRLF_FULL_STDERR"; then
   pass "check-prerequisites.sh 本体からも CRLF 警告が stderr に出る"
 else
   fail "check-prerequisites.sh 本体からも CRLF 警告が stderr に出る" "stderr=[$(cat "$CRLF_FULL_STDERR")]"
+fi
+
+# ---------------------------------------------------------------------------
+# optional_tools_notice（任意ツールの非ブロッキング検出、Epic #66 Phase1・Task #68）
+#
+# context7 / code-review-graph の導入状況（docs/optional-mcp-tools.md「## 申し送りに対してどう応えたか
+# （#80 レビュー対応）」節のとおり、dev-workflowが実際に`command`へ指定するコマンド名:
+# context7-mcp / code-review-graph）を command -v で判定する純粋関数。`npx`はNode.js同梱でほぼ
+# 常に存在し「context7 = 常に導入済み」と誤判定するため使わない（レビュー指摘 #82）。
+# crlf_warning_message と同じく check-prerequisites.sh を source して単体テストする。
+# ---------------------------------------------------------------------------
+
+echo "== optional_tools_notice（任意ツールの非ブロッキング検出。Task #68） =="
+
+make_tool_stub_dir() {
+  # make_tool_stub_dir <ツール名...>  指定した名前の実行可能スタブだけを持つ一時ディレクトリを作る。
+  local dir tool
+  dir="$(mktemp -d "${TMPDIR:-/tmp}/dw-test-optional-tools.XXXXXX")"
+  for tool in "$@"; do
+    cat > "${dir}/${tool}" <<'STUB'
+#!/bin/bash
+exit 0
+STUB
+    chmod +x "${dir}/${tool}"
+  done
+  printf '%s' "$dir"
+}
+
+optional_tools_notice_with_path() {
+  # optional_tools_notice_with_path <PATH>
+  # 指定した PATH だけを使って optional_tools_notice を呼び出し、標準出力を返す（stderr は捨てる）。
+  # 関数内部は command -v の判定しか行わないため、PATH をこのスタブだけに絞っても安全。
+  local fake_path="$1"
+  (
+    # shellcheck source=../scripts/check-prerequisites.sh
+    source "$CHECK_PREREQS_SCRIPT"
+    PATH="$fake_path" optional_tools_notice
+  ) 2>/dev/null
+}
+
+# --- 両方とも利用可能な環境では何も出力しない ---
+OPT_TOOLS_BOTH_DIR="$(make_tool_stub_dir context7-mcp code-review-graph)"
+OPT_TOOLS_BOTH_NOTICE="$(optional_tools_notice_with_path "$OPT_TOOLS_BOTH_DIR")"
+assert_eq "context7 / code-review-graph が両方利用可能なら何も出力しない" "" "$OPT_TOOLS_BOTH_NOTICE"
+
+# --- context7 のみ未導入な環境では、context7 と「従来どおり」を含む警告を返す ---
+OPT_TOOLS_NO_CONTEXT7_DIR="$(make_tool_stub_dir code-review-graph)"
+OPT_TOOLS_NO_CONTEXT7_NOTICE="$(optional_tools_notice_with_path "$OPT_TOOLS_NO_CONTEXT7_DIR")"
+
+case "$OPT_TOOLS_NO_CONTEXT7_NOTICE" in
+  *"context7"*) pass "context7 未導入時、警告に context7 という文字列が含まれる" ;;
+  *) fail "context7 未導入時、警告に context7 という文字列が含まれる" "notice=[${OPT_TOOLS_NO_CONTEXT7_NOTICE}]" ;;
+esac
+
+case "$OPT_TOOLS_NO_CONTEXT7_NOTICE" in
+  *"従来どおり"*) pass "context7 未導入時、警告に『従来どおり』の文言が含まれる" ;;
+  *) fail "context7 未導入時、警告に『従来どおり』の文言が含まれる" "notice=[${OPT_TOOLS_NO_CONTEXT7_NOTICE}]" ;;
+esac
+
+case "$OPT_TOOLS_NO_CONTEXT7_NOTICE" in
+  *"code-review-graph"*) fail "context7 のみ未導入なら code-review-graph には言及しない" "notice=[${OPT_TOOLS_NO_CONTEXT7_NOTICE}]" ;;
+  *) pass "context7 のみ未導入なら code-review-graph には言及しない" ;;
+esac
+
+# --- code-review-graph のみ未導入な環境でも同様（片方が未導入なら未導入分だけ列挙する） ---
+OPT_TOOLS_NO_CRG_DIR="$(make_tool_stub_dir context7-mcp)"
+OPT_TOOLS_NO_CRG_NOTICE="$(optional_tools_notice_with_path "$OPT_TOOLS_NO_CRG_DIR")"
+
+case "$OPT_TOOLS_NO_CRG_NOTICE" in
+  *"code-review-graph"*) pass "code-review-graph 未導入時、警告に code-review-graph という文字列が含まれる" ;;
+  *) fail "code-review-graph 未導入時、警告に code-review-graph という文字列が含まれる" "notice=[${OPT_TOOLS_NO_CRG_NOTICE}]" ;;
+esac
+
+case "$OPT_TOOLS_NO_CRG_NOTICE" in
+  *"従来どおり"*) pass "code-review-graph 未導入時、警告に『従来どおり』の文言が含まれる" ;;
+  *) fail "code-review-graph 未導入時、警告に『従来どおり』の文言が含まれる" "notice=[${OPT_TOOLS_NO_CRG_NOTICE}]" ;;
+esac
+
+# --- レビュー指摘 #82 の再発防止: npx はあるが context7-mcp が無い環境では、
+#     context7 が「未導入」と正しく通知されること（npx の有無を context7 の代わりに
+#     見てしまう歪みが直したはずなのに戻っていないかを検出する） ---
+OPT_TOOLS_NPX_ONLY_DIR="$(make_tool_stub_dir npx code-review-graph)"
+OPT_TOOLS_NPX_ONLY_NOTICE="$(optional_tools_notice_with_path "$OPT_TOOLS_NPX_ONLY_DIR")"
+
+case "$OPT_TOOLS_NPX_ONLY_NOTICE" in
+  *"context7"*) pass "npx はあるが context7-mcp が無い環境で、context7 が未導入と正しく通知される（#82再発防止）" ;;
+  *) fail "npx はあるが context7-mcp が無い環境で、context7 が未導入と正しく通知される（#82再発防止）" \
+    "notice=[${OPT_TOOLS_NPX_ONLY_NOTICE}]" ;;
+esac
+
+case "$OPT_TOOLS_NPX_ONLY_NOTICE" in
+  *"code-review-graph"*) fail "npx はあるが context7-mcp が無い環境で、code-review-graph には言及しない（#82再発防止）" \
+    "notice=[${OPT_TOOLS_NPX_ONLY_NOTICE}]" ;;
+  *) pass "npx はあるが context7-mcp が無い環境で、code-review-graph には言及しない（#82再発防止）" ;;
+esac
+
+# --- 両方未導入でも check-prerequisites.sh 全体の終了コードは 2 にならない ---
+#
+# 他の必須依存（gh/docker）は満たされている前提を再現するため、CRLF警告テストと同じ
+# 偽 gh / 偽 docker を使う。context7-mcp / code-review-graph が「未導入」であることを
+# 環境非依存で保証するため、実際の $PATH からこの2つの実行ファイルを含むディレクトリだけを
+# 取り除いた PATH を組み立てる（git / sed / cat / grep 等、他に必要な外部コマンドはそのまま残す）。
+# npx は取り除かない（context7 の判定に npx を使わないことの確認を兼ねる。#82）。
+strip_optional_tools_from_path() {
+  local dir out=""
+  local IFS=':'
+  for dir in $PATH; do
+    if [ -x "${dir}/context7-mcp" ] || [ -x "${dir}/code-review-graph" ]; then
+      continue
+    fi
+    out="${out:+${out}:}${dir}"
+  done
+  printf '%s' "$out"
+}
+
+OPT_TOOLS_STRIPPED_PATH="$(strip_optional_tools_from_path)"
+OPT_TOOLS_FULL_STDERR="$(mktemp "${TMPDIR:-/tmp}/dw-test-optional-tools-full-stderr.XXXXXX")"
+OPT_TOOLS_FULL_EXIT=0
+(
+  cd "$CRLF_WITHATTR_REPO" || exit 1
+  HOME="$CRLF_FAKE_HOME" PATH="${CRLF_FAKE_BIN_DIR}:${OPT_TOOLS_STRIPPED_PATH}" \
+    bash "$CHECK_PREREQS_SCRIPT" 1>/dev/null 2>"$OPT_TOOLS_FULL_STDERR"
+) || OPT_TOOLS_FULL_EXIT=$?
+
+assert_exit_code "context7 / code-review-graph が両方未導入でも exit 0（ブロックしない）" 0 "$OPT_TOOLS_FULL_EXIT"
+
+if grep -q "任意ツールが未導入です" "$OPT_TOOLS_FULL_STDERR"; then
+  pass "check-prerequisites.sh 本体からも任意ツールの未導入通知が stderr に出る"
+else
+  fail "check-prerequisites.sh 本体からも任意ツールの未導入通知が stderr に出る" "stderr=[$(cat "$OPT_TOOLS_FULL_STDERR")]"
+fi
+
+# --- errors 配列に context7 / code-review-graph という文字列が追加されていないこと（静的検査） ---
+if grep -n "errors+=" "$CHECK_PREREQS_SCRIPT" | grep -qiE "context7|code-review-graph"; then
+  fail "errors 配列に任意ツール（context7 / code-review-graph）が追加されていない" \
+    "$(grep -n "errors+=" "$CHECK_PREREQS_SCRIPT" | grep -iE "context7|code-review-graph")"
+else
+  pass "errors 配列に任意ツール（context7 / code-review-graph）が追加されていない"
 fi
 
 # ---------------------------------------------------------------------------
@@ -6177,13 +6325,13 @@ DOC55_README="${REPO_ROOT}/README.md"
 DOC55_AGENT_GENERATOR="${REPO_ROOT}/agents/generator.md"
 DOC55_CODEX_AGENT_GENERATOR="${REPO_ROOT}/codex-agents/generator.toml"
 
-# --- 両 plugin.json のバージョンが 0.13.0 で一致している ---
+# --- 両 plugin.json のバージョンが 0.14.0 で一致している（#77でv0.13.0から更新） ---
 
 DOC55_CLAUDE_VERSION="$(grep -m1 '"version"' "$DOC55_CLAUDE_PLUGIN_JSON" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+')"
 DOC55_CODEX_VERSION="$(grep -m1 '"version"' "$DOC55_CODEX_PLUGIN_JSON" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+')"
 
-assert_eq ".claude-plugin/plugin.json のバージョンが0.13.0である" "0.13.0" "$DOC55_CLAUDE_VERSION"
-assert_eq ".codex-plugin/plugin.json のバージョンが0.13.0である" "0.13.0" "$DOC55_CODEX_VERSION"
+assert_eq ".claude-plugin/plugin.json のバージョンが0.14.0である" "0.14.0" "$DOC55_CLAUDE_VERSION"
+assert_eq ".codex-plugin/plugin.json のバージョンが0.14.0である" "0.14.0" "$DOC55_CODEX_VERSION"
 assert_eq "両plugin.jsonのバージョンが一致している" "$DOC55_CLAUDE_VERSION" "$DOC55_CODEX_VERSION"
 
 # --- core/instructions.md に watchdog の3点の記述がある ---
@@ -6434,6 +6582,1134 @@ if grep -Fq 'DRY_RUN' "$DOC57_GUIDE" && grep -Fq 'DRY_RUN より前' "$DOC57_GUI
   pass "docs/dev-workflow-multi-vendor-guide.md: DRY_RUNの案内にもDEV_WORKFLOW_TEST_CMDが必要である旨が明記されている（#57）"
 else
   fail "docs/dev-workflow-multi-vendor-guide.md: DRY_RUNの案内にもDEV_WORKFLOW_TEST_CMDが必要である旨が明記されている（#57）"
+fi
+
+# ---------------------------------------------------------------------------
+echo "== ponytail の7段ラダーを generator の正本に規定（#69） =="
+
+# ponytail（DietrichGebert/ponytail, MIT）の「最も怠惰なシニア開発者のように考える」7段の判断ラダーを
+# core/roles/generator.md に日本語で規定する。実装コードのみが対象でテストは対象外。
+# 生成物（agents/generator.md・codex-agents/generator.toml）にも同じ文言が反映されていることを検査する。
+
+DOC69_GENERATOR_ROLE="${REPO_ROOT}/core/roles/generator.md"
+DOC69_AGENT_GENERATOR="${REPO_ROOT}/agents/generator.md"
+DOC69_CODEX_AGENT_GENERATOR="${REPO_ROOT}/codex-agents/generator.toml"
+
+# --- core/roles/generator.md に7段のラダーが日本語で規定されている ---
+
+if grep -Fq '7段のラダー' "$DOC69_GENERATOR_ROLE" \
+  && grep -Fq 'これは存在する必要があるか？' "$DOC69_GENERATOR_ROLE" \
+  && grep -Fq 'ここまで来て初めて: 動く最小限を書く' "$DOC69_GENERATOR_ROLE"; then
+  pass "core/roles/generator.md: 7段のラダーが日本語で規定されている（#69）"
+else
+  fail "core/roles/generator.md: 7段のラダーが日本語で規定されている（#69）"
+fi
+
+# --- 「削ってはいけないもの」にテスト・回帰確認・検証が含まれている ---
+
+if grep -Fq '削ってはいけないもの' "$DOC69_GENERATOR_ROLE" \
+  && grep -Fq 'テスト・回帰確認・検証' "$DOC69_GENERATOR_ROLE"; then
+  pass "core/roles/generator.md: 「削ってはいけないもの」にテスト・回帰確認・検証が含まれている（#69）"
+else
+  fail "core/roles/generator.md: 「削ってはいけないもの」にテスト・回帰確認・検証が含まれている（#69）"
+fi
+
+# --- 実装コードのみ対象、テストコードには適用しない旨が明記されている ---
+
+if grep -Fq '実装コードにのみ適用する' "$DOC69_GENERATOR_ROLE" \
+  && grep -Fq 'テストコードには適用しない' "$DOC69_GENERATOR_ROLE"; then
+  pass "core/roles/generator.md: 「実装コードのみ対象、テストコードには適用しない」旨が明記されている（#69）"
+else
+  fail "core/roles/generator.md: 「実装コードのみ対象、テストコードには適用しない」旨が明記されている（#69）"
+fi
+
+# --- 出典（DietrichGebert/ponytail, MIT）が明記されている ---
+
+if grep -Fq 'DietrichGebert/ponytail' "$DOC69_GENERATOR_ROLE" \
+  && grep -Fq 'MIT License' "$DOC69_GENERATOR_ROLE"; then
+  pass "core/roles/generator.md: 出典（DietrichGebert/ponytail, MIT）が明記されている（#69）"
+else
+  fail "core/roles/generator.md: 出典（DietrichGebert/ponytail, MIT）が明記されている（#69）"
+fi
+
+# --- 完了報告テンプレートに「作らなかったもの」の欄がある ---
+
+if grep -Fq '作らなかったもの（ラダー判定）' "$DOC69_GENERATOR_ROLE"; then
+  pass "core/roles/generator.md: 完了報告テンプレートに「作らなかったもの（ラダー判定）」の欄がある（#69）"
+else
+  fail "core/roles/generator.md: 完了報告テンプレートに「作らなかったもの（ラダー判定）」の欄がある（#69）"
+fi
+
+# --- 生成物（agents/generator.md・codex-agents/generator.toml）に正本の追記内容が反映されている ---
+
+if [ -f "$DOC69_AGENT_GENERATOR" ] \
+  && grep -Fq '7段のラダー' "$DOC69_AGENT_GENERATOR" \
+  && grep -Fq 'DietrichGebert/ponytail' "$DOC69_AGENT_GENERATOR" \
+  && grep -Fq '作らなかったもの（ラダー判定）' "$DOC69_AGENT_GENERATOR"; then
+  pass "agents/generator.md: 正本（core/roles/generator.md）のponytailラダー追記内容が反映されている（#69）"
+else
+  fail "agents/generator.md: 正本（core/roles/generator.md）のponytailラダー追記内容が反映されている（#69）" \
+    "見つかりません: ${DOC69_AGENT_GENERATOR}"
+fi
+
+if [ -f "$DOC69_CODEX_AGENT_GENERATOR" ] \
+  && grep -Fq '7段のラダー' "$DOC69_CODEX_AGENT_GENERATOR" \
+  && grep -Fq 'DietrichGebert/ponytail' "$DOC69_CODEX_AGENT_GENERATOR" \
+  && grep -Fq '作らなかったもの（ラダー判定）' "$DOC69_CODEX_AGENT_GENERATOR"; then
+  pass "codex-agents/generator.toml: 正本のponytailラダー追記内容が反映されている（#69）"
+else
+  fail "codex-agents/generator.toml: 正本のponytailラダー追記内容が反映されている（#69）" \
+    "見つかりません: ${DOC69_CODEX_AGENT_GENERATOR}"
+fi
+
+# ---------------------------------------------------------------------------
+echo "== 「過剰実装・過剰設計」をレビュー観点に追加（#70） =="
+
+# ponytail のラダー（#69）と対になる、evaluator 側の「作らなくてよいものを作った差分」の
+# 検出観点を core/roles/evaluator.md と core/instructions.md に規定する。
+# core/instructions.md は agents/*.md と codex-agents/*.toml の全ファイルに反映される。
+
+DOC70_EVALUATOR_ROLE="${REPO_ROOT}/core/roles/evaluator.md"
+DOC70_INSTRUCTIONS="${REPO_ROOT}/core/instructions.md"
+DOC70_AGENT_EVALUATOR="${REPO_ROOT}/agents/evaluator.md"
+DOC70_CODEX_AGENT_EVALUATOR="${REPO_ROOT}/codex-agents/evaluator.toml"
+
+# --- core/roles/evaluator.md のレビューチェックリストに「過剰実装・過剰設計」の小節がある ---
+
+if grep -Fq '#### 過剰実装・過剰設計' "$DOC70_EVALUATOR_ROLE"; then
+  pass "core/roles/evaluator.md: レビューチェックリストに「過剰実装・過剰設計」の小節がある（#70）"
+else
+  fail "core/roles/evaluator.md: レビューチェックリストに「過剰実装・過剰設計」の小節がある（#70）"
+fi
+
+# --- チェックリストに「削ってはいけないものを削っていないか」の項目が含まれている ---
+
+if grep -Fq 'テスト・回帰確認・検証・セキュリティ・データ損失の扱いを「削減」していないか' "$DOC70_EVALUATOR_ROLE"; then
+  pass "core/roles/evaluator.md: 「削ってはいけないものを削っていないか」の項目が含まれている（#70）"
+else
+  fail "core/roles/evaluator.md: 「削ってはいけないものを削っていないか」の項目が含まれている（#70）"
+fi
+
+# --- core/instructions.md のレビュー基準に、過剰実装・過剰設計の重要度の当てはめが明記されている ---
+
+if grep -Fq '過剰実装・過剰設計の重要度の当てはめ' "$DOC70_INSTRUCTIONS" \
+  && grep -Fq '仕様・Task issue に無い機能を足している（明確な仕様逸脱） | high' "$DOC70_INSTRUCTIONS" \
+  && grep -Fq '重複実装・不要な抽象化・自前実装で済ませられた標準機能の再実装 | medium' "$DOC70_INSTRUCTIONS" \
+  && grep -Fq '好みの範囲の簡潔さ（1行にできた等） | low' "$DOC70_INSTRUCTIONS"; then
+  pass "core/instructions.md: レビュー基準に過剰実装・過剰設計の重要度の当てはめが明記されている（#70）"
+else
+  fail "core/instructions.md: レビュー基準に過剰実装・過剰設計の重要度の当てはめが明記されている（#70）"
+fi
+
+# --- 生成物（agents/evaluator.md・codex-agents/evaluator.toml）に反映されている ---
+
+if [ -f "$DOC70_AGENT_EVALUATOR" ] \
+  && grep -Fq '#### 過剰実装・過剰設計' "$DOC70_AGENT_EVALUATOR" \
+  && grep -Fq '過剰実装・過剰設計の重要度の当てはめ' "$DOC70_AGENT_EVALUATOR"; then
+  pass "agents/evaluator.md: 正本の「過剰実装・過剰設計」追記内容が反映されている（#70）"
+else
+  fail "agents/evaluator.md: 正本の「過剰実装・過剰設計」追記内容が反映されている（#70）" \
+    "見つかりません: ${DOC70_AGENT_EVALUATOR}"
+fi
+
+if [ -f "$DOC70_CODEX_AGENT_EVALUATOR" ] \
+  && grep -Fq '#### 過剰実装・過剰設計' "$DOC70_CODEX_AGENT_EVALUATOR" \
+  && grep -Fq '過剰実装・過剰設計の重要度の当てはめ' "$DOC70_CODEX_AGENT_EVALUATOR"; then
+  pass "codex-agents/evaluator.toml: 正本の「過剰実装・過剰設計」追記内容が反映されている（#70）"
+else
+  fail "codex-agents/evaluator.toml: 正本の「過剰実装・過剰設計」追記内容が反映されている（#70）" \
+    "見つかりません: ${DOC70_CODEX_AGENT_EVALUATOR}"
+fi
+
+# ---------------------------------------------------------------------------
+echo "== プラグイン宣言MCPの未導入時挙動を実測しdocs/optional-mcp-tools.mdに記録している（#67） =="
+
+# Epic #66 Phase 1（#67）: MCP結線方式（方式A: 宣言方式 / 方式B: 非宣言方式）を実測して確定し、
+# 後続タスク（#71 context7 / #73 code-review-graph）が同じ文書を参照できるようにする。
+# 決め打ちで方式名だけ書いていないか、必須6節が揃っているかを機械的に検査する。
+
+DOC67_MCP="${REPO_ROOT}/docs/optional-mcp-tools.md"
+
+if [ -f "$DOC67_MCP" ]; then
+  pass "docs/optional-mcp-tools.md が存在する（#67）"
+
+  for section in "## 対象ツール" "## 実測手順" "## 実測結果" "## 採用方式" "## MCP ツール名" "## 任意依存であることの保証"; do
+    if grep -Fq "$section" "$DOC67_MCP"; then
+      pass "docs/optional-mcp-tools.md: 「${section}」節がある（#67）"
+    else
+      fail "docs/optional-mcp-tools.md: 「${section}」節がある（#67）"
+    fi
+  done
+
+  DOC67_ADOPTED_SECTION="$(awk '/^## 採用方式/{flag=1; next} /^## /{flag=0} flag' "$DOC67_MCP")"
+  if printf '%s' "$DOC67_ADOPTED_SECTION" | grep -Fq '方式A: 宣言方式' \
+    || printf '%s' "$DOC67_ADOPTED_SECTION" | grep -Fq '方式B: 非宣言方式'; then
+    pass "docs/optional-mcp-tools.md: 「## 採用方式」節に方式A/Bいずれかが明記されている（#67）"
+  else
+    fail "docs/optional-mcp-tools.md: 「## 採用方式」節に方式A/Bいずれかが明記されている（#67）"
+  fi
+else
+  fail "docs/optional-mcp-tools.md が存在する（#67）"
+  skip "docs/optional-mcp-tools.md: 必須節の検査（#67）" "ファイルが存在しないためスキップ"
+  skip "docs/optional-mcp-tools.md: 採用方式の検査（#67）" "ファイルが存在しないためスキップ"
+fi
+
+# ---------------------------------------------------------------------------
+echo "== code-review-graph を evaluator にのみ結線する（#73） =="
+
+# Epic #66 Phase 4（#73）: #67で確定した方式Aに従い、code-review-graphをevaluatorにのみ結線する。
+# planner/generatorには一切現れないこと、未導入でも壊れないこと（.gitignore）、
+# plugin.jsonが変更後もJSONとして妥当であることを機械的に検査する。
+
+DOC73_CLAUDE_PLUGIN_JSON="${REPO_ROOT}/.claude-plugin/plugin.json"
+DOC73_GITIGNORE="${REPO_ROOT}/.gitignore"
+DOC73_EVALUATOR_ROLE="${REPO_ROOT}/core/roles/evaluator.md"
+DOC73_AGENT_EVALUATOR="${REPO_ROOT}/agents/evaluator.md"
+DOC73_AGENT_PLANNER="${REPO_ROOT}/agents/planner.md"
+DOC73_AGENT_GENERATOR="${REPO_ROOT}/agents/generator.md"
+DOC73_CODEX_AGENT_EVALUATOR="${REPO_ROOT}/codex-agents/evaluator.toml"
+DOC73_CODEX_AGENT_PLANNER="${REPO_ROOT}/codex-agents/planner.toml"
+DOC73_CODEX_AGENT_GENERATOR="${REPO_ROOT}/codex-agents/generator.toml"
+
+# --- .claude-plugin/plugin.json に code-review-graph の mcpServers エントリがある ---
+
+if grep -Fq '"code-review-graph"' "$DOC73_CLAUDE_PLUGIN_JSON" \
+  && grep -Fq '"command": "code-review-graph"' "$DOC73_CLAUDE_PLUGIN_JSON"; then
+  pass ".claude-plugin/plugin.json: mcpServers に code-review-graph のエントリがある（#73）"
+else
+  fail ".claude-plugin/plugin.json: mcpServers に code-review-graph のエントリがある（#73）"
+fi
+
+# --- .claude-plugin/plugin.json が変更後もJSONとして妥当（既存の _hj_json_syntax_ok を再利用） ---
+
+if _hj_json_syntax_ok "$DOC73_CLAUDE_PLUGIN_JSON"; then
+  pass ".claude-plugin/plugin.json: 構文として妥当（括弧の対応が取れている）（#73）"
+else
+  fail ".claude-plugin/plugin.json: 構文として妥当（括弧の対応が取れている）（#73）" \
+    "$(cat "$DOC73_CLAUDE_PLUGIN_JSON" 2>&1)"
+fi
+
+# --- .gitignore に .code-review-graph/ が追加されている ---
+
+if grep -Fq '.code-review-graph/' "$DOC73_GITIGNORE"; then
+  pass ".gitignore: .code-review-graph/ が追加されている（#73）"
+else
+  fail ".gitignore: .code-review-graph/ が追加されている（#73）"
+fi
+
+# --- core/roles/evaluator.md に「任意ツール: code-review-graph」節がある ---
+
+if grep -Fq '## 任意ツール: code-review-graph' "$DOC73_EVALUATOR_ROLE" \
+  && grep -Fq 'ツールがあれば使う。無ければ従来どおり' "$DOC73_EVALUATOR_ROLE" \
+  && grep -Fq '発火しない' "$DOC73_EVALUATOR_ROLE"; then
+  pass "core/roles/evaluator.md: 「任意ツール: code-review-graph」節がある（#73）"
+else
+  fail "core/roles/evaluator.md: 「任意ツール: code-review-graph」節がある（#73）"
+fi
+
+# --- 生成物（agents/evaluator.md・codex-agents/evaluator.toml）に反映されている ---
+
+if [ -f "$DOC73_AGENT_EVALUATOR" ] \
+  && grep -Fq 'mcp__plugin_dev-workflow_code-review-graph' "$DOC73_AGENT_EVALUATOR" \
+  && grep -Fq '## 任意ツール: code-review-graph' "$DOC73_AGENT_EVALUATOR"; then
+  pass "agents/evaluator.md: 正本の code-review-graph 結線内容が反映されている（#73）"
+else
+  fail "agents/evaluator.md: 正本の code-review-graph 結線内容が反映されている（#73）" \
+    "見つかりません: ${DOC73_AGENT_EVALUATOR}"
+fi
+
+if [ -f "$DOC73_CODEX_AGENT_EVALUATOR" ] \
+  && grep -Fq '[mcp_servers.code-review-graph]' "$DOC73_CODEX_AGENT_EVALUATOR" \
+  && grep -Fq '## 任意ツール: code-review-graph' "$DOC73_CODEX_AGENT_EVALUATOR"; then
+  pass "codex-agents/evaluator.toml: 正本の code-review-graph 結線内容が反映されている（#73）"
+else
+  fail "codex-agents/evaluator.toml: 正本の code-review-graph 結線内容が反映されている（#73）" \
+    "見つかりません: ${DOC73_CODEX_AGENT_EVALUATOR}"
+fi
+
+# --- code-review-graph（MCPツール）が evaluator にのみ与えられている（generatorには現れない） ---
+# planner.md/toml は #75 で「## 準備コマンド」の例としてCLIコマンド `code-review-graph build`
+# を書く（MCPツールの結線ではない）ため、この2ファイルは対象から除外し、MCPツール結線の
+# 有無（mcp__plugin_..._code-review-graph という文字列）だけを別途チェックする。
+
+for f in "$DOC73_AGENT_GENERATOR" "$DOC73_CODEX_AGENT_GENERATOR"; do
+  rel="${f#"${REPO_ROOT}/"}"
+  if [ -f "$f" ]; then
+    if grep -Fq 'code-review-graph' "$f"; then
+      fail "${rel}: code-review-graph が現れない（evaluator専用であること）（#73）" \
+        "$(grep -Fn 'code-review-graph' "$f")"
+    else
+      pass "${rel}: code-review-graph が現れない（evaluator専用であること）（#73）"
+    fi
+  else
+    fail "${rel}: code-review-graph が現れない（evaluator専用であること）（#73）" "見つかりません: ${f}"
+  fi
+done
+
+# --- planner.md/toml には code-review-graph の「MCPツール結線」が現れない
+#     （#75 の準備コマンド例としての言及 `code-review-graph build` は許容する） ---
+
+for f in "$DOC73_AGENT_PLANNER" "$DOC73_CODEX_AGENT_PLANNER"; do
+  rel="${f#"${REPO_ROOT}/"}"
+  if [ -f "$f" ]; then
+    if grep -Fq 'mcp__plugin_dev-workflow_code-review-graph' "$f" \
+      || grep -Fq '[mcp_servers.code-review-graph]' "$f"; then
+      fail "${rel}: code-review-graph のMCPツール結線が現れない（evaluator専用であること）（#73/#75）" \
+        "$(grep -Fn 'code-review-graph' "$f")"
+    else
+      pass "${rel}: code-review-graph のMCPツール結線が現れない（evaluator専用であること）（#73/#75）"
+    fi
+  else
+    fail "${rel}: code-review-graph のMCPツール結線が現れない（evaluator専用であること）（#73/#75）" "見つかりません: ${f}"
+  fi
+done
+
+# ---------------------------------------------------------------------------
+echo "== context7 を generator にのみ結線している（#71） =="
+
+# Epic #66 Phase 3（#71）: #67 で確定した方式A（宣言方式）でcontext7を結線し、
+# generatorにのみ与える（決定6）。planner / evaluatorには一切現れないことを検査する。
+# Codex側はサーバー単位でしか絞れないため、絞り込み方式そのものは異なるが（詳細は
+# docs/optional-mcp-tools.md「Phase 3（#71）」節）、結果として「generatorにのみ与える」ことは
+# 両CLIで一致していることを検査する。
+
+DOC71_CLAUDE_PLUGIN_JSON="${REPO_ROOT}/.claude-plugin/plugin.json"
+DOC71_CODEX_PLUGIN_JSON="${REPO_ROOT}/.codex-plugin/plugin.json"
+DOC71_MCP_DOC="${REPO_ROOT}/docs/optional-mcp-tools.md"
+DOC71_AGENT_GENERATOR="${REPO_ROOT}/agents/generator.md"
+DOC71_AGENT_PLANNER="${REPO_ROOT}/agents/planner.md"
+DOC71_AGENT_EVALUATOR="${REPO_ROOT}/agents/evaluator.md"
+DOC71_CODEX_AGENT_GENERATOR="${REPO_ROOT}/codex-agents/generator.toml"
+DOC71_CODEX_AGENT_PLANNER="${REPO_ROOT}/codex-agents/planner.toml"
+DOC71_CODEX_AGENT_EVALUATOR="${REPO_ROOT}/codex-agents/evaluator.toml"
+
+# --- .claude-plugin/plugin.json が方式Aどおりcontext7を宣言しており、変更後もJSONとして妥当 ---
+
+if _hj_json_syntax_ok "$DOC71_CLAUDE_PLUGIN_JSON"; then
+  pass ".claude-plugin/plugin.json: 変更後もJSON構文として妥当（括弧の対応が取れている）（#71）"
+else
+  fail ".claude-plugin/plugin.json: 変更後もJSON構文として妥当（括弧の対応が取れている）（#71）" \
+    "$(cat "$DOC71_CLAUDE_PLUGIN_JSON" 2>&1)"
+fi
+
+if grep -Fq '"mcpServers"' "$DOC71_CLAUDE_PLUGIN_JSON" && grep -Fq '"context7"' "$DOC71_CLAUDE_PLUGIN_JSON"; then
+  pass ".claude-plugin/plugin.json: mcpServersにcontext7が宣言されている（方式A）（#71）"
+else
+  fail ".claude-plugin/plugin.json: mcpServersにcontext7が宣言されている（方式A）（#71）"
+fi
+
+# --- context7のツールがgeneratorにのみ与えられている（Claude Code版） ---
+
+if grep -Fq 'mcp__plugin_dev-workflow_context7__resolve-library-id' "$DOC71_AGENT_GENERATOR" \
+  && grep -Fq 'mcp__plugin_dev-workflow_context7__query-docs' "$DOC71_AGENT_GENERATOR"; then
+  pass "agents/generator.md: context7の2ツール（resolve-library-id / query-docs）がtools:にある（#71）"
+else
+  fail "agents/generator.md: context7の2ツール（resolve-library-id / query-docs）がtools:にある（#71）" \
+    "見つかりません: ${DOC71_AGENT_GENERATOR}"
+fi
+
+for f in "$DOC71_AGENT_PLANNER" "$DOC71_AGENT_EVALUATOR"; do
+  label="agents/$(basename "$f")"
+  if grep -Fq 'context7' "$f"; then
+    fail "${label}: context7が現れない（#71）" "見つかりました: ${f}"
+  else
+    pass "${label}: context7が現れない（#71）"
+  fi
+done
+
+# --- context7のツールがgeneratorにのみ与えられている（Codex版） ---
+
+if grep -Fq 'mcp_servers.context7' "$DOC71_CODEX_AGENT_GENERATOR"; then
+  pass "codex-agents/generator.toml: mcp_servers.context7が宣言されている（#71）"
+else
+  fail "codex-agents/generator.toml: mcp_servers.context7が宣言されている（#71）" \
+    "見つかりません: ${DOC71_CODEX_AGENT_GENERATOR}"
+fi
+
+for f in "$DOC71_CODEX_AGENT_PLANNER" "$DOC71_CODEX_AGENT_EVALUATOR"; do
+  label="codex-agents/$(basename "$f")"
+  if grep -Fq 'context7' "$f"; then
+    fail "${label}: context7が現れない（#71）" "見つかりました: ${f}"
+  else
+    pass "${label}: context7が現れない（#71）"
+  fi
+done
+
+# --- .codex-plugin/plugin.json にはcontext7を宣言しない（宣言すると全サブエージェントに継承されるため） ---
+
+if grep -Fq 'context7' "$DOC71_CODEX_PLUGIN_JSON"; then
+  fail ".codex-plugin/plugin.json: context7を宣言していない（宣言するとplanner/evaluatorにも継承されるため）（#71）"
+else
+  pass ".codex-plugin/plugin.json: context7を宣言していない（宣言するとplanner/evaluatorにも継承されるため）（#71）"
+fi
+
+# --- Claude/Codex間の機能差が無い（同等にできない場合はdocsに理由が明記されている） ---
+
+if grep -Fq '## Phase 3（#71）' "$DOC71_MCP_DOC" \
+  && grep -Fq 'Codex にはサブエージェント単位でMCPの「ツール名」を絞り込む機構が無い' "$DOC71_MCP_DOC"; then
+  pass "docs/optional-mcp-tools.md: Codex側で同等にできない理由と回避策が明記されている（#71）"
+else
+  fail "docs/optional-mcp-tools.md: Codex側で同等にできない理由と回避策が明記されている（#71）"
+fi
+
+# ---------------------------------------------------------------------------
+echo "== generator の規約に context7 の使いどころを追加（#72） =="
+
+# #71 の結線だけではgeneratorはcontext7を使わないため、正本に「いつ使うか」を明記する。
+# 完了条件の3点（推測禁止・未導入時の従来動作・ラダー2段目との優先関係）と、
+# 生成物への反映を検査する。
+
+DOC72_GENERATOR_ROLE="${REPO_ROOT}/core/roles/generator.md"
+DOC72_AGENT_GENERATOR="${REPO_ROOT}/agents/generator.md"
+DOC72_CODEX_AGENT_GENERATOR="${REPO_ROOT}/codex-agents/generator.toml"
+
+# --- 「未知のライブラリ／バージョン依存のAPIは推測で書かずcontext7で確認する」旨が明記されている ---
+
+if grep -Fq '未知のライブラリ' "$DOC72_GENERATOR_ROLE" \
+  && grep -Fq 'バージョン依存の API' "$DOC72_GENERATOR_ROLE" \
+  && grep -Fq '推測で書かない' "$DOC72_GENERATOR_ROLE" \
+  && grep -Fq 'context7' "$DOC72_GENERATOR_ROLE"; then
+  pass "core/roles/generator.md: 未知のライブラリ／バージョン依存のAPIは推測で書かずcontext7で確認する旨が明記されている（#72）"
+else
+  fail "core/roles/generator.md: 未知のライブラリ／バージョン依存のAPIは推測で書かずcontext7で確認する旨が明記されている（#72）"
+fi
+
+# --- 「未導入なら従来どおり動く」旨が明記されている（必須依存として書かれていないこと） ---
+
+if grep -Fq '未導入なら従来どおり動く' "$DOC72_GENERATOR_ROLE"; then
+  pass "core/roles/generator.md: 「未導入なら従来どおり動く」旨が明記されている（#72）"
+else
+  fail "core/roles/generator.md: 「未導入なら従来どおり動く」旨が明記されている（#72）"
+fi
+
+if grep -Eiq 'context7[^。\n]*(必ず使う|使わなければならない|使うこと)' "$DOC72_GENERATOR_ROLE"; then
+  fail "core/roles/generator.md: context7 を必須依存として書いていない（#72）" \
+    "$(grep -EinB1 'context7[^。]*(必ず使う|使わなければならない|使うこと)' "$DOC72_GENERATOR_ROLE")"
+else
+  pass "core/roles/generator.md: context7 を必須依存として書いていない（#72）"
+fi
+
+# --- 「既にコードベースで使われている用法は既存箇所を読む方が優先」旨が明記されている（ラダー2段目との整合） ---
+
+if grep -Fq '既存箇所を読む方が' "$DOC72_GENERATOR_ROLE" \
+  && grep -Fq 'このコードベースに既にあるか？' "$DOC72_GENERATOR_ROLE"; then
+  pass "core/roles/generator.md: 既存箇所を読む方が優先（ラダー2段目との整合）である旨が明記されている（#72）"
+else
+  fail "core/roles/generator.md: 既存箇所を読む方が優先（ラダー2段目との整合）である旨が明記されている（#72）"
+fi
+
+# --- 生成物（agents/generator.md・codex-agents/generator.toml）に正本の追記内容が反映されている ---
+
+if [ -f "$DOC72_AGENT_GENERATOR" ] \
+  && grep -Fq '未知のライブラリ' "$DOC72_AGENT_GENERATOR" \
+  && grep -Fq '未導入なら従来どおり動く' "$DOC72_AGENT_GENERATOR" \
+  && grep -Fq '既存箇所を読む方が' "$DOC72_AGENT_GENERATOR"; then
+  pass "agents/generator.md: 正本（core/roles/generator.md）のcontext7使いどころ追記内容が反映されている（#72）"
+else
+  fail "agents/generator.md: 正本（core/roles/generator.md）のcontext7使いどころ追記内容が反映されている（#72）" \
+    "見つかりません: ${DOC72_AGENT_GENERATOR}"
+fi
+
+if [ -f "$DOC72_CODEX_AGENT_GENERATOR" ] \
+  && grep -Fq '未知のライブラリ' "$DOC72_CODEX_AGENT_GENERATOR" \
+  && grep -Fq '未導入なら従来どおり動く' "$DOC72_CODEX_AGENT_GENERATOR" \
+  && grep -Fq '既存箇所を読む方が' "$DOC72_CODEX_AGENT_GENERATOR"; then
+  pass "codex-agents/generator.toml: 正本のcontext7使いどころ追記内容が反映されている（#72）"
+else
+  fail "codex-agents/generator.toml: 正本のcontext7使いどころ追記内容が反映されている（#72）" \
+    "見つかりません: ${DOC72_CODEX_AGENT_GENERATOR}"
+fi
+
+echo "== Epic一括レビューに「変更50ファイル超」しきい値の3分岐を入れる（#74） =="
+
+# Epic #66 Phase 4（#74）: R1起動前の変更ファイル数しきい値を、既存の「変更50ファイル超」に
+# 相乗りさせて3分岐（<=50は従来どおり / >50かつ利用可能ならblast radius / >50かつ未導入なら
+# 従来どおりPhase分割）にする。新しいしきい値の軸を増やさないこと、Claude版とCodex版で
+# 機能差を作らないこと（決定3）を検査する。
+
+DOC74_RUN_SKILL="${REPO_ROOT}/skills/run/SKILL.md"
+DOC74_CODEX_RUN_SKILL="${REPO_ROOT}/skills-codex/dev-workflow-run/SKILL.md"
+
+# --- skills/run/SKILL.md: 3分岐（<=50 / >50かつ利用可能 / >50かつ未導入）が記述されている ---
+
+if grep -Fq '<= 50' "$DOC74_RUN_SKILL" \
+  && grep -Fq '従来どおり' "$DOC74_RUN_SKILL" \
+  && grep -Fq 'code-review-graphが利用可能' "$DOC74_RUN_SKILL" \
+  && grep -Fq 'blast radius' "$DOC74_RUN_SKILL" \
+  && grep -Fq 'code-review-graphが未導入' "$DOC74_RUN_SKILL"; then
+  pass "skills/run/SKILL.md: 変更ファイル数50を境にした3分岐が記述されている（#74）"
+else
+  fail "skills/run/SKILL.md: 変更ファイル数50を境にした3分岐が記述されている（#74）"
+fi
+
+# --- skills/run/SKILL.md: 未導入ならPhase分割にフォールバックする旨が明記されている ---
+
+if grep -Fq '未導入' "$DOC74_RUN_SKILL" && grep -Fq 'Phase単位に分割して起動する' "$DOC74_RUN_SKILL"; then
+  pass "skills/run/SKILL.md: code-review-graph未導入ならPhase分割にフォールバックする旨が明記されている（#74）"
+else
+  fail "skills/run/SKILL.md: code-review-graph未導入ならPhase分割にフォールバックする旨が明記されている（#74）"
+fi
+
+# --- skills/run/SKILL.md: 「新しいしきい値の軸は増やさない」旨が明記され、しきい値が50のみである ---
+
+if grep -Fq '新しいしきい値の軸は増やさず' "$DOC74_RUN_SKILL"; then
+  pass "skills/run/SKILL.md: 新しいしきい値の軸を増やさない旨が明記されている（#74）"
+else
+  fail "skills/run/SKILL.md: 新しいしきい値の軸を増やさない旨が明記されている（#74）"
+fi
+
+DOC74_THRESHOLD_NUMBERS="$(grep -oE '[0-9]+ファイル超' "$DOC74_RUN_SKILL" | sort -u)"
+if [ "$DOC74_THRESHOLD_NUMBERS" = "50ファイル超" ]; then
+  pass "skills/run/SKILL.md: 「Xファイル超」しきい値が50のみである（新しい軸が増えていない）（#74）"
+else
+  fail "skills/run/SKILL.md: 「Xファイル超」しきい値が50のみである（新しい軸が増えていない）（#74）" \
+    "検出したしきい値: ${DOC74_THRESHOLD_NUMBERS}"
+fi
+
+# --- skills-codex/dev-workflow-run/SKILL.md: 同等の3分岐が記述されている（決定3: 機能差を作らない） ---
+
+if grep -Fq '<= 50' "$DOC74_CODEX_RUN_SKILL" \
+  && grep -Fq '従来どおり' "$DOC74_CODEX_RUN_SKILL" \
+  && grep -Fq 'code-review-graph が利用可能' "$DOC74_CODEX_RUN_SKILL" \
+  && grep -Fq 'blast radius' "$DOC74_CODEX_RUN_SKILL" \
+  && grep -Fq 'code-review-graph が未導入' "$DOC74_CODEX_RUN_SKILL"; then
+  pass "skills-codex/dev-workflow-run/SKILL.md: 変更ファイル数50を境にした3分岐が記述されている（#74）"
+else
+  fail "skills-codex/dev-workflow-run/SKILL.md: 変更ファイル数50を境にした3分岐が記述されている（#74）"
+fi
+
+# --- skills-codex/dev-workflow-run/SKILL.md: 未導入ならPhase分割にフォールバックする旨が明記されている ---
+
+if grep -Fq '未導入' "$DOC74_CODEX_RUN_SKILL" && grep -Fq 'R1 を Phase 単位に分割して起動する' "$DOC74_CODEX_RUN_SKILL"; then
+  pass "skills-codex/dev-workflow-run/SKILL.md: code-review-graph未導入ならPhase分割にフォールバックする旨が明記されている（#74）"
+else
+  fail "skills-codex/dev-workflow-run/SKILL.md: code-review-graph未導入ならPhase分割にフォールバックする旨が明記されている（#74）"
+fi
+
+# --- Claude版とCodex版で分岐の有無が一致している（決定3: 機能差を作らない） ---
+
+DOC74_CLAUDE_HAS_SECTION="no"
+DOC74_CODEX_HAS_SECTION="no"
+grep -Fq '### レビュー粒度の調整' "$DOC74_RUN_SKILL" && DOC74_CLAUDE_HAS_SECTION="yes"
+grep -Fq '### レビュー粒度の調整' "$DOC74_CODEX_RUN_SKILL" && DOC74_CODEX_HAS_SECTION="yes"
+
+if [ "$DOC74_CLAUDE_HAS_SECTION" = "yes" ] && [ "$DOC74_CODEX_HAS_SECTION" = "yes" ]; then
+  pass "skills/run/SKILL.md と skills-codex/dev-workflow-run/SKILL.md の両方に「レビュー粒度の調整」節があり分岐の有無が一致する（#74）"
+else
+  fail "skills/run/SKILL.md と skills-codex/dev-workflow-run/SKILL.md の両方に「レビュー粒度の調整」節があり分岐の有無が一致する（#74）" \
+    "claude=${DOC74_CLAUDE_HAS_SECTION} codex=${DOC74_CODEX_HAS_SECTION}"
+fi
+
+# --- しきい値の値は既存記述と同じ50であり、Codex版側にも50以外の新しい軸が増えていない ---
+
+DOC74_CODEX_THRESHOLD_NUMBERS="$(grep -oE '[0-9]+ファイル超' "$DOC74_CODEX_RUN_SKILL" | sort -u)"
+if [ "$DOC74_CODEX_THRESHOLD_NUMBERS" = "50ファイル超" ]; then
+  pass "skills-codex/dev-workflow-run/SKILL.md: 「Xファイル超」しきい値が50のみである（新しい軸が増えていない）（#74）"
+else
+  fail "skills-codex/dev-workflow-run/SKILL.md: 「Xファイル超」しきい値が50のみである（新しい軸が増えていない）（#74）" \
+    "検出したしきい値: ${DOC74_CODEX_THRESHOLD_NUMBERS}"
+fi
+
+echo "== CHANGED_FILESのしきい値算出がベースブランチを決め打ちしない（#81） =="
+
+# レビュー指摘 #81: 「変更50ファイル超」しきい値算出（#74）が
+# `git diff --name-only master...` とベースブランチを決め打ちしていた。dev-workflowは
+# 他プロジェクトを駆動するプラグインでありSKILL.mdは駆動先で実行されるテンプレートなので、
+# dev-workflow自身のリポジトリ固有の値（master）を埋め込んではならない。
+# また `git diff | wc -l` のパイプはgit diffの失敗を握り潰し0に化けさせるため、
+# 失敗時にPhase単位分割へ安全側フォールバックできるよう終了コードを直接見る形にする。
+
+# --- skills/run/SKILL.md: `master...` によるベースブランチ決め打ちが残っていない ---
+
+if grep -Eq 'git diff --name-only master\.\.\.' "$DOC74_RUN_SKILL"; then
+  fail "skills/run/SKILL.md: CHANGED_FILES算出がmasterブランチを決め打ちしていない（#81）" \
+    "'git diff --name-only master...' が残っている"
+else
+  pass "skills/run/SKILL.md: CHANGED_FILES算出がmasterブランチを決め打ちしていない（#81）"
+fi
+
+# --- skills/run/SKILL.md: ベースブランチを動的に解決している（gh repo view で駆動先の実際の値を使う） ---
+
+if grep -Fq 'gh repo view --json defaultBranchRef' "$DOC74_RUN_SKILL" \
+  && grep -Fq 'BASE_BRANCH' "$DOC74_RUN_SKILL"; then
+  pass "skills/run/SKILL.md: ベースブランチをgh repo viewで動的に解決している（#81）"
+else
+  fail "skills/run/SKILL.md: ベースブランチをgh repo viewで動的に解決している（#81）"
+fi
+
+# --- skills/run/SKILL.md: git diffをwc -lへ直接パイプしていない（失敗を握り潰さない） ---
+
+if grep -Eq 'git diff --name-only "\$\{BASE_BRANCH\}\.\.\.\$\{EPIC_BRANCH\}" \| wc -l' "$DOC74_RUN_SKILL"; then
+  fail "skills/run/SKILL.md: git diffの失敗がwc -lで握り潰されない（#81）" \
+    "git diffの出力を直接wc -lにパイプしている箇所が残っている"
+else
+  pass "skills/run/SKILL.md: git diffの失敗がwc -lで握り潰されない（#81）"
+fi
+
+# --- skills/run/SKILL.md: git diff失敗時に「数えられなかった」旨を出しPhase分割へ倒す記述がある ---
+
+if grep -Fq '数えられなかった' "$DOC74_RUN_SKILL" \
+  && grep -Fq 'Phase単位分割にフォールバックする' "$DOC74_RUN_SKILL"; then
+  pass "skills/run/SKILL.md: git diff失敗時にPhase単位分割へフォールバックする旨が明記されている（#81）"
+else
+  fail "skills/run/SKILL.md: git diff失敗時にPhase単位分割へフォールバックする旨が明記されている（#81）"
+fi
+
+# --- skills-codex/dev-workflow-run/SKILL.md: 同様にmaster決め打ちが残っていない（決定3: 機能差を作らない） ---
+
+if grep -Eq 'git diff --name-only master\.\.\.' "$DOC74_CODEX_RUN_SKILL"; then
+  fail "skills-codex/dev-workflow-run/SKILL.md: CHANGED_FILES算出がmasterブランチを決め打ちしていない（#81）" \
+    "'git diff --name-only master...' が残っている"
+else
+  pass "skills-codex/dev-workflow-run/SKILL.md: CHANGED_FILES算出がmasterブランチを決め打ちしていない（#81）"
+fi
+
+# --- skills-codex/dev-workflow-run/SKILL.md: ベースブランチを動的に解決している ---
+
+if grep -Fq 'gh repo view --json defaultBranchRef' "$DOC74_CODEX_RUN_SKILL" \
+  && grep -Fq 'BASE_BRANCH' "$DOC74_CODEX_RUN_SKILL"; then
+  pass "skills-codex/dev-workflow-run/SKILL.md: ベースブランチをgh repo viewで動的に解決している（#81）"
+else
+  fail "skills-codex/dev-workflow-run/SKILL.md: ベースブランチをgh repo viewで動的に解決している（#81）"
+fi
+
+# --- skills-codex/dev-workflow-run/SKILL.md: git diffをwc -lへ直接パイプしていない ---
+
+if grep -Eq 'git diff --name-only "\$\{BASE_BRANCH\}\.\.\.\$\{EPIC_BRANCH\}" \| wc -l' "$DOC74_CODEX_RUN_SKILL"; then
+  fail "skills-codex/dev-workflow-run/SKILL.md: git diffの失敗がwc -lで握り潰されない（#81）" \
+    "git diffの出力を直接wc -lにパイプしている箇所が残っている"
+else
+  pass "skills-codex/dev-workflow-run/SKILL.md: git diffの失敗がwc -lで握り潰されない（#81）"
+fi
+
+# --- skills-codex/dev-workflow-run/SKILL.md: git diff失敗時のフォールバック記述がある ---
+
+if grep -Fq '数えられなかった' "$DOC74_CODEX_RUN_SKILL" \
+  && grep -Fq 'Phase 単位分割にフォールバックする' "$DOC74_CODEX_RUN_SKILL"; then
+  pass "skills-codex/dev-workflow-run/SKILL.md: git diff失敗時にPhase単位分割へフォールバックする旨が明記されている（#81）"
+else
+  fail "skills-codex/dev-workflow-run/SKILL.md: git diff失敗時にPhase単位分割へフォールバックする旨が明記されている（#81）"
+fi
+
+# --- 「Xファイル超」しきい値が依然として50のみである（#81の修正でしきい値の軸が増えていない） ---
+
+DOC81_THRESHOLD_NUMBERS="$(grep -oE '[0-9]+ファイル超' "$DOC74_RUN_SKILL" | sort -u)"
+if [ "$DOC81_THRESHOLD_NUMBERS" = "50ファイル超" ]; then
+  pass "skills/run/SKILL.md: #81修正後も「Xファイル超」しきい値が50のみである（#81）"
+else
+  fail "skills/run/SKILL.md: #81修正後も「Xファイル超」しきい値が50のみである（#81）" \
+    "検出したしきい値: ${DOC81_THRESHOLD_NUMBERS}"
+fi
+
+DOC81_CODEX_THRESHOLD_NUMBERS="$(grep -oE '[0-9]+ファイル超' "$DOC74_CODEX_RUN_SKILL" | sort -u)"
+if [ "$DOC81_CODEX_THRESHOLD_NUMBERS" = "50ファイル超" ]; then
+  pass "skills-codex/dev-workflow-run/SKILL.md: #81修正後も「Xファイル超」しきい値が50のみである（#81）"
+else
+  fail "skills-codex/dev-workflow-run/SKILL.md: #81修正後も「Xファイル超」しきい値が50のみである（#81）" \
+    "検出したしきい値: ${DOC81_CODEX_THRESHOLD_NUMBERS}"
+fi
+
+echo "== グラフ構築をEpic開始時の準備に載せ限界を明記する（#75） =="
+
+# Epic #66 Phase 4（#75）: code-review-graphのグラフ構築はEpic開始時に1回だけ、
+# 既存の「## 準備コマンド」節（issue #23）に載せる。evaluator自身はグラフを構築しない。
+# markdown + bash主体のリポジトリ（dev-workflow自身）では発火しないのが正常である旨を
+# core/roles/evaluator.mdとdocs/optional-mcp-tools.mdの両方に明記する。
+
+DOC75_EVALUATOR_ROLE="${REPO_ROOT}/core/roles/evaluator.md"
+DOC75_PLANNER_ROLE="${REPO_ROOT}/core/roles/planner.md"
+DOC75_OPTIONAL_MCP_DOC="${REPO_ROOT}/docs/optional-mcp-tools.md"
+DOC75_AGENT_EVALUATOR="${REPO_ROOT}/agents/evaluator.md"
+DOC75_AGENT_PLANNER="${REPO_ROOT}/agents/planner.md"
+DOC75_CODEX_AGENT_EVALUATOR="${REPO_ROOT}/codex-agents/evaluator.toml"
+DOC75_CODEX_AGENT_PLANNER="${REPO_ROOT}/codex-agents/planner.toml"
+
+# --- core/roles/evaluator.md: 「epic-review かつ変更50ファイル超のときだけ使う」旨 ---
+
+if grep -Fq 'epic-review かつ変更50ファイル超のときだけ' "$DOC75_EVALUATOR_ROLE"; then
+  pass "core/roles/evaluator.md: epic-reviewかつ変更50ファイル超のときだけ使う旨が明記されている（#75）"
+else
+  fail "core/roles/evaluator.md: epic-reviewかつ変更50ファイル超のときだけ使う旨が明記されている（#75）"
+fi
+
+# --- core/roles/evaluator.md: 「evaluator自身はグラフを構築しない」旨 ---
+
+if grep -Fq 'evaluator 自身はグラフを構築しない' "$DOC75_EVALUATOR_ROLE"; then
+  pass "core/roles/evaluator.md: evaluator自身はグラフを構築しない旨が明記されている（#75）"
+else
+  fail "core/roles/evaluator.md: evaluator自身はグラフを構築しない旨が明記されている（#75）"
+fi
+
+# --- core/roles/evaluator.md: グラフの出力をそのまま指摘にしない旨 ---
+
+if grep -Fq 'グラフの出力をそのまま指摘にしない' "$DOC75_EVALUATOR_ROLE"; then
+  pass "core/roles/evaluator.md: グラフの出力をそのまま指摘にしない旨が明記されている（#75）"
+else
+  fail "core/roles/evaluator.md: グラフの出力をそのまま指摘にしない旨が明記されている（#75）"
+fi
+
+# --- core/roles/evaluator.md と docs/optional-mcp-tools.md の両方に
+#     「markdown + bash 主体のリポジトリ...発火しないのが正常」の限界が明記されている ---
+
+if grep -Fq 'markdown + bash 主体のリポジトリ' "$DOC75_EVALUATOR_ROLE" \
+  && grep -Fq '発火しないのが正常' "$DOC75_EVALUATOR_ROLE"; then
+  pass "core/roles/evaluator.md: markdown + bash主体のリポジトリでは発火しないのが正常という限界が明記されている（#75）"
+else
+  fail "core/roles/evaluator.md: markdown + bash主体のリポジトリでは発火しないのが正常という限界が明記されている（#75）"
+fi
+
+if grep -Fq 'markdown + bash 主体のリポジトリ' "$DOC75_OPTIONAL_MCP_DOC" \
+  && grep -Fq '発火しないのが正常' "$DOC75_OPTIONAL_MCP_DOC"; then
+  pass "docs/optional-mcp-tools.md: markdown + bash主体のリポジトリでは発火しないのが正常という限界が明記されている（#75）"
+else
+  fail "docs/optional-mcp-tools.md: markdown + bash主体のリポジトリでは発火しないのが正常という限界が明記されている（#75）"
+fi
+
+# --- core/roles/planner.md: 「## 準備コマンド」の説明にグラフ構築コマンドの例が追加されている ---
+
+if grep -Fq 'グラフ構築コマンド' "$DOC75_PLANNER_ROLE" \
+  && grep -Fq 'code-review-graph build' "$DOC75_PLANNER_ROLE"; then
+  pass "core/roles/planner.md: 準備コマンド節の説明にグラフ構築コマンドの例が追加されている（#75）"
+else
+  fail "core/roles/planner.md: 準備コマンド節の説明にグラフ構築コマンドの例が追加されている（#75）"
+fi
+
+# --- docs/optional-mcp-tools.md: グラフ構築はEpic開始時に1回・evaluatorは構築しない旨 ---
+
+if grep -Fq '## 準備コマンド' "$DOC75_OPTIONAL_MCP_DOC" \
+  && grep -Fq 'evaluator 自身はグラフを構築しない' "$DOC75_OPTIONAL_MCP_DOC"; then
+  pass "docs/optional-mcp-tools.md: グラフ構築は準備コマンド節に載せevaluatorは構築しない旨が明記されている（#75）"
+else
+  fail "docs/optional-mcp-tools.md: グラフ構築は準備コマンド節に載せevaluatorは構築しない旨が明記されている（#75）"
+fi
+
+# --- 生成物: agents/evaluator.md に正本の内容が反映されている ---
+
+if [ -f "$DOC75_AGENT_EVALUATOR" ] \
+  && grep -Fq 'epic-review かつ変更50ファイル超のときだけ' "$DOC75_AGENT_EVALUATOR" \
+  && grep -Fq 'evaluator 自身はグラフを構築しない' "$DOC75_AGENT_EVALUATOR" \
+  && grep -Fq 'markdown + bash 主体のリポジトリ' "$DOC75_AGENT_EVALUATOR"; then
+  pass "agents/evaluator.md: 正本のグラフ構築・限界の記述内容が反映されている（#75）"
+else
+  fail "agents/evaluator.md: 正本のグラフ構築・限界の記述内容が反映されている（#75）" \
+    "見つかりません: ${DOC75_AGENT_EVALUATOR}"
+fi
+
+# --- 生成物: agents/planner.md に正本の内容が反映されている ---
+
+if [ -f "$DOC75_AGENT_PLANNER" ] \
+  && grep -Fq 'グラフ構築コマンド' "$DOC75_AGENT_PLANNER" \
+  && grep -Fq 'code-review-graph build' "$DOC75_AGENT_PLANNER"; then
+  pass "agents/planner.md: 正本のグラフ構築コマンド例が反映されている（#75）"
+else
+  fail "agents/planner.md: 正本のグラフ構築コマンド例が反映されている（#75）" \
+    "見つかりません: ${DOC75_AGENT_PLANNER}"
+fi
+
+# --- 生成物: codex-agents/evaluator.toml に正本の内容が反映されている ---
+
+if [ -f "$DOC75_CODEX_AGENT_EVALUATOR" ] \
+  && grep -Fq 'epic-review かつ変更50ファイル超のときだけ' "$DOC75_CODEX_AGENT_EVALUATOR" \
+  && grep -Fq 'evaluator 自身はグラフを構築しない' "$DOC75_CODEX_AGENT_EVALUATOR" \
+  && grep -Fq 'markdown + bash 主体のリポジトリ' "$DOC75_CODEX_AGENT_EVALUATOR"; then
+  pass "codex-agents/evaluator.toml: 正本のグラフ構築・限界の記述内容が反映されている（#75）"
+else
+  fail "codex-agents/evaluator.toml: 正本のグラフ構築・限界の記述内容が反映されている（#75）" \
+    "見つかりません: ${DOC75_CODEX_AGENT_EVALUATOR}"
+fi
+
+# --- 生成物: codex-agents/planner.toml に正本の内容が反映されている ---
+
+if [ -f "$DOC75_CODEX_AGENT_PLANNER" ] \
+  && grep -Fq 'グラフ構築コマンド' "$DOC75_CODEX_AGENT_PLANNER" \
+  && grep -Fq 'code-review-graph build' "$DOC75_CODEX_AGENT_PLANNER"; then
+  pass "codex-agents/planner.toml: 正本のグラフ構築コマンド例が反映されている（#75）"
+else
+  fail "codex-agents/planner.toml: 正本のグラフ構築コマンド例が反映されている（#75）" \
+    "見つかりません: ${DOC75_CODEX_AGENT_PLANNER}"
+fi
+
+# ---------------------------------------------------------------------------
+echo "== scripts/record-agent-tokens.sh（サブエージェントのトークン消費記録・集計。#76） =="
+# ---------------------------------------------------------------------------
+
+# Epic #66 Phase 5（#76）: 導入前後のサブエージェントトークン消費を記録・集計する仕組み。
+# jq等の追加依存を使わず素のbashで完結すること、記録先が git 管理外であること、
+# 不正入力は明快なエラーで非0終了することを検査する。
+
+RAT_SCRIPT="${REPO_ROOT}/scripts/record-agent-tokens.sh"
+RAT_TESTDIR="$(mktemp -d "${TMPDIR:-/tmp}/dw-test-agent-tokens.XXXXXX")"
+RAT_FILE="${RAT_TESTDIR}/agent-tokens.tsv"
+
+# --- 静的検査: jq等の追加依存を呼んでいない（コメント行は対象外。単語境界での一致のみ見る） ---
+
+RAT_FORBIDDEN_HITS="$(grep -v '^[[:space:]]*#' "$RAT_SCRIPT" \
+  | grep -E '(^|[^A-Za-z0-9_])jq([^A-Za-z0-9_]|$)' || true)"
+if [ -z "$RAT_FORBIDDEN_HITS" ]; then
+  pass "record-agent-tokens.sh: スクリプト本体が jq を呼んでいない（#76）"
+else
+  fail "record-agent-tokens.sh: スクリプト本体が jq を呼んでいない（#76）" "$RAT_FORBIDDEN_HITS"
+fi
+
+# --- record: 追記した内容がTSVとして読み戻せる（6列） ---
+
+RAT_RECORD_OUT="$(DEV_WORKFLOW_AGENT_TOKENS_FILE="$RAT_FILE" \
+  bash "$RAT_SCRIPT" record --epic 76 --role generator --mode "タスク実装" --tokens 90000 --note "dryrun" 2>&1)"
+RAT_RECORD_EXIT=$?
+assert_exit_code "record-agent-tokens.sh record: 正常入力は exit 0（#76）" 0 "$RAT_RECORD_EXIT"
+
+if [ -f "$RAT_FILE" ]; then
+  RAT_LINE="$(tail -n 1 "$RAT_FILE")"
+  RAT_COL_COUNT="$(printf '%s' "$RAT_LINE" | awk -F'\t' '{print NF}')"
+  assert_eq "record-agent-tokens.sh record: TSVが6列で書かれる（#76）" "6" "$RAT_COL_COUNT"
+
+  RAT_EPIC_COL="$(printf '%s' "$RAT_LINE" | cut -f2)"
+  RAT_ROLE_COL="$(printf '%s' "$RAT_LINE" | cut -f3)"
+  RAT_MODE_COL="$(printf '%s' "$RAT_LINE" | cut -f4)"
+  RAT_TOKENS_COL="$(printf '%s' "$RAT_LINE" | cut -f5)"
+  RAT_NOTE_COL="$(printf '%s' "$RAT_LINE" | cut -f6)"
+  if [ "$RAT_EPIC_COL" = "76" ] && [ "$RAT_ROLE_COL" = "generator" ] \
+    && [ "$RAT_MODE_COL" = "タスク実装" ] && [ "$RAT_TOKENS_COL" = "90000" ] \
+    && [ "$RAT_NOTE_COL" = "dryrun" ]; then
+    pass "record-agent-tokens.sh record: 各列の値が正しく読み戻せる（#76）"
+  else
+    fail "record-agent-tokens.sh record: 各列の値が正しく読み戻せる（#76）" \
+      "epic=${RAT_EPIC_COL} role=${RAT_ROLE_COL} mode=${RAT_MODE_COL} tokens=${RAT_TOKENS_COL} note=${RAT_NOTE_COL}"
+  fi
+else
+  fail "record-agent-tokens.sh record: TSVが6列で書かれる（#76）" "${RAT_FILE} が作られていません"
+  fail "record-agent-tokens.sh record: 各列の値が正しく読み戻せる（#76）" "${RAT_FILE} が作られていません"
+fi
+
+# --- record: --note を省略しても6列で書かれる（noteは空文字列） ---
+
+DEV_WORKFLOW_AGENT_TOKENS_FILE="$RAT_FILE" \
+  bash "$RAT_SCRIPT" record --epic 76 --role evaluator --mode "epic-review" --tokens 139000 >/dev/null 2>&1
+RAT_LINE2="$(tail -n 1 "$RAT_FILE")"
+RAT_COL_COUNT2="$(printf '%s' "$RAT_LINE2" | awk -F'\t' '{print NF}')"
+assert_eq "record-agent-tokens.sh record: --note省略時も6列で書かれる（#76）" "6" "$RAT_COL_COUNT2"
+
+# --- record: 複数レコードを追記できる（1行1レコード。追記であって上書きではない） ---
+
+RAT_TOTAL_LINES="$(wc -l < "$RAT_FILE" | tr -d ' ')"
+assert_eq "record-agent-tokens.sh record: 1行1レコードで追記される（#76）" "2" "$RAT_TOTAL_LINES"
+
+# --- --summary: role・modeごとの件数・合計・平均を出力する ---
+
+DEV_WORKFLOW_AGENT_TOKENS_FILE="$RAT_FILE" \
+  bash "$RAT_SCRIPT" record --epic 76 --role generator --mode "タスク実装" --tokens 150000 >/dev/null 2>&1
+RAT_SUMMARY_OUT="$(DEV_WORKFLOW_AGENT_TOKENS_FILE="$RAT_FILE" bash "$RAT_SCRIPT" --summary --epic 76 2>&1)"
+RAT_SUMMARY_EXIT=$?
+assert_exit_code "record-agent-tokens.sh --summary: exit 0（#76）" 0 "$RAT_SUMMARY_EXIT"
+
+if printf '%s' "$RAT_SUMMARY_OUT" | grep -Fq "generator" \
+  && printf '%s' "$RAT_SUMMARY_OUT" | grep -Fq "240000" \
+  && printf '%s' "$RAT_SUMMARY_OUT" | grep -Fq "120000" \
+  && printf '%s' "$RAT_SUMMARY_OUT" | grep -Fq "evaluator" \
+  && printf '%s' "$RAT_SUMMARY_OUT" | grep -Fq "139000"; then
+  pass "record-agent-tokens.sh --summary: role・modeごとの件数・合計・平均を出力する（#76）"
+else
+  fail "record-agent-tokens.sh --summary: role・modeごとの件数・合計・平均を出力する（#76）" "$RAT_SUMMARY_OUT"
+fi
+
+# --- --summary: 他のEpicのレコードは集計に混ざらない ---
+
+RAT_OTHER_EPIC_FILE="${RAT_TESTDIR}/agent-tokens-other.tsv"
+DEV_WORKFLOW_AGENT_TOKENS_FILE="$RAT_OTHER_EPIC_FILE" \
+  bash "$RAT_SCRIPT" record --epic 999 --role generator --mode "タスク実装" --tokens 1 >/dev/null 2>&1
+RAT_ISOLATION_OUT="$(DEV_WORKFLOW_AGENT_TOKENS_FILE="$RAT_OTHER_EPIC_FILE" bash "$RAT_SCRIPT" --summary --epic 76 2>&1)"
+if printf '%s' "$RAT_ISOLATION_OUT" | grep -Fq "記録が0件です"; then
+  pass "record-agent-tokens.sh --summary: 指定Epic以外のレコードは集計対象外（#76）"
+else
+  fail "record-agent-tokens.sh --summary: 指定Epic以外のレコードは集計対象外（#76）" "$RAT_ISOLATION_OUT"
+fi
+
+# --- 不正入力: --tokens が数値でない場合は非0終了しエラーメッセージを出す ---
+
+RAT_BAD_TOKENS_OUT="$(DEV_WORKFLOW_AGENT_TOKENS_FILE="$RAT_FILE" \
+  bash "$RAT_SCRIPT" record --epic 76 --role generator --mode x --tokens abc 2>&1)"
+RAT_BAD_TOKENS_EXIT=$?
+if [ "$RAT_BAD_TOKENS_EXIT" -ne 0 ] && printf '%s' "$RAT_BAD_TOKENS_OUT" | grep -Fq "数値"; then
+  pass "record-agent-tokens.sh record: --tokensが数値でない場合は非0終了しエラーを出す（#76）"
+else
+  fail "record-agent-tokens.sh record: --tokensが数値でない場合は非0終了しエラーを出す（#76）" \
+    "exit=${RAT_BAD_TOKENS_EXIT} out=${RAT_BAD_TOKENS_OUT}"
+fi
+
+# --- 不正入力: 必須オプション（--tokens）が欠けている場合は非0終了する ---
+
+RAT_MISSING_OUT="$(DEV_WORKFLOW_AGENT_TOKENS_FILE="$RAT_FILE" \
+  bash "$RAT_SCRIPT" record --epic 76 --role generator --mode x 2>&1)"
+RAT_MISSING_EXIT=$?
+assert_exit_code "record-agent-tokens.sh record: 必須オプション欠落は非0終了する（#76）" 2 "$RAT_MISSING_EXIT"
+
+# --- 不正入力: 末尾に値の無いオプションを置いても無限ループしない（ハングしない）（#79） ---
+# bash の `shift 2` は $# が2未満のとき何もせず非0を返す。値なしでオプション名だけが
+# 末尾に置かれた場合にこれを検出しないと while ループが同じ分岐を回り続けてハングする
+# 不具合があった（実測: timeout 5 bash record-agent-tokens.sh record --epic 66 --role
+# generator --mode impl --tokens は exit 124 だった。ただし sandbox 内の BusyBox timeout
+# は exit 143 を返すため、終了コードのみでは「ハングして timeout に強制終了させられた」
+# ことを判定できない。詳細は assert_no_hang 参照）。「必須オプション欠落」テスト（直上）
+# はオプションを丸ごと省く形なのでこのケースを通り抜けていた。cmd_record の全オプション
+# （--epic/--role/--mode/--tokens/--note）を、他は有効な値を与えたまま1つだけ末尾で
+# 値なしにする形で網羅する。
+
+if command -v timeout >/dev/null 2>&1; then
+  RAT_NOVAL_OPTS=(--epic --role --mode --tokens --note)
+  for RAT_NOVAL_OPT in "${RAT_NOVAL_OPTS[@]}"; do
+    RAT_NOVAL_ARGS=(record)
+    for RAT_OTHER_OPT in "${RAT_NOVAL_OPTS[@]}"; do
+      [ "$RAT_OTHER_OPT" = "$RAT_NOVAL_OPT" ] && continue
+      case "$RAT_OTHER_OPT" in
+        --epic) RAT_NOVAL_ARGS+=(--epic 76) ;;
+        --role) RAT_NOVAL_ARGS+=(--role generator) ;;
+        --mode) RAT_NOVAL_ARGS+=(--mode x) ;;
+        --tokens) RAT_NOVAL_ARGS+=(--tokens 1) ;;
+        --note) RAT_NOVAL_ARGS+=(--note y) ;;
+      esac
+    done
+    RAT_NOVAL_ARGS+=("$RAT_NOVAL_OPT")
+
+    RAT_NOVAL_OUT="$(DEV_WORKFLOW_AGENT_TOKENS_FILE="$RAT_FILE" \
+      timeout 5 bash "$RAT_SCRIPT" "${RAT_NOVAL_ARGS[@]}" 2>&1)"
+    RAT_NOVAL_EXIT=$?
+
+    assert_no_hang "record-agent-tokens.sh record: ${RAT_NOVAL_OPT}が末尾で値なしでも無限ループせず exit 2 かつエラーメッセージを出す（#79）" \
+      2 "$RAT_NOVAL_EXIT" "$RAT_NOVAL_OUT" "${RAT_NOVAL_OPT} に値がありません"
+  done
+
+  RAT_SUMMARY_NOVAL_OUT="$(DEV_WORKFLOW_AGENT_TOKENS_FILE="$RAT_FILE" \
+    timeout 5 bash "$RAT_SCRIPT" --summary --epic 2>&1)"
+  RAT_SUMMARY_NOVAL_EXIT=$?
+
+  assert_no_hang "record-agent-tokens.sh --summary: --epicが末尾で値なしでも無限ループせず exit 2 かつエラーメッセージを出す（#79）" \
+    2 "$RAT_SUMMARY_NOVAL_EXIT" "$RAT_SUMMARY_NOVAL_OUT" "--epic に値がありません"
+else
+  skip "record-agent-tokens.sh: 末尾に値の無いオプションでも無限ループしない（#79）" "timeout コマンドが利用できません"
+fi
+
+# --- 不正入力: --role が想定外の値の場合は非0終了する ---
+
+RAT_BADROLE_EXIT_OUT="$(DEV_WORKFLOW_AGENT_TOKENS_FILE="$RAT_FILE" \
+  bash "$RAT_SCRIPT" record --epic 76 --role reviewer --mode x --tokens 1 2>&1)"
+RAT_BADROLE_EXIT=$?
+if [ "$RAT_BADROLE_EXIT" -ne 0 ]; then
+  pass "record-agent-tokens.sh record: --roleが想定外の値の場合は非0終了する（#76）"
+else
+  fail "record-agent-tokens.sh record: --roleが想定外の値の場合は非0終了する（#76）" "$RAT_BADROLE_EXIT_OUT"
+fi
+
+# --- --summary: --epic が欠けている場合は非0終了する ---
+
+RAT_SUMMARY_NOEPIC_EXIT_OUT="$(DEV_WORKFLOW_AGENT_TOKENS_FILE="$RAT_FILE" bash "$RAT_SCRIPT" --summary 2>&1)"
+RAT_SUMMARY_NOEPIC_EXIT=$?
+assert_exit_code "record-agent-tokens.sh --summary: --epic欠落は非0終了する（#76）" 2 "$RAT_SUMMARY_NOEPIC_EXIT"
+
+# --- 不正な入力の失敗は記録先ファイルを壊さない（レコード件数が増えていない） ---
+
+RAT_LINES_AFTER_ERRORS="$(wc -l < "$RAT_FILE" | tr -d ' ')"
+assert_eq "record-agent-tokens.sh: 不正入力の失敗はファイルへの書き込みを行わない（#76）" "3" "$RAT_LINES_AFTER_ERRORS"
+
+# --- 記録先が git 管理外であること（.gitignore で除外されている） ---
+# git worktree（サンドボックスや専用worktree）内では .git ファイルがホスト側の絶対パスを
+# 指しており、コンテナ内から親リポジトリを解決できない環境がある（#73のcode-review-graph
+# 検査と同じ理由で `git check-ignore` は使わず、.gitignore の内容を直接検査する）。
+
+if grep -Fq '.claude/agent-tokens.tsv' "${REPO_ROOT}/.gitignore"; then
+  pass "record-agent-tokens.sh: 既定の記録先（.claude/agent-tokens.tsv）が.gitignoreで除外されている（#76）"
+else
+  fail "record-agent-tokens.sh: 既定の記録先（.claude/agent-tokens.tsv）が.gitignoreで除外されている（#76）"
+fi
+
+# --- run への結線: skills/run/SKILL.md と skills-codex/dev-workflow-run/SKILL.md の両方に
+#     record-agent-tokens.sh の呼び出しとPR本文への集計が記述されている ---
+
+RAT_RUN_SKILL="${REPO_ROOT}/skills/run/SKILL.md"
+RAT_CODEX_RUN_SKILL="${REPO_ROOT}/skills-codex/dev-workflow-run/SKILL.md"
+
+for f in "$RAT_RUN_SKILL" "$RAT_CODEX_RUN_SKILL"; do
+  name="${f#"${REPO_ROOT}"/}"
+  if grep -Fq 'record-agent-tokens.sh' "$f" \
+    && grep -Fq 'record-agent-tokens.sh --summary' "$f" \
+    && grep -Fq 'トークン消費' "$f"; then
+    pass "${name}: record-agent-tokens.shの結線とPR本文への集計が記述されている（#76）"
+  else
+    fail "${name}: record-agent-tokens.shの結線とPR本文への集計が記述されている（#76）"
+  fi
+done
+
+# --- 呼び出し側への注記: 記録に失敗しても自律ループを止めない旨が両SKILL.mdに明記されている ---
+
+for f in "$RAT_RUN_SKILL" "$RAT_CODEX_RUN_SKILL"; do
+  name="${f#"${REPO_ROOT}"/}"
+  if grep -Fq '自律ループを止めない' "$f" || grep -Fq 'ループは止めない' "$f"; then
+    pass "${name}: 記録失敗が自律ループを止めない旨が明記されている（#76）"
+  else
+    fail "${name}: 記録失敗が自律ループを止めない旨が明記されている（#76）"
+  fi
+done
+
+# --- docs/optional-mcp-tools.md: ベースライン表と「外す判断基準」が記載されている ---
+
+RAT_DOC="${REPO_ROOT}/docs/optional-mcp-tools.md"
+if grep -Fq '81k' "$RAT_DOC" && grep -Fq '150k' "$RAT_DOC" \
+  && grep -Fq '83k' "$RAT_DOC" && grep -Fq '139k' "$RAT_DOC" \
+  && grep -Fq 'delta-review' "$RAT_DOC" && grep -Fq 'epic-review' "$RAT_DOC"; then
+  pass "docs/optional-mcp-tools.md: ベースライン表（Epic #42実測値）が記載されている（#76）"
+else
+  fail "docs/optional-mcp-tools.md: ベースライン表（Epic #42実測値）が記載されている（#76）"
+fi
+
+if grep -Fq '外す判断基準' "$RAT_DOC" \
+  && grep -Fq 'record-agent-tokens.sh' "$RAT_DOC"; then
+  pass "docs/optional-mcp-tools.md: 「外す判断基準」が明記されている（#76）"
+else
+  fail "docs/optional-mcp-tools.md: 「外す判断基準」が明記されている（#76）"
+fi
+
+# ---------------------------------------------------------------------------
+# ドキュメント更新・v0.14.0・両アダプタ再生成（#77）
+# ---------------------------------------------------------------------------
+
+echo "== ドキュメント更新・v0.14.0・両アダプタ再生成（#77） =="
+
+DOC77_CLAUDE_PLUGIN_JSON="${REPO_ROOT}/.claude-plugin/plugin.json"
+DOC77_CODEX_PLUGIN_JSON="${REPO_ROOT}/.codex-plugin/plugin.json"
+DOC77_README="${REPO_ROOT}/README.md"
+DOC77_GUIDE="${REPO_ROOT}/docs/dev-workflow-multi-vendor-guide.md"
+
+# --- 両 plugin.json の version が一致している（片方だけ上がる事故の検出。値そのものは固定しない） ---
+
+DOC77_CLAUDE_VERSION="$(grep -m1 '"version"' "$DOC77_CLAUDE_PLUGIN_JSON" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+')"
+DOC77_CODEX_VERSION="$(grep -m1 '"version"' "$DOC77_CODEX_PLUGIN_JSON" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+')"
+
+if [ -n "$DOC77_CLAUDE_VERSION" ] && [ "$DOC77_CLAUDE_VERSION" = "$DOC77_CODEX_VERSION" ]; then
+  pass ".claude-plugin/plugin.json と .codex-plugin/plugin.json の version が一致している（#77）"
+else
+  fail ".claude-plugin/plugin.json と .codex-plugin/plugin.json の version が一致している（#77）" \
+    "claude=[${DOC77_CLAUDE_VERSION}] codex=[${DOC77_CODEX_VERSION}]"
+fi
+
+assert_eq "両plugin.jsonのversionが0.14.0である（#77）" "0.14.0" "$DOC77_CLAUDE_VERSION"
+
+# --- README.md に「任意依存の外部ツール」節があり、4点（任意依存・未導入時の挙動・入れ方・外す基準）が書かれている ---
+
+if grep -Fq '## 任意依存の外部ツール' "$DOC77_README"; then
+  pass "README.md: 「任意依存の外部ツール」節がある（#77）"
+else
+  fail "README.md: 「任意依存の外部ツール」節がある（#77）"
+fi
+
+if grep -Fq '必須依存ではありません' "$DOC77_README"; then
+  pass "README.md: 任意依存であり必須依存ではない旨が明記されている（#77）"
+else
+  fail "README.md: 任意依存であり必須依存ではない旨が明記されている（#77）"
+fi
+
+if grep -Fq 'context7 で確認しません' "$DOC77_README" && grep -Fq 'blast radius' "$DOC77_README" \
+  && grep -Fq 'Phase 単位に分割' "$DOC77_README"; then
+  pass "README.md: 未導入時にcontext7/code-review-graphがどう動かないかが明記されている（#77）"
+else
+  fail "README.md: 未導入時にcontext7/code-review-graphがどう動かないかが明記されている（#77）"
+fi
+
+# --- README に「未導入でも従来どおり動く」旨の記述がある ---
+
+if grep -Fq '入れなくても dev-workflow は従来どおり動作します' "$DOC77_README" \
+  || grep -Fq 'いずれもワークフローを止めません' "$DOC77_README"; then
+  pass "README.md: 「未導入でも従来どおり動く」旨の記述がある（#77）"
+else
+  fail "README.md: 「未導入でも従来どおり動く」旨の記述がある（#77）"
+fi
+
+if grep -Fq 'optional-mcp-tools.md' "$DOC77_README"; then
+  pass "README.md: 入れ方としてdocs/optional-mcp-tools.mdを参照している（#77）"
+else
+  fail "README.md: 入れ方としてdocs/optional-mcp-tools.mdを参照している（#77）"
+fi
+
+if grep -Fq '外す判断基準' "$DOC77_README"; then
+  pass "README.md: 「外す判断基準」への参照がある（#77）"
+else
+  fail "README.md: 「外す判断基準」への参照がある（#77）"
+fi
+
+# --- README.md に ponytail のラダー・出典（MIT）・テスト対象外の旨が書かれている ---
+
+if grep -Fq 'DietrichGebert/ponytail' "$DOC77_README" && grep -Fq 'MIT' "$DOC77_README" \
+  && grep -Fq '7段の判断ラダー' "$DOC77_README"; then
+  pass "README.md: ponytailのラダーと出典（MIT）が明記されている（#77）"
+else
+  fail "README.md: ponytailのラダーと出典（MIT）が明記されている（#77）"
+fi
+
+if grep -Fq 'テスト・回帰確認・検証・セキュリティは削減対象外' "$DOC77_README"; then
+  pass "README.md: テスト・検証・安全性は削減対象外である旨が明記されている（#77）"
+else
+  fail "README.md: テスト・検証・安全性は削減対象外である旨が明記されている（#77）"
+fi
+
+# --- docs/dev-workflow-multi-vendor-guide.md にClaude/Codex双方の任意依存の扱いが書かれている ---
+
+if grep -Fq '任意依存の外部 MCP ツール' "$DOC77_GUIDE" \
+  && grep -Fq 'ツール単位' "$DOC77_GUIDE" && grep -Fq 'サーバー単位' "$DOC77_GUIDE"; then
+  pass "docs/dev-workflow-multi-vendor-guide.md: Claude/Codexの設定場所の違いが書かれている（#77）"
+else
+  fail "docs/dev-workflow-multi-vendor-guide.md: Claude/Codexの設定場所の違いが書かれている（#77）"
+fi
+
+if grep -Fq '機能差は無い' "$DOC77_GUIDE" && grep -Fq '同等にできない箇所' "$DOC77_GUIDE"; then
+  pass "docs/dev-workflow-multi-vendor-guide.md: 機能差の有無と同等にできない箇所の理由・回避策が書かれている（#77）"
+else
+  fail "docs/dev-workflow-multi-vendor-guide.md: 機能差の有無と同等にできない箇所の理由・回避策が書かれている（#77）"
+fi
+
+# ---------------------------------------------------------------------------
+echo "== docs/dev-workflow-multi-vendor-guide.md の節参照が参照先ファイルに実在する（レビュー#84） =="
+
+# レビュー指摘 #84: ガイドが「正本はそちら」として案内する節見出しが、実際には参照先ファイルに
+# 存在しないケース（`core/roles/generator.md`ではなく`docs/optional-mcp-tools.md`にある節を
+# 誤って`core/roles/generator.md`と案内していた）が見つかった。ドキュメント自体が成果物である
+# このリポジトリでは参照切れが再発しうるため、`` `ファイル名.md` 「見出しテキスト」節 `` という
+# 形式で書かれた参照をガイドから機械的に抽出し、参照先ファイルに同名の見出し（`#`〜`######`の
+# いずれか）が実在することを検査する。新たに同形式の参照を追加した場合も自動的に対象になる。
+
+DOC84_GUIDE="${REPO_ROOT}/docs/dev-workflow-multi-vendor-guide.md"
+
+# ガイド全文を1行に連結してから抽出する（参照が改行を挟んで書かれていることがあるため）。
+DOC84_REFS="$(tr '\n' ' ' < "$DOC84_GUIDE" | grep -oE '`[A-Za-z0-9_./-]+\.md`[[:space:]]*「[^」]+」節' | sort -u)"
+
+if [ -z "$DOC84_REFS" ]; then
+  fail "docs/dev-workflow-multi-vendor-guide.md: 節参照の抽出パターンが1件も見つからない（テスト自体が空振りしていないか）（#84）"
+else
+  while IFS= read -r ref; do
+    [ -z "$ref" ] && continue
+    ref_file="$(printf '%s' "$ref" | grep -oE '^`[A-Za-z0-9_./-]+\.md`' | tr -d '`')"
+    ref_heading="$(printf '%s' "$ref" | grep -oE '「[^」]+」節$' | sed -E 's/^「//; s/」節$//')"
+    ref_target="${REPO_ROOT}/${ref_file}"
+
+    if [ ! -f "$ref_target" ]; then
+      fail "docs/dev-workflow-multi-vendor-guide.md: 参照先ファイルが実在する（#84）" \
+        "参照=[${ref_file}] 見つかりません"
+      continue
+    fi
+
+    ref_found=0
+    for level in 1 2 3 4 5 6; do
+      prefix="$(printf '#%.0s' $(seq 1 "$level"))"
+      if grep -Fxq "${prefix} ${ref_heading}" "$ref_target"; then
+        ref_found=1
+        break
+      fi
+    done
+
+    if [ "$ref_found" -eq 1 ]; then
+      pass "docs/dev-workflow-multi-vendor-guide.md: 「${ref_heading}」節が ${ref_file} に実在する（#84）"
+    else
+      fail "docs/dev-workflow-multi-vendor-guide.md: 「${ref_heading}」節が ${ref_file} に実在する（#84）" \
+        "参照先=[${ref_file}] 見出し=[${ref_heading}] が見つかりません"
+    fi
+  done <<< "$DOC84_REFS"
 fi
 
 # ---------------------------------------------------------------------------

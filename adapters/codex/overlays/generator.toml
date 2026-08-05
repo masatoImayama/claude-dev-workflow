@@ -45,3 +45,27 @@ Claude Code 版と異なり、**このエージェント専用の worktree は�
 プラグイン同梱フックは初回に信頼付与が必要なので、
 ブロックが働かない場合はフックが信頼されているか確認すること。
 '''
+
+# context7（任意依存・Epic #66 Phase 3・#71）: generator にのみ MCP サーバーを与える。
+#
+# Codex にはサブエージェント単位でMCPツール名を絞り込む機構（Claude Code の `tools:`
+# allowlist相当）が無い（`sandbox_mode` はファイルアクセスの粒度でしかなく、MCPツール名の
+# 単位では絞れない。docs/dev-workflow-multi-vendor-guide.md 3.3.2 参照）。
+# その代わり、エージェント単位のTOMLに `mcp_servers` を書くとそのエージェント専用の宣言に
+# なり、親セッションからの継承を上書きできる。generator.toml だけに書き、
+# planner.toml / evaluator.toml には書かないことで「generatorにのみ」を実現する
+# （`.codex-plugin/plugin.json` 側には宣言しない。宣言するとセッション全体・全サブエージェントに
+# 継承されてしまい、generatorだけに絞れなくなるため）。
+#
+# context7はツールが `resolve-library-id` / `query-docs` の2つしか無いため、サーバー単位の
+# 限定でもClaude版のツール単位限定（#71 adapters/claude/overlays/generator.md の tools:）と
+# 実質的に同じ結果になる。実測・詳細は docs/optional-mcp-tools.md を参照。
+#
+# command はローカルにインストール済みの `context7-mcp` バイナリ（PATH上）を直接指す
+# （#80 レビュー対応）。`npx -y` によるネットワーク越しの毎回オンデマンド取得は行わない。
+# 未導入環境では「コマンドが見つからない」で即座に失敗し、他のツール・セッション起動を
+# ブロックしない（docs/optional-mcp-tools.md 実測結果参照）。バージョン固定は導入コマンド側の
+# 利用者の責務（例: `npm install -g @upstash/context7-mcp@3.2.5`）。詳細は同ドキュメント
+# 「Phase 1 申し送りへの回答」を参照。
+[mcp_servers.context7]
+command = "context7-mcp"

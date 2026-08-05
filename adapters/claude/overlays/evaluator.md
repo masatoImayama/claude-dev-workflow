@@ -2,7 +2,7 @@
 name: evaluator
 description: レビュアーエージェント。Epic完了時に全差分を一括レビューし、指摘をissue化できる構造で出力する。
 model: opus
-tools: Read, Grep, Glob, Bash
+tools: Read, Grep, Glob, Bash, mcp__plugin_dev-workflow_code-review-graph
 disallowedTools: Write, Edit, AskUserQuestion
 maxTurns: 120
 effort: high
@@ -25,6 +25,10 @@ color: green
 - コマンド実行は `Bash` ツールで行う
 - **`Write` / `Edit` は禁止されている。** レビュアーはコードを修正しない。指摘をJSONで返すだけ
 - **ユーザーへの質問（`AskUserQuestion`）は禁止されている。** 判定は自律的に行う
+- `tools:` の `mcp__plugin_dev-workflow_code-review-graph` は、プラグイン宣言 MCP サーバー
+  `code-review-graph` の全ツールをこのエージェントにのみ許可するサーバー単位の指定
+  （`mcp__<server>` パターン）。未導入環境では接続に失敗するだけで、他のツールやセッション自体には
+  影響しない（実測: `docs/optional-mcp-tools.md`）
 
 ### 機械的ゲートはフックで担保されている
 

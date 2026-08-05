@@ -264,6 +264,21 @@ Task #<番号> を実装してください。
 - 報告には「実際に叩いたテストコマンドの全文」と「ベース検証の実出力」を含めること
 ```
 
+#### トークン消費の記録（効果測定。Task #76・決定3でClaude版と同じ結線を入れる）
+
+Codex にはClaude Codeの「Task完了時に `N tool uses · Xk tokens · Ym Zs` を表示する」に相当する
+既定の要約表示が無い。**Codex側でトークン数が取得できない場合は、その事実を明記した上で
+記録をスキップする。** `codex exec` を JSON 出力形式（`--json` 等、上流の対応状況に応じて）で
+起動し使用量が取得できた場合に限り記録する:
+
+```bash
+bash "${CLAUDE_PLUGIN_ROOT}/scripts/record-agent-tokens.sh" record \
+  --epic "$EPIC_NUM" --role generator --mode "タスク実装" --tokens [取得できたトークン数] --note "#<番号>"
+```
+
+取得できない場合は何も呼ばず、次のStepへ進む。**`record-agent-tokens.sh` の成否・トークン数の
+有無に関わらず、自律ループは止めない。**
+
 ### Step 4: レーンを wave ブランチへ取り込む
 
 ```bash
@@ -462,6 +477,14 @@ codex exec --output-schema "${CLAUDE_PLUGIN_ROOT}/adapters/codex/schemas/evaluat
   "evaluator として Epic #<epic番号> の main...<EPIC_BRANCH> をレビューせよ"
 ```
 
+トークン数が取得できた場合のみ記録する（取得できない場合はその事実を明記し、記録をスキップする。
+Task #76・自律ループは止めない）:
+
+```bash
+bash "${CLAUDE_PLUGIN_ROOT}/scripts/record-agent-tokens.sh" record \
+  --epic "$EPIC_NUM" --role evaluator --mode epic-review --tokens [取得できたトークン数]
+```
+
 ### R2: 指摘をissue化
 
 `high` と `medium` の指摘だけを issue にする。`low` は PR本文に記録するだけ。
@@ -503,10 +526,74 @@ Epic #<epic番号> の指摘対応を確認してください。
 - 最後に必ずJSONを出力すること
 ```
 
+R1と同じ作法でこのdelta-review呼び出しのトークン消費も記録する（取得できた場合のみ。
+取得できなければスキップし、自律ループは止めない）:
+
+```bash
+bash "${CLAUDE_PLUGIN_ROOT}/scripts/record-agent-tokens.sh" record \
+  --epic "$EPIC_NUM" --role evaluator --mode delta-review --tokens [取得できたトークン数]
+```
+
 ### R4: 打ち切り
 
 2巡目でも `REQUEST_CHANGES` が残る場合は**打ち切ってPRを作成する。** 未対応の指摘は
 issue をオープンのまま残し、PR本文に列挙して人間の判断に委ねる。
+
+### レビュー粒度の調整
+
+R1 の起動前に変更ファイル数を数え、しきい値（目安: 変更50ファイル超。`skills/run/SKILL.md`
+の既存しきい値と同じ）で3つに分岐する。**新しいしきい値の軸は増やさず、この50ファイル超の
+しきい値に相乗りする。**
+
+dev-workflow は**駆動先プロジェクト**でこの SKILL.md を実行するプラグインであり、駆動先の
+デフォルトブランチが `main` とは限らない。**ベースブランチを `master`/`main` に決め打ちしない**
+（dev-workflow 自身のリポジトリのデフォルトブランチが `master` であっても、それを駆動先の値
+として埋め込んではならない）。`gh repo view` で駆動先の実際のデフォルトブランチを解決する:
+
+```bash
+BASE_BRANCH="$(gh repo view --json defaultBranchRef -q .defaultBranchRef.name 2>/dev/null)"
+BASE_BRANCH="${BASE_BRANCH:-main}"
+
+if CHANGED_FILES_LIST="$(git diff --name-only "${BASE_BRANCH}...${EPIC_BRANCH}")"; then
+  CHANGED_FILES="$(printf '%s\n' "$CHANGED_FILES_LIST" | grep -c '.')"
+else
+  echo "WARN: git diff ${BASE_BRANCH}...${EPIC_BRANCH} に失敗し、変更ファイル数を数えられなかった。Phase 単位分割にフォールバックする" >&2
+  CHANGED_FILES=""
+fi
+```
+
+`git diff` を `wc -l` に直接パイプしない。パイプすると `git diff` が失敗しても `wc -l` は0を
+返して**失敗を握り潰し**、「CHANGED_FILES <= 50 → 従来どおり」に誤判定してしまう
+（ベースブランチが存在しない等で起きうる）。上記のとおり `git diff` 自体の終了コードを見て、
+失敗時は `CHANGED_FILES` を空にし、**サイズ不明のまま「従来どおり（分割なし）」に倒さず**
+Phase 単位分割へフォールバックする。
+
+| 条件 | 挙動 |
+|---|---|
+| `CHANGED_FILES` を数えられなかった（`git diff` 失敗） | **Phase 単位分割にフォールバックする**（既存の回避策。サイズ不明の場合に安全側へ倒す） |
+| `CHANGED_FILES` <= 50 | **従来どおり。** code-review-graph には一切触れない（グラフ構築もしない） |
+| `CHANGED_FILES` > 50 かつ code-review-graph が利用可能（`command -v code-review-graph`） | evaluator への指示に「blast radius の算出を使って読む優先順位を付けてよい」旨を含めて起動する |
+| `CHANGED_FILES` > 50 かつ code-review-graph が未導入 | **従来どおり**、R1 を Phase 単位に分割して起動する |
+
+code-review-graph が利用可能な場合でも、Phase 単位の分割を**禁止はしない**（両立してよい）。
+どちらの場合も**タスク単位には戻さない**。
+
+blast radius を使う場合の指示例（R1 の基本形に1行加えるだけでよい）:
+
+```
+Epic #<epic番号> の全変更をレビューしてください。
+- モード: epic-review
+- 差分範囲: main...<EPIC_BRANCH>
+- 変更ファイル数が50超のため、code-review-graph の blast radius の算出を使って読む優先順位を付けてよい
+- 最後に必ずJSON（verdict / reviewed_commit / findings）を出力すること
+```
+
+code-review-graph が未導入の場合（従来どおり Phase 単位に分割する既存の回避策）:
+
+```
+Epic #<epic番号> のうち Phase 1 の変更をレビューしてください。
+- 差分範囲: main...<EPIC_BRANCH> のうち <Phase1で変更されたファイル群>
+```
 
 ## PR作成（最終責務）
 
@@ -517,6 +604,26 @@ gh pr create --base main --head "${EPIC_BRANCH}" --title "Epic: <機能名>" --b
 
 PR本文には Summary（`Closes #<epic番号>`）、完了タスク、レビュー結果、未対応の指摘、
 軽微な指摘、Test plan を含める。**PRを作成せずに終了してはならない。**
+
+### PR本文への「トークン消費」集計（効果測定。Task #76・決定3）
+
+Claude版（`skills/run/SKILL.md`）と同じく、「実行時間」相当の集計の隣に
+`record-agent-tokens.sh --summary` の出力をそのまま載せる:
+
+```bash
+bash "${CLAUDE_PLUGIN_ROOT}/scripts/record-agent-tokens.sh" --summary --epic "$EPIC_NUM"
+```
+
+```
+## トークン消費
+[record-agent-tokens.sh --summary --epic "$EPIC_NUM" の出力をそのまま貼る]
+
+比較対象（Epic #42実測。docs/optional-mcp-tools.md「効果測定のベースライン」参照）:
+generator タスク実装 81k〜150k / evaluator delta-review 83k / evaluator epic-review 139k。
+```
+
+Codex側でトークン数が一度も取得できず1件も記録が無い場合は、その旨を一行明記した上で
+このセクションを省略してよい。**記録の有無はPR作成のブロッカーにしない。**
 
 ## 完了通知
 

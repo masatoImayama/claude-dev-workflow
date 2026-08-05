@@ -1,0 +1,441 @@
+# 任意依存として結線する外部 MCP ツール
+
+Epic #66 の Phase 1（#67）で実測した、プラグイン宣言 MCP サーバーの未導入時挙動の記録。
+Phase 3（#71 context7）・Phase 4（#73 code-review-graph）はこの結果に乗る。
+
+## 対象ツール
+
+| ツール | パッケージ | 起動コマンド（上流で確認した値） | 導入手順（上流で確認した値） |
+|---|---|---|---|
+| context7 | `@upstash/context7-mcp`（npm, v3.2.5時点で確認） | `npx -y @upstash/context7-mcp`（`bin.context7-mcp = dist/index.js`。既定は stdio。`--transport http` は `npm run start` 用のスクリプトであり MCP サーバーの既定起動には使わない） | `npx ctx7 setup` で OAuth 認証・APIキー発行・スキル導入まで一括で行う方式が現在の上流の主流（README 記載）。手動で MCP クライアントに登録する場合はホスト型サーバー `https://mcp.context7.com/mcp` を使う案内が前面に出ているが、ローカルで動かす npm パッケージ `@upstash/context7-mcp` は現在も配布されている |
+| code-review-graph | `code-review-graph`（PyPI, Python 3.10+） | `code-review-graph serve`（stdio既定。`code-review-graph mcp` はエイリアス。`code-review-graph serve --http` でHTTP切替可） | `pip install code-review-graph`（または `pipx install` / `uvx`）→ `code-review-graph install --platform claude-code` でMCP設定を自動生成 → `code-review-graph build` でグラフを構築 |
+
+上記「起動コマンド」列は上流README上の推奨値の記録であり、dev-workflowが実際に`.claude-plugin/plugin.json`
+等で使う値とは異なる。context7についてはdev-workflowは`npx -y ...`ではなく、導入済み前提の
+`context7-mcp`を直接指す（下記「申し送りに対してどう応えたか（#80 レビュー対応）」参照）。
+
+**上流の想定との差分（実測して確認した値）:**
+
+- Epic #66 本文は context7 のMCPツール名を `resolve-library-id` / `get-library-docs` の2つと想定していたが、
+  上流 README（`upstash/context7`, 2026-08-05時点の `master`）を確認したところ実際のツール名は
+  `resolve-library-id` / **`query-docs`** だった（`get-library-docs` ではない）。
+  Phase 3（#71・#72）で正確な名前を使うこと。
+- code-review-graph のMCPツール数は上流 `docs/COMMANDS.md` の `#### \`...\`` 見出し数を数えて **30個**と確認した
+  （Epic本文の「30ツール」という記載と一致）。
+
+## 実測手順
+
+Claude Code CLI（`claude`, v2.1.222）が使える環境だったため、実際に起動して観測した。
+一時ディレクトリを作り、存在しないコマンドを `command` に指定した `.mcp.json`（プロジェクトスコープのMCP設定。
+`.claude-plugin/plugin.json` の `mcpServers` フィールドとスキーマは同じ）を置いて `claude -p`（非対話モード）で
+起動した。作業ディレクトリはプロジェクト外の一時ディレクトリに限定し、リポジトリを汚さなかった。
+
+```bash
+TMPDIR_EXP="$(mktemp -d)"
+cat > "${TMPDIR_EXP}/.mcp.json" <<'JSON'
+{
+  "mcpServers": {
+    "does-not-exist": {
+      "command": "dev-workflow-nonexistent-binary",
+      "args": []
+    }
+  }
+}
+JSON
+
+cd "${TMPDIR_EXP}"
+time claude -p "Bashツールでecho check-ok を実行し、最後にDONE_MARKERとだけ出力してください。" \
+  --mcp-config .mcp.json --strict-mcp-config --allowedTools "Bash" \
+  --permission-mode bypassPermissions --debug-file debug.log --output-format json
+```
+
+サブエージェント起動の確認には `--agents` でアドホックなエージェントを定義し、`tools:` に存在しない
+MCPツール名（`mcp__does-not-exist__some_nonexistent_tool`）を含めて `Task` ツールから起動させた。
+
+起動遅延（タイムアウト待ち）の確認には、コマンドは実在するが MCP ハンドシェイクに一切応答しない
+プロセス（`sleep 60`）を `command` に指定した別の `.mcp.json` を用意し、同様に計測した。
+
+`--output-format stream-json --verbose` で起動すると、非デバッグモードでも `system init` イベントに
+`mcp_servers` フィールドとして各サーバーの接続状態（`status: "failed"` 等）が出ることも確認した。
+
+## 実測結果
+
+### 1. セッションは起動するか
+
+起動する。存在しないコマンドを宣言しても `claude -p` は正常に完走した（`is_error: false`,
+`terminal_reason: "completed"`, `stop_reason: "end_turn"`, `exit_code: 0`）。
+
+### 2. 警告は出るか。どこに出るか
+
+出る。実出力（`--debug-file` で得たログの該当行。個人環境固有の情報は除いた抜粋）:
+
+```
+2026-08-05T11:12:05.038Z [DEBUG] MCP server "does-not-exist": Starting connection with timeout of 30000ms
+2026-08-05T11:12:05.300Z [ERROR] "MCP server \"does-not-exist\" Server stderr: 'dev-workflow-nonexistent-binary' は、内部コマンドまたは外部コマンド、
+操作可能なプログラムまたはバッチ ファイルとして認識されていません。
+2026-08-05T11:12:05.301Z [DEBUG] MCP server "does-not-exist": Connection failed after 265ms (-32000): MCP error -32000: Connection closed
+2026-08-05T11:12:05.301Z [ERROR] MCP server "does-not-exist" Connection failed (-32000): MCP error -32000: Connection closed
+```
+
+この `[ERROR]` ログは `--debug-file` を指定したときのみファイルに書かれる。既定（非デバッグ）の
+`claude -p` 実行では、通常の stdout / stderr には一切出ない（実測: `stderr.log` は0バイト）。
+
+ただし `--output-format stream-json --verbose` を付けると、デバッグフラグなしでも `system init` イベントに
+構造化された形で接続状態が載ることを確認した（実出力の該当部分）:
+
+```json
+{"type":"system","subtype":"init", ... ,"mcp_servers":[{"name":"does-not-exist","status":"failed"}], ...}
+```
+
+`tools` フィールドには `Task` `Bash` `Read` `Edit` 等の標準ツールが通常どおり全て列挙されており、
+MCPサーバーの接続失敗がツール一覧に影響しないことも同時に確認できた。
+
+### 3. 起動後、他のツール（Read / Bash 等）が通常どおり使えるか
+
+使える。上記と同じセッションで `Bash` ツールに `echo check-ok` を実行させたところ、正常に完了した
+（実出力: `"result":"...Bash実行結果: \`echo check-ok\` → \`check-ok\`\n\nDONE_MARKER"`）。
+
+### 4. サブエージェントを起動できるか（`tools:` に存在しないMCPツール名を書いた場合）
+
+できる。`--agents` で `tools: ["Bash", "mcp__does-not-exist__some_nonexistent_tool"]` を持つ
+アドホックエージェント `exp-agent` を定義し、`Task` ツールから起動させたところ、正常に起動・完走した。
+
+実出力（デバッグログ、個人環境固有の情報を除いた抜粋）:
+
+```
+2026-08-05T11:12:45.723Z [DEBUG] [API REQUEST] /v1/messages ... source=agent:custom:exp-agent
+2026-08-05T11:12:51.221Z [INFO] [Stall] agent_completion agentId=a048a0de39c77bbe7 agentType=exp-agent exitPath=completed durationMs=5510 turns=2 finalStopReason=end_turn
+```
+
+最終結果（実出力）:
+
+```
+exp-agent は正常に起動し、Bash で `echo subagent-ok` を実行しました。標準出力は `subagent-ok`、
+終了ステータス 0（stderr なし）。存在しない MCP ツールが定義に含まれていても、エージェントの起動と
+Bash 実行は問題なく動作しました。
+```
+
+存在しないMCPツール名を `tools:` に書いても、エラーにならず単に「そのツールは呼べない（他の宣言済み
+ツールだけが使える）」状態になるだけだった。
+
+### 5. 起動に時間がかかるか（タイムアウト待ちが発生するか）
+
+**ケースA（コマンドが存在しない・即座に失敗する場合）:** 接続試行から失敗確定まで実測 **265〜329ms**。
+セッション全体の所要時間（13〜20秒、LLM応答待ちを含む）に対して無視できる差であり、体感できる遅延は無い。
+
+**ケースB（コマンドは存在するがMCPハンドシェイクに応答しない＝ハングする場合）:** 実際に `sleep 60` を
+`command` に指定して計測したところ、次のとおり **既定のタイムアウト上限（30000ms）まで待ってから**
+最初のLLMリクエストが発行された（実出力、個人環境固有の情報を除いた抜粋）。
+
+```
+2026-08-05T11:13:46.087Z [DEBUG] MCP server "hangs-forever": Starting connection with timeout of 30000ms
+2026-08-05T11:14:16.199Z [DEBUG] MCP server "hangs-forever": Connection timeout triggered after 30115ms (limit: 30000ms)
+2026-08-05T11:14:16.203Z [DEBUG] MCP server "hangs-forever": Connection failed after 30118ms: MCP server "hangs-forever" connection timed out after 30000ms
+2026-08-05T11:14:16.203Z [ERROR] MCP server "hangs-forever" Connection failed: MCP server "hangs-forever" connection timed out after 30000ms
+2026-08-05T11:14:16.338Z [DEBUG] [API REQUEST] /v1/messages ... source=sdk
+```
+
+MCP接続タイムアウト確定（16.203）の135ms後に最初のAPIリクエストが発行されており、
+**セッションの最初のターン開始はMCP接続試行の解決（成功 or タイムアウト）を待ってから行われる**ことを
+確認した。実測の総所要時間（`real 0m36.964s`）もこれと整合する。
+
+この待ちは一度きり（セッション開始時のみ）で、他のツール呼び出し（Bash等）やサブエージェント起動を
+繰り返しブロックするものではない。ただし「コマンドが存在するが応答しない」壊れた導入状態では、
+セッション開始が最大約30秒遅れうる。これは「コマンドが存在しない（＝未導入）」という本来の想定
+ケースには当てはまらないが、Phase 3・4でコマンドを確定する際の注意点として残す（後述）。
+
+## 採用方式
+
+**方式A: 宣言方式** を採用する。
+
+根拠:
+
+1. 起動失敗（コマンドが存在しない、最も典型的な「未導入」の形）でもセッションは正常に起動・完走する
+2. 起動失敗は警告として記録されるだけで（`system init` の `mcp_servers[].status`、`--debug-file` のログ）、
+   セッションをブロックしない。既定の非デバッグ実行では通常のstdout/stderrに一切出ず汚染もしない
+3. 他のツール（Bash等）は接続失敗の影響を受けず、宣言時と同一セッション内で問題なく動作する
+4. サブエージェントの起動、および `tools:` に存在しないMCPツール名を含めた場合でも、エラーにならず
+   正常に起動・完走する
+5. 起動遅延は「コマンドが存在しない」場合は無視できるレベル（実測265〜329ms）。「コマンドは存在するが
+   応答しない」場合のみ最大タイムアウト（実測30115ms、既定30000ms）まで一度だけ遅延しうるが、これは
+   セッションが止まる／他ツールに影響が出るという方式Bへの分岐条件には該当しない
+   （起動が遅れるだけで、起動自体は成功する）
+
+したがって「起動失敗でも続行し、他ツール・サブエージェントに影響が無い」という方式Aの採用条件を満たす。
+
+**Phase 3・4への申し送り事項（注意点）:** 上記5のとおり、コマンドが存在するのに応答しない
+（壊れた導入・ネットワーク未接続でのオンデマンド取得待ち等）状態では最大約30秒の起動遅延が発生しうる。
+`#71`（context7）・`#73`（code-review-graph）でコマンドを確定する際は、フェイルファストな起動
+（パッケージがローカルに無ければ即座にエラー終了する等）を優先し、ネットワーク越しのオンデマンド
+取得に依存する起動コマンドを避けることが望ましい。
+
+## 申し送りに対してどう応えたか（#80 レビュー対応）
+
+`#71` は当初この申し送りに反し、`npx -y @upstash/context7-mcp` という「パッケージが手元に無ければ
+npmレジストリから毎セッション自動取得する」起動コマンドを採用していた。レビュー指摘 #80（重要度high）
+を受けて見直し、次のとおり是正した。
+
+**上流README（`upstash/context7` master、`packages/mcp/README.md`）を確認した結果:**
+
+- APIキーは**任意**（Optional）。無くても動く。「レート制限緩和・プライベートリポジトリ用」の位置付けで、
+  必須ではない（`### Requirements` 節: "Context7 API Key (Optional) for higher rate limits..."）
+- ローカル（stdio）起動は `npx -y @upstash/context7-mcp [--api-key YOUR_API_KEY]`
+  が上流の案内する既定形。`--transport` を省略した場合の既定値は `stdio`（`packages/mcp/src/index.ts`
+  で確認済み。`--transport http` は明示指定時のみ）
+- APIキーはCLIオプション `--api-key` のほか、環境変数 `CONTEXT7_API_KEY` でも渡せる
+  （同ソース: `stdioApiKey = cliOptions.apiKey || process.env.CONTEXT7_API_KEY`）
+- npmパッケージ`@upstash/context7-mcp`の`bin`エントリは`context7-mcp`という名前で公開されている
+  （`package.json`: `"bin":{"context7-mcp":"dist/index.js"}`）。上記「対象ツール」表の記載と一致する
+
+**採った方式: 「1. 自動取得しないフェイルファストな起動に変える」**
+
+`.claude-plugin/plugin.json`・`adapters/codex/overlays/generator.toml` の両方で、`command` を
+`npx -y @upstash/context7-mcp` から、PATH上に導入済みの `context7-mcp` バイナリを直接指す形に変更した
+（`code-review-graph`のPhase4で採った方式と同じ「導入済み前提でPATH解決に任せる」パターン）。
+
+これにより指摘の4点に次のとおり応える。
+
+1. **同意なき自動取得**: 解消。`context7-mcp`が見つからなければ「コマンドが見つからない」で
+   即座に接続失敗するだけであり（実測結果1〜3で確認済みの、方式Aが前提とする「未導入」の挙動と同じ）、
+   npmレジストリへの自動取得は起きない。利用者が明示的に`npm install -g @upstash/context7-mcp`等を
+   実行して初めて有効になる、opt-inな形になった
+2. **バージョン固定が無い**: dev-workflow側では固定しない。固定するかどうかは導入コマンドを叩く利用者の
+   選択に委ねる（例: `npm install -g @upstash/context7-mcp@3.2.5`で固定できる）。dev-workflowが
+   `npx -y`で常に最新を解決する経路を廃止したことで、上流の破壊的変更が利用者の関知しないタイミングで
+   直撃することは無くなった。これが「固定しない理由」であり、固定しないこと自体は利用者の意思決定に
+   委ねる設計判断である
+3. **Phase 1の申し送りを守っていなかった**: 本対応で是正した。フェイルファストな起動
+   （コマンドがローカルに無ければ即座にエラー終了する）を優先し、ネットワーク越しのオンデマンド取得に
+   依存する起動コマンドを避けるという申し送りどおりの形にした
+4. **APIキーが必要で機能しない可能性**: 上流確認の結果、APIキーは任意（無くても動作する。レート制限が
+   厳しくなるだけ）と判明したため、必須の対応は不要と判断した。ただし利用者が緩和したい場合のため、
+   環境変数`CONTEXT7_API_KEY`をシェルに設定しておけば、dev-workflow側で何も設定しなくても
+   子プロセスへの環境変数継承により自動的に渡る（`.claude-plugin/plugin.json`・`generator.toml`側で
+   APIキーの受け渡し設定を追加する必要は無い）ことを確認し、ここに記録する
+
+**`#82`（`scripts/check-prerequisites.sh`の任意ツール検出）への前提:** 現状の
+`optional_tools_notice`は`command -v npx`でcontext7の導入判定をしている（`npx`はNode.js同梱で
+ほぼ常に存在するため、実質的に「常に導入済み」と誤判定する）。本対応の結果、正しい判定コマンドは
+`context7-mcp`になる。`#82`はこの結論を前提に`command -v npx`を`command -v context7-mcp`へ
+修正すること。本タスク（#80）ではその修正自体は行わない（指示範囲外）。
+
+## MCP ツール名
+
+方式Aを採用したため、`.claude-plugin/plugin.json` の `mcpServers`（または `.mcp.json`）で宣言する。
+プラグイン由来のMCPツール名の書式は次のとおり（Claude Code公式ドキュメント準拠）。
+
+```
+mcp__plugin_<plugin-name>_<server-name>__<tool-name>
+```
+
+`<plugin-name>` は本プラグインの `.claude-plugin/plugin.json` の `name` フィールドの値（`dev-workflow`）で
+固定される。`<server-name>` は `#71`（context7）・`#73`（code-review-graph）で `mcpServers` に登録する
+サーバーキー名で確定するため、本タスクでは確定しない。上記「対象ツール」節で確認した実際のツール名を
+使うと、想定される名前は次のとおり（`<server-name>` は仮に `context7` / `code-review-graph` とした場合の例）。
+
+- context7: `mcp__plugin_dev-workflow_context7__resolve-library-id`,
+  `mcp__plugin_dev-workflow_context7__query-docs`
+  （`get-library-docs` ではなく `query-docs` である点に注意。上記「対象ツール」節参照）
+- code-review-graph: `mcp__plugin_dev-workflow_code-review-graph__<tool_name>`
+  （30個のツール名は上流 `docs/COMMANDS.md` の `#### \`...\`` 見出しを参照。例:
+  `build_or_update_graph_tool`, `get_minimal_context_tool`, `get_impact_radius_tool` 等）
+
+## 任意依存であることの保証
+
+外部ツール（context7 / code-review-graph）が未導入の環境で、方式Aの宣言によって次のことは**起きない**
+（実測で確認済み）:
+
+- セッションが起動できない、または途中で落ちる
+- 他のツール（Bash / Read / Edit / Task 等）が使えなくなる
+- サブエージェントが起動できなくなる
+- `tools:` に存在しないMCPツール名を書いたサブエージェント定義がエラーになる
+- 通常のstdout/stderrにエラーメッセージが漏れてユーザー向け出力を汚す
+- 体感できるほどの起動遅延（「コマンドが存在しない」ケースでは実測265〜329ms。無視できる）
+
+一方、次の限界がある（未導入とは異なる「壊れた導入」のケースでのみ発生する。上記「実測結果 5」参照）:
+
+- コマンドが存在するのに応答しない状態（壊れた導入・ネットワーク未接続でのオンデマンド取得待ち等）では、
+  セッション開始が最大約30秒（既定タイムアウト）遅れうる。これはセッションの起動そのものを妨げるもの
+  ではなく、開始が遅れるだけで、一度きり（他のツール呼び出しの繰り返しをブロックするものではない）
+
+## Phase 4: code-review-graph の結線（#73）
+
+上記「採用方式」（方式A: 宣言方式）に従い、code-review-graph を **evaluator にのみ**結線した。
+planner / generator には与えない（Epic #66 決定4）。
+
+### 上流の起動コマンド（上流 README で確認した値）
+
+`code-review-graph serve`（`args: ["serve"]`）。ホストの `PATH` 上の `code-review-graph`
+コマンドをそのまま `command` に指定する（`pip install code-review-graph` 等で導入されていれば
+解決される。未導入なら「コマンドが見つからない」という、上記「実測結果」で確認済みの
+最も典型的な未導入ケースに落ちる）。
+
+### Claude Code側: サーバー単位のツール許可
+
+`.claude-plugin/plugin.json` の `mcpServers` に `code-review-graph` を宣言し、
+`adapters/claude/overlays/evaluator.md` の frontmatter `tools:` に
+`mcp__plugin_dev-workflow_code-review-graph`（`mcp__<server>` パターン。個別ツール名の
+`__<tool-name>` を付けずサーバー名までで止める）を追加した。これは Claude Code 公式ドキュメント
+（`sub-agents.md`）に明記された「MCPサーバー単位のパターンはサーバーの全ツールを一括で
+許可/除外する」という仕様に基づく。
+
+上流 `docs/COMMANDS.md` を確認したところ、code-review-graph のMCPツールは実際に30個
+（`#### \`...\`` 見出し30件）であり、Epic本文の記載と一致した。30個を個別に列挙せずサーバー単位で
+許可したのは、列挙の手間を惜しんだからではなく、Epic本文が明記する「ツールが多いから絞る、という
+理由で恣意的に間引かない」という方針に従い、evaluatorに全30ツールへのアクセスを一括で与えるためである
+（個別列挙してもサーバー単位許可しても、結果として与えるツールの集合は同じ30個になる）。
+
+### Codex側: エージェント単位の `mcp_servers` 宣言
+
+Codex はサブエージェント定義自体をプラグインで配布できない
+（`docs/dev-workflow-multi-vendor-guide.md` 3.3.4）。したがって `.codex-plugin/plugin.json` の
+`mcpServers`（セッション全体に効くグローバル宣言）は使わず、代わりに
+`adapters/codex/overlays/evaluator.toml` に直接 `[mcp_servers.code-review-graph]` テーブルを
+宣言した。config.toml のキー（`mcp_servers` を含む）はエージェント定義に併記でき、
+省略した場合のみ親セッションから継承される（同ガイド 3.3.2）。`planner.toml` / `generator.toml`
+には何も追加していないため、code-review-graph はグローバルにもそれらのエージェントにも渡らない。
+Claude Code側の「セッション全体に宣言し、サブエージェント単位のツール許可で絞る」方式とは
+機構が異なるが、**「evaluatorだけが使える」という結果は同じであり、機能差は無い。**
+
+Codex公式の設定リファレンス（`mcp_servers.<id>.required`）によれば、`required` を明示しない
+MCPサーバーは既定で非必須接続であり、起動できなくてもエージェントの起動をブロックしない。
+これは Claude Code側で実測した「起動失敗でもセッションが継続する」という挙動と整合する。
+ただし、この既定挙動は公式ドキュメント記載を根拠にしたものであり、Claude Code CLIのように
+実際に起動して観測してはいない（#67の実測はClaude Code CLIのみを対象にしている）。将来
+Codex側でも同様の実測を行う場合は、この記述を実測結果で更新すること。
+
+### `.gitignore`
+
+code-review-graph の生成物（SQLiteグラフDB・キャッシュ）は `.code-review-graph/` に置かれる
+（上流READMEで確認済み）。`.gitignore` に追加した。
+
+### evaluator にのみ与えることの検証
+
+`tests/run-tests.sh` は generator と planner とで検査基準を分けている。
+
+- **generator**（`agents/generator.md` / `codex-agents/generator.toml`）: `code-review-graph`
+  という文字列が**一切現れない**ことを検査する。
+- **planner**（`agents/planner.md` / `codex-agents/planner.toml`）: MCP結線を表す文字列
+  （`mcp__plugin_dev-workflow_code-review-graph` / `[mcp_servers.code-review-graph]`）が
+  **現れない**ことのみを検査する。`## 準備コマンド` 節のCLI例としての `code-review-graph build`
+  という言及自体は許容する。
+
+この区別を設けたのは、`#75` で仕様書 3.6 の要求（グラフ構築コマンドを Epic issue 本文の
+`## 準備コマンド` 節に書く例を、その節の書き方を示す `core/roles/planner.md` に併記すること）
+に従い、planner の正本に `code-review-graph build` という文字列を書いたためである。これは
+MCPツールとしての結線ではなく、Epic開始時にrunが1回実行するCLIコマンド例の記述であり
+（詳細は下記「グラフ構築は Epic 開始時に1回（#75）」節参照）、「evaluatorにのみMCPツールとして
+結線する」という決定（Epic #66 決定4）とは矛盾しない。したがって planner の生成物
+（`agents/planner.md:109,117` 等）に `code-review-graph` という文字列が現れること自体は正常であり、
+検査対象はあくまで**MCP結線文字列の不在**に絞っている。
+
+### dev-workflow 自身では発火しないのが正常
+
+code-review-graph は Tree-sitter による AST 解析が中核であり、dev-workflow 自身のロジックの大半は
+`core/*.md` と `skills/*/SKILL.md`（markdown）および bash に載っている。
+**dev-workflow 自身のような markdown + bash 主体のリポジトリでは、code-review-graph の
+呼び出しグラフからほとんど情報が出ず、発火しないのが正常である。** 「発火しない = 壊れている」
+ではない。この限界は `core/roles/evaluator.md` の「## 任意ツール: code-review-graph」節にも
+明記した。効果が出るのは dev-workflow が駆動する側のプロジェクト（実コードを持つプロジェクト）である。
+
+### グラフ構築は Epic 開始時に1回（#75）
+
+グラフ構築（`code-review-graph build`）は Epic issue 本文の `## 準備コマンド` 節
+（Epic #14・issue #23 で導入済みの既存の仕組み）に書き、run が Epic 開始時に1回だけ実行する。
+レビューのたびに構築し直さない。**evaluator 自身はグラフを構築しない。** レビュー時点で
+未構築であれば、その事実を報告した上で従来どおり（ツール無しの手順で）レビューする。
+書き方の例は `core/roles/planner.md` の「プロジェクト固有の準備コマンド」を参照。
+## Phase 3（#71）: context7 の結線方式（Claude / Codex の差分）
+
+Epic本文はcontext7のMCPツール名を `resolve-library-id` / `get-library-docs` と想定していたが、
+上記「対象ツール」節のとおり実際は `resolve-library-id` / **`query-docs`** である。
+generator にのみ結線し、planner / evaluator には与えない（決定6）。
+
+**起動コマンド（#80 レビュー対応で `npx -y ...` から変更済み）:** `command` には
+`npx -y @upstash/context7-mcp` ではなく、導入済み前提でPATH解決に任せる `context7-mcp`
+（npmパッケージ`@upstash/context7-mcp`の`bin`名）を直接指定する。理由・APIキーの扱い・
+バージョン固定の考え方は上記「申し送りに対してどう応えたか（#80 レビュー対応）」節を参照。
+
+### Claude Code 側
+
+`.claude-plugin/plugin.json` の `mcpServers.context7` にサーバーを宣言し、
+`adapters/claude/overlays/generator.md` の frontmatter `tools:` にツール名を2つとも明示的に
+列挙する（サーバー全体のワイルドカードは使わない）。
+
+```
+mcp__plugin_dev-workflow_context7__resolve-library-id
+mcp__plugin_dev-workflow_context7__query-docs
+```
+
+セッション全体（`.claude-plugin/plugin.json`）にサーバーを宣言しても、`tools:` に列挙していない
+planner / evaluator のサブエージェントはそのツールを呼べない（実測結果4のとおり、`tools:` に
+存在しないツール名を含めてもエラーにならないのと同じ理屈で、逆に列挙しなければ単に使えないだけ）。
+
+### Codex CLI 側（Claude Code との差分と回避策）
+
+**Codex にはサブエージェント単位でMCPの「ツール名」を絞り込む機構が無い。**
+`docs/dev-workflow-multi-vendor-guide.md` 3.3.2 のとおり、Codex のサブエージェント定義（TOML）は
+Claude Code の `tools:` allowlist に相当する項目を持たず、`sandbox_mode`（ファイルアクセス等の
+粗い粒度）しか無い。したがって「ツール単位でallowlistする」ことはできない（できない理由）。
+
+**回避策:** Codex のエージェントTOMLは `mcp_servers` キーを個別に持てる（省略時は親セッションから
+継承する）。この性質を使い、`.codex-plugin/plugin.json` にはcontext7を宣言せず（宣言すると
+セッション全体・全サブエージェントに継承されてしまう）、`adapters/codex/overlays/generator.toml`
+にだけ `[mcp_servers.context7]` を書く。これにより **サーバー単位**でgeneratorだけに絞り込める。
+context7はツールが2つしか無いため、サーバー単位の限定でもClaude版のツール単位限定と実質的に
+同じ結果になり、機能差は生じない。
+
+まとめると、絞り込みの**粒度**（ツール単位 vs サーバー単位）はCLI間で異なるが、
+「generatorにのみcontext7が使える」という**結果**は両CLIで一致する。
+
+## Phase 5（#76）: 効果測定のベースラインと「外す判断基準」
+
+3つの任意依存ツール（ponytail / context7 / code-review-graph）を導入する目的は
+「サブエージェントが同じ成果をより少ないトークンで、あるいはより高いレビュー品質で出せる」
+ことである。導入して終わりにせず、**実測して効果を確認し、効かなければ外す**（Epic #66 決定5）。
+
+### 効果測定のベースライン（導入前の実測値）
+
+Epic #42 の run 実績（3つの任意依存ツールを導入する前）から得た実測値。今後の Epic での
+`bash scripts/record-agent-tokens.sh --summary --epic <N>` の出力と比較する基準線として使う。
+
+| 役割 | モード | 実測トークン |
+|---|---|---|
+| generator | タスク実装 | 81k 〜 150k / タスク |
+| evaluator | delta-review | 83k |
+| evaluator | epic-review | 139k |
+
+**evaluator の epic-review が単発で最も重い。** 変更ファイル数が多いEpicでは`docs/optional-mcp-tools.md`
+「レビュー粒度の調整」節のとおりPhase単位分割やcode-review-graphのblast radius算出が効いてくる想定であり、
+この数値がその効果を測る基準になる。
+
+### 記録・集計の仕組み
+
+`scripts/record-agent-tokens.sh`（Task #76）が、Epic/role/mode ごとのトークン消費をTSVで記録し、
+`--summary`で件数・合計・平均を集計する。generator / evaluator の起動が終わるたびに
+`skills/run/SKILL.md`・`skills-codex/dev-workflow-run/SKILL.md`の各Stepから呼ばれ、
+Epic完了時にはPR本文の「トークン消費」節に集計結果を載せる。追加の依存物（`jq`等）は使わず、
+記録先はリポジトリ内のローカル作業領域（`.claude/agent-tokens.tsv`。git管理外。`.gitignore`参照）に限る。
+
+トークン数が取得できない場合（Claude Codeの完了要約が読み取れない、Codexで使用量が取得できない等）は
+記録をスキップする。**記録の成否は自律ループを止めない。**
+
+### 外す判断基準
+
+複数の Epic を通して、当該ツールを有効にした場合のトークン消費が無効時より減らず、
+かつレビュー品質の向上（high/medium の指摘件数、取りこぼしの減少）も観測できない場合、
+そのツールの結線を外してよい。**入れたまま複雑さだけ残すことをしない。**
+
+判断に使う材料は次の2つで、どちらか一方だけでは判断しない（トークン消費が減っても指摘の
+取りこぼしが増えていれば本末転倒であり、逆にトークン消費が多少増えても指摘品質が明確に
+向上していれば残す価値がある）。
+
+1. **トークン消費**: 上記ベースラインと、導入後の複数Epicにおける
+   `record-agent-tokens.sh --summary`の実測値を比較する
+2. **レビュー品質**: Epic一括レビューで挙がった high/medium の指摘件数、および
+   （分かる範囲で）人間のレビュアーが後から見つけた取りこぼしの件数を比較する
+
+いずれのツールも、外す場合は当該ツールの結線箇所（`.claude-plugin/plugin.json`の`mcpServers`、
+`adapters/*/overlays/*`の`tools:`または`mcp_servers`宣言、`core/roles/*.md`の使いどころの記述）を
+まとめて削除し、任意依存の仕組み自体（`check-prerequisites.sh`の非ブロッキング検出等）は
+他のツールのために残す。
