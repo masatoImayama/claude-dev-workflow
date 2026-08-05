@@ -642,6 +642,12 @@ Claude Code 版と異なり、**このエージェント専用の worktree は�
 # context7はツールが `resolve-library-id` / `query-docs` の2つしか無いため、サーバー単位の
 # 限定でもClaude版のツール単位限定（#71 adapters/claude/overlays/generator.md の tools:）と
 # 実質的に同じ結果になる。実測・詳細は docs/optional-mcp-tools.md を参照。
+#
+# command はローカルにインストール済みの `context7-mcp` バイナリ（PATH上）を直接指す
+# （#80 レビュー対応）。`npx -y` によるネットワーク越しの毎回オンデマンド取得は行わない。
+# 未導入環境では「コマンドが見つからない」で即座に失敗し、他のツール・セッション起動を
+# ブロックしない（docs/optional-mcp-tools.md 実測結果参照）。バージョン固定は導入コマンド側の
+# 利用者の責務（例: `npm install -g @upstash/context7-mcp@3.2.5`）。詳細は同ドキュメント
+# 「Phase 1 申し送りへの回答」を参照。
 [mcp_servers.context7]
-command = "npx"
-args = ["-y", "@upstash/context7-mcp"]
+command = "context7-mcp"

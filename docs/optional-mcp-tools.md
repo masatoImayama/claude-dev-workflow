@@ -10,6 +10,10 @@ Phase 3（#71 context7）・Phase 4（#73 code-review-graph）はこの結果に
 | context7 | `@upstash/context7-mcp`（npm, v3.2.5時点で確認） | `npx -y @upstash/context7-mcp`（`bin.context7-mcp = dist/index.js`。既定は stdio。`--transport http` は `npm run start` 用のスクリプトであり MCP サーバーの既定起動には使わない） | `npx ctx7 setup` で OAuth 認証・APIキー発行・スキル導入まで一括で行う方式が現在の上流の主流（README 記載）。手動で MCP クライアントに登録する場合はホスト型サーバー `https://mcp.context7.com/mcp` を使う案内が前面に出ているが、ローカルで動かす npm パッケージ `@upstash/context7-mcp` は現在も配布されている |
 | code-review-graph | `code-review-graph`（PyPI, Python 3.10+） | `code-review-graph serve`（stdio既定。`code-review-graph mcp` はエイリアス。`code-review-graph serve --http` でHTTP切替可） | `pip install code-review-graph`（または `pipx install` / `uvx`）→ `code-review-graph install --platform claude-code` でMCP設定を自動生成 → `code-review-graph build` でグラフを構築 |
 
+上記「起動コマンド」列は上流README上の推奨値の記録であり、dev-workflowが実際に`.claude-plugin/plugin.json`
+等で使う値とは異なる。context7についてはdev-workflowは`npx -y ...`ではなく、導入済み前提の
+`context7-mcp`を直接指す（下記「申し送りに対してどう応えたか（#80 レビュー対応）」参照）。
+
 **上流の想定との差分（実測して確認した値）:**
 
 - Epic #66 本文は context7 のMCPツール名を `resolve-library-id` / `get-library-docs` の2つと想定していたが、
@@ -165,6 +169,56 @@ MCP接続タイムアウト確定（16.203）の135ms後に最初のAPIリクエ
 （パッケージがローカルに無ければ即座にエラー終了する等）を優先し、ネットワーク越しのオンデマンド
 取得に依存する起動コマンドを避けることが望ましい。
 
+## 申し送りに対してどう応えたか（#80 レビュー対応）
+
+`#71` は当初この申し送りに反し、`npx -y @upstash/context7-mcp` という「パッケージが手元に無ければ
+npmレジストリから毎セッション自動取得する」起動コマンドを採用していた。レビュー指摘 #80（重要度high）
+を受けて見直し、次のとおり是正した。
+
+**上流README（`upstash/context7` master、`packages/mcp/README.md`）を確認した結果:**
+
+- APIキーは**任意**（Optional）。無くても動く。「レート制限緩和・プライベートリポジトリ用」の位置付けで、
+  必須ではない（`### Requirements` 節: "Context7 API Key (Optional) for higher rate limits..."）
+- ローカル（stdio）起動は `npx -y @upstash/context7-mcp [--api-key YOUR_API_KEY]`
+  が上流の案内する既定形。`--transport` を省略した場合の既定値は `stdio`（`packages/mcp/src/index.ts`
+  で確認済み。`--transport http` は明示指定時のみ）
+- APIキーはCLIオプション `--api-key` のほか、環境変数 `CONTEXT7_API_KEY` でも渡せる
+  （同ソース: `stdioApiKey = cliOptions.apiKey || process.env.CONTEXT7_API_KEY`）
+- npmパッケージ`@upstash/context7-mcp`の`bin`エントリは`context7-mcp`という名前で公開されている
+  （`package.json`: `"bin":{"context7-mcp":"dist/index.js"}`）。上記「対象ツール」表の記載と一致する
+
+**採った方式: 「1. 自動取得しないフェイルファストな起動に変える」**
+
+`.claude-plugin/plugin.json`・`adapters/codex/overlays/generator.toml` の両方で、`command` を
+`npx -y @upstash/context7-mcp` から、PATH上に導入済みの `context7-mcp` バイナリを直接指す形に変更した
+（`code-review-graph`のPhase4で採った方式と同じ「導入済み前提でPATH解決に任せる」パターン）。
+
+これにより指摘の4点に次のとおり応える。
+
+1. **同意なき自動取得**: 解消。`context7-mcp`が見つからなければ「コマンドが見つからない」で
+   即座に接続失敗するだけであり（実測結果1〜3で確認済みの、方式Aが前提とする「未導入」の挙動と同じ）、
+   npmレジストリへの自動取得は起きない。利用者が明示的に`npm install -g @upstash/context7-mcp`等を
+   実行して初めて有効になる、opt-inな形になった
+2. **バージョン固定が無い**: dev-workflow側では固定しない。固定するかどうかは導入コマンドを叩く利用者の
+   選択に委ねる（例: `npm install -g @upstash/context7-mcp@3.2.5`で固定できる）。dev-workflowが
+   `npx -y`で常に最新を解決する経路を廃止したことで、上流の破壊的変更が利用者の関知しないタイミングで
+   直撃することは無くなった。これが「固定しない理由」であり、固定しないこと自体は利用者の意思決定に
+   委ねる設計判断である
+3. **Phase 1の申し送りを守っていなかった**: 本対応で是正した。フェイルファストな起動
+   （コマンドがローカルに無ければ即座にエラー終了する）を優先し、ネットワーク越しのオンデマンド取得に
+   依存する起動コマンドを避けるという申し送りどおりの形にした
+4. **APIキーが必要で機能しない可能性**: 上流確認の結果、APIキーは任意（無くても動作する。レート制限が
+   厳しくなるだけ）と判明したため、必須の対応は不要と判断した。ただし利用者が緩和したい場合のため、
+   環境変数`CONTEXT7_API_KEY`をシェルに設定しておけば、dev-workflow側で何も設定しなくても
+   子プロセスへの環境変数継承により自動的に渡る（`.claude-plugin/plugin.json`・`generator.toml`側で
+   APIキーの受け渡し設定を追加する必要は無い）ことを確認し、ここに記録する
+
+**`#82`（`scripts/check-prerequisites.sh`の任意ツール検出）への前提:** 現状の
+`optional_tools_notice`は`command -v npx`でcontext7の導入判定をしている（`npx`はNode.js同梱で
+ほぼ常に存在するため、実質的に「常に導入済み」と誤判定する）。本対応の結果、正しい判定コマンドは
+`context7-mcp`になる。`#82`はこの結論を前提に`command -v npx`を`command -v context7-mcp`へ
+修正すること。本タスク（#80）ではその修正自体は行わない（指示範囲外）。
+
 ## MCP ツール名
 
 方式Aを採用したため、`.claude-plugin/plugin.json` の `mcpServers`（または `.mcp.json`）で宣言する。
@@ -282,6 +336,11 @@ code-review-graph は Tree-sitter による AST 解析が中核であり、dev-w
 Epic本文はcontext7のMCPツール名を `resolve-library-id` / `get-library-docs` と想定していたが、
 上記「対象ツール」節のとおり実際は `resolve-library-id` / **`query-docs`** である。
 generator にのみ結線し、planner / evaluator には与えない（決定6）。
+
+**起動コマンド（#80 レビュー対応で `npx -y ...` から変更済み）:** `command` には
+`npx -y @upstash/context7-mcp` ではなく、導入済み前提でPATH解決に任せる `context7-mcp`
+（npmパッケージ`@upstash/context7-mcp`の`bin`名）を直接指定する。理由・APIキーの扱い・
+バージョン固定の考え方は上記「申し送りに対してどう応えたか（#80 レビュー対応）」節を参照。
 
 ### Claude Code 側
 
