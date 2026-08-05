@@ -6902,6 +6902,74 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+echo "== generator の規約に context7 の使いどころを追加（#72） =="
+
+# #71 の結線だけではgeneratorはcontext7を使わないため、正本に「いつ使うか」を明記する。
+# 完了条件の3点（推測禁止・未導入時の従来動作・ラダー2段目との優先関係）と、
+# 生成物への反映を検査する。
+
+DOC72_GENERATOR_ROLE="${REPO_ROOT}/core/roles/generator.md"
+DOC72_AGENT_GENERATOR="${REPO_ROOT}/agents/generator.md"
+DOC72_CODEX_AGENT_GENERATOR="${REPO_ROOT}/codex-agents/generator.toml"
+
+# --- 「未知のライブラリ／バージョン依存のAPIは推測で書かずcontext7で確認する」旨が明記されている ---
+
+if grep -Fq '未知のライブラリ' "$DOC72_GENERATOR_ROLE" \
+  && grep -Fq 'バージョン依存の API' "$DOC72_GENERATOR_ROLE" \
+  && grep -Fq '推測で書かない' "$DOC72_GENERATOR_ROLE" \
+  && grep -Fq 'context7' "$DOC72_GENERATOR_ROLE"; then
+  pass "core/roles/generator.md: 未知のライブラリ／バージョン依存のAPIは推測で書かずcontext7で確認する旨が明記されている（#72）"
+else
+  fail "core/roles/generator.md: 未知のライブラリ／バージョン依存のAPIは推測で書かずcontext7で確認する旨が明記されている（#72）"
+fi
+
+# --- 「未導入なら従来どおり動く」旨が明記されている（必須依存として書かれていないこと） ---
+
+if grep -Fq '未導入なら従来どおり動く' "$DOC72_GENERATOR_ROLE"; then
+  pass "core/roles/generator.md: 「未導入なら従来どおり動く」旨が明記されている（#72）"
+else
+  fail "core/roles/generator.md: 「未導入なら従来どおり動く」旨が明記されている（#72）"
+fi
+
+if grep -Eiq 'context7[^。\n]*(必ず使う|使わなければならない|使うこと)' "$DOC72_GENERATOR_ROLE"; then
+  fail "core/roles/generator.md: context7 を必須依存として書いていない（#72）" \
+    "$(grep -EinB1 'context7[^。]*(必ず使う|使わなければならない|使うこと)' "$DOC72_GENERATOR_ROLE")"
+else
+  pass "core/roles/generator.md: context7 を必須依存として書いていない（#72）"
+fi
+
+# --- 「既にコードベースで使われている用法は既存箇所を読む方が優先」旨が明記されている（ラダー2段目との整合） ---
+
+if grep -Fq '既存箇所を読む方が' "$DOC72_GENERATOR_ROLE" \
+  && grep -Fq 'このコードベースに既にあるか？' "$DOC72_GENERATOR_ROLE"; then
+  pass "core/roles/generator.md: 既存箇所を読む方が優先（ラダー2段目との整合）である旨が明記されている（#72）"
+else
+  fail "core/roles/generator.md: 既存箇所を読む方が優先（ラダー2段目との整合）である旨が明記されている（#72）"
+fi
+
+# --- 生成物（agents/generator.md・codex-agents/generator.toml）に正本の追記内容が反映されている ---
+
+if [ -f "$DOC72_AGENT_GENERATOR" ] \
+  && grep -Fq '未知のライブラリ' "$DOC72_AGENT_GENERATOR" \
+  && grep -Fq '未導入なら従来どおり動く' "$DOC72_AGENT_GENERATOR" \
+  && grep -Fq '既存箇所を読む方が' "$DOC72_AGENT_GENERATOR"; then
+  pass "agents/generator.md: 正本（core/roles/generator.md）のcontext7使いどころ追記内容が反映されている（#72）"
+else
+  fail "agents/generator.md: 正本（core/roles/generator.md）のcontext7使いどころ追記内容が反映されている（#72）" \
+    "見つかりません: ${DOC72_AGENT_GENERATOR}"
+fi
+
+if [ -f "$DOC72_CODEX_AGENT_GENERATOR" ] \
+  && grep -Fq '未知のライブラリ' "$DOC72_CODEX_AGENT_GENERATOR" \
+  && grep -Fq '未導入なら従来どおり動く' "$DOC72_CODEX_AGENT_GENERATOR" \
+  && grep -Fq '既存箇所を読む方が' "$DOC72_CODEX_AGENT_GENERATOR"; then
+  pass "codex-agents/generator.toml: 正本のcontext7使いどころ追記内容が反映されている（#72）"
+else
+  fail "codex-agents/generator.toml: 正本のcontext7使いどころ追記内容が反映されている（#72）" \
+    "見つかりません: ${DOC72_CODEX_AGENT_GENERATOR}"
+fi
+
+# ---------------------------------------------------------------------------
 # 結果集計
 # ---------------------------------------------------------------------------
 
