@@ -264,11 +264,19 @@ code-review-graph の生成物（SQLiteグラフDB・キャッシュ）は `.cod
 ### dev-workflow 自身では発火しないのが正常
 
 code-review-graph は Tree-sitter による AST 解析が中核であり、dev-workflow 自身のロジックの大半は
-`core/*.md` と `skills/*/SKILL.md`（markdown）および bash に載っている。したがって
-**dev-workflow自身の開発では、code-review-graphの呼び出しグラフからほとんど情報が出ず、
-発火しないのが正常である。** この限界は `core/roles/evaluator.md` の
-「## 任意ツール: code-review-graph」節にも明記した。効果が出るのは dev-workflow が駆動する側の
-プロジェクト（実コードを持つプロジェクト）である。
+`core/*.md` と `skills/*/SKILL.md`（markdown）および bash に載っている。
+**dev-workflow 自身のような markdown + bash 主体のリポジトリでは、code-review-graph の
+呼び出しグラフからほとんど情報が出ず、発火しないのが正常である。** 「発火しない = 壊れている」
+ではない。この限界は `core/roles/evaluator.md` の「## 任意ツール: code-review-graph」節にも
+明記した。効果が出るのは dev-workflow が駆動する側のプロジェクト（実コードを持つプロジェクト）である。
+
+### グラフ構築は Epic 開始時に1回（#75）
+
+グラフ構築（`code-review-graph build`）は Epic issue 本文の `## 準備コマンド` 節
+（Epic #14・issue #23 で導入済みの既存の仕組み）に書き、run が Epic 開始時に1回だけ実行する。
+レビューのたびに構築し直さない。**evaluator 自身はグラフを構築しない。** レビュー時点で
+未構築であれば、その事実を報告した上で従来どおり（ツール無しの手順で）レビューする。
+書き方の例は `core/roles/planner.md` の「プロジェクト固有の準備コマンド」を参照。
 ## Phase 3（#71）: context7 の結線方式（Claude / Codex の差分）
 
 Epic本文はcontext7のMCPツール名を `resolve-library-id` / `get-library-docs` と想定していたが、

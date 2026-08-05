@@ -106,6 +106,18 @@ make setup && make wasm
 Task issue 側にはこの準備を書かない（Epic 側に1回書けば全タスクに効くため、
 Task issue ごとに書くと同じ情報を繰り返すことになる）。
 
+**code-review-graph（`core/roles/evaluator.md` 参照）を使うプロジェクトでは、
+グラフ構築コマンドもこの節に書く。** レビューのたびに構築し直さないよう、
+Epic 開始時の1回に載せる（evaluator 自身はグラフを構築しない）。
+
+````markdown
+## 準備コマンド
+
+```
+code-review-graph build
+```
+````
+
 #### Task issue の自己完結化
 
 Task issue は、それ単体を読むだけで実装に着手できるように書く。Epic 本文（仕様書・計画書で

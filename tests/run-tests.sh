@@ -6796,10 +6796,12 @@ else
     "見つかりません: ${DOC73_CODEX_AGENT_EVALUATOR}"
 fi
 
-# --- code-review-graph が evaluator にのみ与えられている（planner/generatorには現れない） ---
+# --- code-review-graph（MCPツール）が evaluator にのみ与えられている（generatorには現れない） ---
+# planner.md/toml は #75 で「## 準備コマンド」の例としてCLIコマンド `code-review-graph build`
+# を書く（MCPツールの結線ではない）ため、この2ファイルは対象から除外し、MCPツール結線の
+# 有無（mcp__plugin_..._code-review-graph という文字列）だけを別途チェックする。
 
-for f in "$DOC73_AGENT_PLANNER" "$DOC73_AGENT_GENERATOR" \
-  "$DOC73_CODEX_AGENT_PLANNER" "$DOC73_CODEX_AGENT_GENERATOR"; do
+for f in "$DOC73_AGENT_GENERATOR" "$DOC73_CODEX_AGENT_GENERATOR"; do
   rel="${f#"${REPO_ROOT}/"}"
   if [ -f "$f" ]; then
     if grep -Fq 'code-review-graph' "$f"; then
@@ -6810,6 +6812,24 @@ for f in "$DOC73_AGENT_PLANNER" "$DOC73_AGENT_GENERATOR" \
     fi
   else
     fail "${rel}: code-review-graph が現れない（evaluator専用であること）（#73）" "見つかりません: ${f}"
+  fi
+done
+
+# --- planner.md/toml には code-review-graph の「MCPツール結線」が現れない
+#     （#75 の準備コマンド例としての言及 `code-review-graph build` は許容する） ---
+
+for f in "$DOC73_AGENT_PLANNER" "$DOC73_CODEX_AGENT_PLANNER"; do
+  rel="${f#"${REPO_ROOT}/"}"
+  if [ -f "$f" ]; then
+    if grep -Fq 'mcp__plugin_dev-workflow_code-review-graph' "$f" \
+      || grep -Fq '[mcp_servers.code-review-graph]' "$f"; then
+      fail "${rel}: code-review-graph のMCPツール結線が現れない（evaluator専用であること）（#73/#75）" \
+        "$(grep -Fn 'code-review-graph' "$f")"
+    else
+      pass "${rel}: code-review-graph のMCPツール結線が現れない（evaluator専用であること）（#73/#75）"
+    fi
+  else
+    fail "${rel}: code-review-graph のMCPツール結線が現れない（evaluator専用であること）（#73/#75）" "見つかりません: ${f}"
   fi
 done
 
@@ -7057,6 +7077,126 @@ if [ "$DOC74_CODEX_THRESHOLD_NUMBERS" = "50ファイル超" ]; then
 else
   fail "skills-codex/dev-workflow-run/SKILL.md: 「Xファイル超」しきい値が50のみである（新しい軸が増えていない）（#74）" \
     "検出したしきい値: ${DOC74_CODEX_THRESHOLD_NUMBERS}"
+fi
+
+echo "== グラフ構築をEpic開始時の準備に載せ限界を明記する（#75） =="
+
+# Epic #66 Phase 4（#75）: code-review-graphのグラフ構築はEpic開始時に1回だけ、
+# 既存の「## 準備コマンド」節（issue #23）に載せる。evaluator自身はグラフを構築しない。
+# markdown + bash主体のリポジトリ（dev-workflow自身）では発火しないのが正常である旨を
+# core/roles/evaluator.mdとdocs/optional-mcp-tools.mdの両方に明記する。
+
+DOC75_EVALUATOR_ROLE="${REPO_ROOT}/core/roles/evaluator.md"
+DOC75_PLANNER_ROLE="${REPO_ROOT}/core/roles/planner.md"
+DOC75_OPTIONAL_MCP_DOC="${REPO_ROOT}/docs/optional-mcp-tools.md"
+DOC75_AGENT_EVALUATOR="${REPO_ROOT}/agents/evaluator.md"
+DOC75_AGENT_PLANNER="${REPO_ROOT}/agents/planner.md"
+DOC75_CODEX_AGENT_EVALUATOR="${REPO_ROOT}/codex-agents/evaluator.toml"
+DOC75_CODEX_AGENT_PLANNER="${REPO_ROOT}/codex-agents/planner.toml"
+
+# --- core/roles/evaluator.md: 「epic-review かつ変更50ファイル超のときだけ使う」旨 ---
+
+if grep -Fq 'epic-review かつ変更50ファイル超のときだけ' "$DOC75_EVALUATOR_ROLE"; then
+  pass "core/roles/evaluator.md: epic-reviewかつ変更50ファイル超のときだけ使う旨が明記されている（#75）"
+else
+  fail "core/roles/evaluator.md: epic-reviewかつ変更50ファイル超のときだけ使う旨が明記されている（#75）"
+fi
+
+# --- core/roles/evaluator.md: 「evaluator自身はグラフを構築しない」旨 ---
+
+if grep -Fq 'evaluator 自身はグラフを構築しない' "$DOC75_EVALUATOR_ROLE"; then
+  pass "core/roles/evaluator.md: evaluator自身はグラフを構築しない旨が明記されている（#75）"
+else
+  fail "core/roles/evaluator.md: evaluator自身はグラフを構築しない旨が明記されている（#75）"
+fi
+
+# --- core/roles/evaluator.md: グラフの出力をそのまま指摘にしない旨 ---
+
+if grep -Fq 'グラフの出力をそのまま指摘にしない' "$DOC75_EVALUATOR_ROLE"; then
+  pass "core/roles/evaluator.md: グラフの出力をそのまま指摘にしない旨が明記されている（#75）"
+else
+  fail "core/roles/evaluator.md: グラフの出力をそのまま指摘にしない旨が明記されている（#75）"
+fi
+
+# --- core/roles/evaluator.md と docs/optional-mcp-tools.md の両方に
+#     「markdown + bash 主体のリポジトリ...発火しないのが正常」の限界が明記されている ---
+
+if grep -Fq 'markdown + bash 主体のリポジトリ' "$DOC75_EVALUATOR_ROLE" \
+  && grep -Fq '発火しないのが正常' "$DOC75_EVALUATOR_ROLE"; then
+  pass "core/roles/evaluator.md: markdown + bash主体のリポジトリでは発火しないのが正常という限界が明記されている（#75）"
+else
+  fail "core/roles/evaluator.md: markdown + bash主体のリポジトリでは発火しないのが正常という限界が明記されている（#75）"
+fi
+
+if grep -Fq 'markdown + bash 主体のリポジトリ' "$DOC75_OPTIONAL_MCP_DOC" \
+  && grep -Fq '発火しないのが正常' "$DOC75_OPTIONAL_MCP_DOC"; then
+  pass "docs/optional-mcp-tools.md: markdown + bash主体のリポジトリでは発火しないのが正常という限界が明記されている（#75）"
+else
+  fail "docs/optional-mcp-tools.md: markdown + bash主体のリポジトリでは発火しないのが正常という限界が明記されている（#75）"
+fi
+
+# --- core/roles/planner.md: 「## 準備コマンド」の説明にグラフ構築コマンドの例が追加されている ---
+
+if grep -Fq 'グラフ構築コマンド' "$DOC75_PLANNER_ROLE" \
+  && grep -Fq 'code-review-graph build' "$DOC75_PLANNER_ROLE"; then
+  pass "core/roles/planner.md: 準備コマンド節の説明にグラフ構築コマンドの例が追加されている（#75）"
+else
+  fail "core/roles/planner.md: 準備コマンド節の説明にグラフ構築コマンドの例が追加されている（#75）"
+fi
+
+# --- docs/optional-mcp-tools.md: グラフ構築はEpic開始時に1回・evaluatorは構築しない旨 ---
+
+if grep -Fq '## 準備コマンド' "$DOC75_OPTIONAL_MCP_DOC" \
+  && grep -Fq 'evaluator 自身はグラフを構築しない' "$DOC75_OPTIONAL_MCP_DOC"; then
+  pass "docs/optional-mcp-tools.md: グラフ構築は準備コマンド節に載せevaluatorは構築しない旨が明記されている（#75）"
+else
+  fail "docs/optional-mcp-tools.md: グラフ構築は準備コマンド節に載せevaluatorは構築しない旨が明記されている（#75）"
+fi
+
+# --- 生成物: agents/evaluator.md に正本の内容が反映されている ---
+
+if [ -f "$DOC75_AGENT_EVALUATOR" ] \
+  && grep -Fq 'epic-review かつ変更50ファイル超のときだけ' "$DOC75_AGENT_EVALUATOR" \
+  && grep -Fq 'evaluator 自身はグラフを構築しない' "$DOC75_AGENT_EVALUATOR" \
+  && grep -Fq 'markdown + bash 主体のリポジトリ' "$DOC75_AGENT_EVALUATOR"; then
+  pass "agents/evaluator.md: 正本のグラフ構築・限界の記述内容が反映されている（#75）"
+else
+  fail "agents/evaluator.md: 正本のグラフ構築・限界の記述内容が反映されている（#75）" \
+    "見つかりません: ${DOC75_AGENT_EVALUATOR}"
+fi
+
+# --- 生成物: agents/planner.md に正本の内容が反映されている ---
+
+if [ -f "$DOC75_AGENT_PLANNER" ] \
+  && grep -Fq 'グラフ構築コマンド' "$DOC75_AGENT_PLANNER" \
+  && grep -Fq 'code-review-graph build' "$DOC75_AGENT_PLANNER"; then
+  pass "agents/planner.md: 正本のグラフ構築コマンド例が反映されている（#75）"
+else
+  fail "agents/planner.md: 正本のグラフ構築コマンド例が反映されている（#75）" \
+    "見つかりません: ${DOC75_AGENT_PLANNER}"
+fi
+
+# --- 生成物: codex-agents/evaluator.toml に正本の内容が反映されている ---
+
+if [ -f "$DOC75_CODEX_AGENT_EVALUATOR" ] \
+  && grep -Fq 'epic-review かつ変更50ファイル超のときだけ' "$DOC75_CODEX_AGENT_EVALUATOR" \
+  && grep -Fq 'evaluator 自身はグラフを構築しない' "$DOC75_CODEX_AGENT_EVALUATOR" \
+  && grep -Fq 'markdown + bash 主体のリポジトリ' "$DOC75_CODEX_AGENT_EVALUATOR"; then
+  pass "codex-agents/evaluator.toml: 正本のグラフ構築・限界の記述内容が反映されている（#75）"
+else
+  fail "codex-agents/evaluator.toml: 正本のグラフ構築・限界の記述内容が反映されている（#75）" \
+    "見つかりません: ${DOC75_CODEX_AGENT_EVALUATOR}"
+fi
+
+# --- 生成物: codex-agents/planner.toml に正本の内容が反映されている ---
+
+if [ -f "$DOC75_CODEX_AGENT_PLANNER" ] \
+  && grep -Fq 'グラフ構築コマンド' "$DOC75_CODEX_AGENT_PLANNER" \
+  && grep -Fq 'code-review-graph build' "$DOC75_CODEX_AGENT_PLANNER"; then
+  pass "codex-agents/planner.toml: 正本のグラフ構築コマンド例が反映されている（#75）"
+else
+  fail "codex-agents/planner.toml: 正本のグラフ構築コマンド例が反映されている（#75）" \
+    "見つかりません: ${DOC75_CODEX_AGENT_PLANNER}"
 fi
 
 # ---------------------------------------------------------------------------
