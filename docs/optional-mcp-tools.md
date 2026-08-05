@@ -311,9 +311,23 @@ code-review-graph の生成物（SQLiteグラフDB・キャッシュ）は `.cod
 
 ### evaluator にのみ与えることの検証
 
-`agents/planner.md` / `agents/generator.md` / `codex-agents/planner.toml` /
-`codex-agents/generator.toml` に `code-review-graph` という文字列が一切現れないことを
-`tests/run-tests.sh` で検査する。
+`tests/run-tests.sh` は generator と planner とで検査基準を分けている。
+
+- **generator**（`agents/generator.md` / `codex-agents/generator.toml`）: `code-review-graph`
+  という文字列が**一切現れない**ことを検査する。
+- **planner**（`agents/planner.md` / `codex-agents/planner.toml`）: MCP結線を表す文字列
+  （`mcp__plugin_dev-workflow_code-review-graph` / `[mcp_servers.code-review-graph]`）が
+  **現れない**ことのみを検査する。`## 準備コマンド` 節のCLI例としての `code-review-graph build`
+  という言及自体は許容する。
+
+この区別を設けたのは、`#75` で仕様書 3.6 の要求（グラフ構築コマンドを Epic issue 本文の
+`## 準備コマンド` 節に書く例を、その節の書き方を示す `core/roles/planner.md` に併記すること）
+に従い、planner の正本に `code-review-graph build` という文字列を書いたためである。これは
+MCPツールとしての結線ではなく、Epic開始時にrunが1回実行するCLIコマンド例の記述であり
+（詳細は下記「グラフ構築は Epic 開始時に1回（#75）」節参照）、「evaluatorにのみMCPツールとして
+結線する」という決定（Epic #66 決定4）とは矛盾しない。したがって planner の生成物
+（`agents/planner.md:109,117` 等）に `code-review-graph` という文字列が現れること自体は正常であり、
+検査対象はあくまで**MCP結線文字列の不在**に絞っている。
 
 ### dev-workflow 自身では発火しないのが正常
 
