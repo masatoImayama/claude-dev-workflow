@@ -363,9 +363,9 @@ context7（generator のみ）・code-review-graph（evaluator のみ）は**任
    サーバー単位の限定でも実質的にツール単位限定と同じ結果になる
 
 したがって「context7 は generator にのみ、code-review-graph は evaluator にのみ使える」という
-**結果**は両CLIで一致する（決定6・決定4）。詳細な実装は `core/roles/generator.md`
+**結果**は両CLIで一致する（決定6・決定4）。詳細な実装は `docs/optional-mcp-tools.md`
 「Phase 3（#71）: context7 の結線方式（Claude / Codex の差分）」節、および
-`core/roles/generator.md` 「Phase 4: code-review-graph の結線（#73）」節を参照（正本はそちら）。
+`docs/optional-mcp-tools.md` 「Phase 4: code-review-graph の結線（#73）」節を参照（正本はそちら）。
 
 #### 3.7.3. 同等にできない箇所とその理由・回避策
 
@@ -376,7 +376,8 @@ context7（generator のみ）・code-review-graph（evaluator のみ）は**任
 
 今回結線した2ツールはこの限界の影響を受けない。context7 はツールが2個しか無く実質的に
 サーバー単位＝ツール単位が一致し、code-review-graph は「evaluatorに全30ツールを一括で渡す」
-という設計（`core/roles/generator.md` 参照。恣意的に間引かない方針）のため、そもそも
+という設計（`docs/optional-mcp-tools.md` 「Phase 4: code-review-graph の結線（#73）」節参照。
+恣意的に間引かない方針）のため、そもそも
 ツール単位の絞り込みを必要としない。**将来、1サーバーの一部ツールだけをエージェントに
 渡したいケースが出た場合は、Codex 側では実現できないことを設計時点で確認すること。**
 

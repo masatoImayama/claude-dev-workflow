@@ -7667,6 +7667,54 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+echo "== docs/dev-workflow-multi-vendor-guide.md の節参照が参照先ファイルに実在する（レビュー#84） =="
+
+# レビュー指摘 #84: ガイドが「正本はそちら」として案内する節見出しが、実際には参照先ファイルに
+# 存在しないケース（`core/roles/generator.md`ではなく`docs/optional-mcp-tools.md`にある節を
+# 誤って`core/roles/generator.md`と案内していた）が見つかった。ドキュメント自体が成果物である
+# このリポジトリでは参照切れが再発しうるため、`` `ファイル名.md` 「見出しテキスト」節 `` という
+# 形式で書かれた参照をガイドから機械的に抽出し、参照先ファイルに同名の見出し（`#`〜`######`の
+# いずれか）が実在することを検査する。新たに同形式の参照を追加した場合も自動的に対象になる。
+
+DOC84_GUIDE="${REPO_ROOT}/docs/dev-workflow-multi-vendor-guide.md"
+
+# ガイド全文を1行に連結してから抽出する（参照が改行を挟んで書かれていることがあるため）。
+DOC84_REFS="$(tr '\n' ' ' < "$DOC84_GUIDE" | grep -oE '`[A-Za-z0-9_./-]+\.md`[[:space:]]*「[^」]+」節' | sort -u)"
+
+if [ -z "$DOC84_REFS" ]; then
+  fail "docs/dev-workflow-multi-vendor-guide.md: 節参照の抽出パターンが1件も見つからない（テスト自体が空振りしていないか）（#84）"
+else
+  while IFS= read -r ref; do
+    [ -z "$ref" ] && continue
+    ref_file="$(printf '%s' "$ref" | grep -oE '^`[A-Za-z0-9_./-]+\.md`' | tr -d '`')"
+    ref_heading="$(printf '%s' "$ref" | grep -oE '「[^」]+」節$' | sed -E 's/^「//; s/」節$//')"
+    ref_target="${REPO_ROOT}/${ref_file}"
+
+    if [ ! -f "$ref_target" ]; then
+      fail "docs/dev-workflow-multi-vendor-guide.md: 参照先ファイルが実在する（#84）" \
+        "参照=[${ref_file}] 見つかりません"
+      continue
+    fi
+
+    ref_found=0
+    for level in 1 2 3 4 5 6; do
+      prefix="$(printf '#%.0s' $(seq 1 "$level"))"
+      if grep -Fxq "${prefix} ${ref_heading}" "$ref_target"; then
+        ref_found=1
+        break
+      fi
+    done
+
+    if [ "$ref_found" -eq 1 ]; then
+      pass "docs/dev-workflow-multi-vendor-guide.md: 「${ref_heading}」節が ${ref_file} に実在する（#84）"
+    else
+      fail "docs/dev-workflow-multi-vendor-guide.md: 「${ref_heading}」節が ${ref_file} に実在する（#84）" \
+        "参照先=[${ref_file}] 見出し=[${ref_heading}] が見つかりません"
+    fi
+  done <<< "$DOC84_REFS"
+fi
+
+# ---------------------------------------------------------------------------
 # 結果集計
 # ---------------------------------------------------------------------------
 
