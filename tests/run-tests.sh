@@ -8481,6 +8481,51 @@ case "$README_PREP_SECTION" in
 esac
 
 # ---------------------------------------------------------------------------
+# review#99: H1・H2 が否定した旧文言が、正本・生成物のいずれにも残っていない
+#
+# #94/#89 時点の退行防止テストは skills/run/SKILL.md・core/roles/generator.md・README.md の
+# 3ファイル限定だった。同じ内容を連結する core/instructions.md が対象外だったため、
+# 生成物（agents/*.md・codex-agents/*.toml）内に新旧の記述が同居する状態を検出できなかった。
+# 検査対象を「core/instructions.md を連結する全生成物」まで広げ、同じ見落としを再発させない。
+# ---------------------------------------------------------------------------
+
+echo ""
+echo "== review#99: core/instructions.md と生成物から旧文言が消えている（回帰防止） =="
+
+# for/whileのパイプはbashではサブシェルになりPASS/FAILカウンタが親シェルに伝播しない
+# ため、配列 + for（サブシェルを作らない）で回す。
+REVIEW99_OLD_PHRASES=(
+  "検証1回だけを行う"
+  "ウェーブ・レーンをまたいで効く"
+  "タスクごとにこの準備を再実行しない"
+)
+
+REVIEW99_FILES=(
+  "core/instructions.md"
+  "docs/dev-workflow-multi-vendor-guide.md"
+  "core/roles/generator.md"
+  "skills/run/SKILL.md"
+  "README.md"
+  "agents/generator.md"
+  "agents/evaluator.md"
+  "agents/planner.md"
+  "codex-agents/generator.toml"
+  "codex-agents/evaluator.toml"
+  "codex-agents/planner.toml"
+)
+
+for f in "${REVIEW99_FILES[@]}"; do
+  for phrase in "${REVIEW99_OLD_PHRASES[@]}"; do
+    if grep -Fq -- "$phrase" "${REPO_ROOT}/${f}"; then
+      fail "${f}: 旧文言『${phrase}』が消えている（#99）" \
+        "$(grep -n -- "$phrase" "${REPO_ROOT}/${f}")"
+    else
+      pass "${f}: 旧文言『${phrase}』が消えている（#99）"
+    fi
+  done
+done
+
+# ---------------------------------------------------------------------------
 # H6-b（Task #95）: run の後片付けで当該 Epic 分のレーン worktree を削除する
 #
 # 前提タスク #93 で新設した scripts/cleanup-lane-worktrees.sh を run のクリーンアップ節に
