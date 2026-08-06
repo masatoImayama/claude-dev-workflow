@@ -390,7 +390,11 @@ bash "${CLAUDE_PLUGIN_ROOT}/scripts/check-readability.sh" --git
 - `skips=unknown`（exit 1）→ **「0件」として扱ってはならない。** built-inランナー
   （go/jest/pytest）以外の形式であるため数えられなかったことを Epic issue に明記し、
   `DEV_WORKFLOW_SKIP_PATTERN`（Epic本文の `## SKIPパターン` 節）の設定を促す。
-  この1件のために run 全体を必ず停止させるわけではないが、「0件」への読み替えは常に禁止する
+  この1件のために run 全体を必ず停止させるわけではないが、「0件」への読み替えは常に禁止する。
+  **恒久対処として、次の run までに Epic issue 本文へ `## SKIPパターン` 節（ERE1行）を
+  追加することを明記する。** 都度コメントで済ませるだけでは同じ run が来るたびに
+  `skips=unknown` を繰り返すだけで、SKIP件数が検証されないまま進む状態が固定化する
+  （書き方は `core/roles/planner.md`「SKIPパターン（該当する場合のみ）」節を参照）
 
 - **通過** →
 

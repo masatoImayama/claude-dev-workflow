@@ -565,6 +565,18 @@ isolation worktree には及ばない。**
   （`core/roles/generator.md`）
 - 節を書くかどうかの判断は planner が行う（`core/roles/planner.md`）
 
+### Epic 本文の `## SKIPパターン` 節
+
+`scripts/count-skips.sh` は go / jest / pytest の3形式しか built-in で判定できない。
+駆動先プロジェクトのテスト出力がこの3形式のいずれとも異なる場合、Epic issue 本文に
+`## SKIPパターン` 節（SKIP行に一致するERE1行）が無いと `count-skips.sh` は既定で
+`skips=unknown` になり、SKIP件数の検証が働かないまま run が進んでしまう。
+
+- 節があれば run がその内容を `DEV_WORKFLOW_SKIP_PATTERN` として読み取り、Step 3 の各
+  generator プロンプトと統合ゲートの両方に渡す（`## 準備コマンド` 節と同じ抽出方法）
+- 節が無ければ何も設定されず、built-in ランナー（go/jest/pytest）の判定だけが行われる
+- 節を書くかどうかの判断は `## 準備コマンド` 節と同様に planner が行う（`core/roles/planner.md`）
+
 ## 安全ルール（例外なし）
 
 - **削除コマンドを実行しない。** `rm`, `rmdir`, `unlink` 等は絶対に実行しない

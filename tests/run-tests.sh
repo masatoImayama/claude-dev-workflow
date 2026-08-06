@@ -9029,6 +9029,101 @@ case "$H97_README_EPICSECTION" in
 esac
 
 # ---------------------------------------------------------------------------
+# review#102: Epic本文の「## SKIPパターン」節がplanner側に結線されている
+#
+# 消費側（README.md/skills SKILL.md/generator.md）にしか記載が無く、Epic本文を書く側
+# （planner.md/instructions.md）に規定が無かったため、人間が手で追記しない限り節が
+# 生成されず、built-inランナー以外のプロジェクトでは常にskips=unknownになっていた。
+# 既存の「## 準備コマンド」節（planner.md/instructions.mdの両方に規定済み）と同じ
+# 対称性を持たせる。
+# ---------------------------------------------------------------------------
+
+echo ""
+echo "== review#102: Epic本文の『## SKIPパターン』節がplanner側に結線されている =="
+
+# --- core/roles/planner.md: 「プロジェクト固有の準備コマンド」の隣にSKIPパターン節の書き方がある ---
+PLANNER_SKIP_SECTION="$(awk '/^#### SKIPパターン（該当する場合のみ）/{f=1} /^#### Task issue の自己完結化/{f=0} f' \
+  "${REPO_ROOT}/core/roles/planner.md")"
+
+if [ -z "$PLANNER_SKIP_SECTION" ]; then
+  fail "core/roles/planner.md: 『#### SKIPパターン（該当する場合のみ）』節が見つかる（#102）" "節が空でした"
+else
+  pass "core/roles/planner.md: 『#### SKIPパターン（該当する場合のみ）』節が見つかる（#102）"
+fi
+
+case "$PLANNER_SKIP_SECTION" in
+  *'go / jest / pytest'*'## SKIPパターン'*'必ず書く'*'ERE'*)
+    pass "core/roles/planner.md: SKIPパターン節がgo/jest/pytest以外は必ず書く旨とERE1行の書式を明記している（#102）" ;;
+  *)
+    fail "core/roles/planner.md: SKIPパターン節がgo/jest/pytest以外は必ず書く旨とERE1行の書式を明記している（#102）" \
+      "$PLANNER_SKIP_SECTION" ;;
+esac
+
+case "$PLANNER_SKIP_SECTION" in
+  *'count-skips.sh'*'skips=unknown'*)
+    pass "core/roles/planner.md: SKIPパターン節が書かないとcount-skips.shがunknownになる旨を明記している（#102）" ;;
+  *)
+    fail "core/roles/planner.md: SKIPパターン節が書かないとcount-skips.shがunknownになる旨を明記している（#102）" \
+      "$PLANNER_SKIP_SECTION" ;;
+esac
+
+# --- core/instructions.md: 「## 準備コマンド」節と対称に「Epic本文の『## SKIPパターン』節」が
+#     planner が判断する規定として存在する ---
+INSTR_SKIP_SECTION="$(awk '/^### Epic 本文の `## SKIPパターン` 節/{f=1} /^## 安全ルール/{f=0} f' \
+  "${REPO_ROOT}/core/instructions.md")"
+
+if [ -z "$INSTR_SKIP_SECTION" ]; then
+  fail "core/instructions.md: 『### Epic 本文の \`## SKIPパターン\` 節』が見つかる（#102）" "節が空でした"
+else
+  pass "core/instructions.md: 『### Epic 本文の \`## SKIPパターン\` 節』が見つかる（#102）"
+fi
+
+case "$INSTR_SKIP_SECTION" in
+  *'節を書くかどうかの判断は'*'準備コマンド'*'節と同様に planner が行う'*)
+    pass "core/instructions.md: SKIPパターン節を書くかどうかの判断もplannerが行う旨が準備コマンド節と対称に規定されている（#102）" ;;
+  *)
+    fail "core/instructions.md: SKIPパターン節を書くかどうかの判断もplannerが行う旨が準備コマンド節と対称に規定されている（#102）" \
+      "$INSTR_SKIP_SECTION" ;;
+esac
+
+# --- 生成物（agents/*.md・codex-agents/*.toml）にもcore/instructions.mdのSKIPパターン節が
+#     伝播している（build.shの再生成漏れを検知する） ---
+for f in agents/planner.md agents/generator.md agents/evaluator.md \
+         codex-agents/planner.toml codex-agents/generator.toml codex-agents/evaluator.toml; do
+  if grep -Fq -- '### Epic 本文の `## SKIPパターン` 節' "${REPO_ROOT}/${f}"; then
+    pass "${f}: core/instructions.mdのSKIPパターン節が生成物に反映されている（#102）"
+  else
+    fail "${f}: core/instructions.mdのSKIPパターン節が生成物に反映されている（#102）" \
+      "節が見つかりませんでした"
+  fi
+done
+
+# --- 生成物（agents/planner.md・codex-agents/planner.toml）にもcore/roles/planner.mdの
+#     SKIPパターン節が伝播している ---
+for f in agents/planner.md codex-agents/planner.toml; do
+  if grep -Fq -- '#### SKIPパターン（該当する場合のみ）' "${REPO_ROOT}/${f}"; then
+    pass "${f}: core/roles/planner.mdのSKIPパターン節が生成物に反映されている（#102）"
+  else
+    fail "${f}: core/roles/planner.mdのSKIPパターン節が生成物に反映されている（#102）" \
+      "節が見つかりませんでした"
+  fi
+done
+
+# --- skills/run/SKILL.md Step 6: skips=unknownの恒久対処として「次のrunまでに
+#     ## SKIPパターン節を追加する」ことが明記されている（都度Epic issueにコメントするだけでは
+#     同じrunが来るたびにskips=unknownを繰り返すだけの状態が固定化するため） ---
+RUN_SKILL_UNKNOWN="$(awk '/^#### SKIP を通過扱いにしない/{f=1} /^### Step 7: Epicブランチへ取り込んで次のウェーブへ/{f=0} f' \
+  "${REPO_ROOT}/skills/run/SKILL.md")"
+
+case "$RUN_SKILL_UNKNOWN" in
+  *'恒久対処'*'次の run までに'*'## SKIPパターン'*)
+    pass "SKILL.md: skips=unknown時に次のrunまでに『## SKIPパターン』節を追加することが恒久対処として明記されている（#102）" ;;
+  *)
+    fail "SKILL.md: skips=unknown時に次のrunまでに『## SKIPパターン』節を追加することが恒久対処として明記されている（#102）" \
+      "$RUN_SKILL_UNKNOWN" ;;
+esac
+
+# ---------------------------------------------------------------------------
 # 結果集計
 # ---------------------------------------------------------------------------
 
