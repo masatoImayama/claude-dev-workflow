@@ -8624,6 +8624,99 @@ case "$H6_README_SECTION" in
 esac
 
 # ---------------------------------------------------------------------------
+# H3（Task #96）: generator が `cd` で作業ディレクトリを変えないことの明示
+# ---------------------------------------------------------------------------
+
+echo ""
+echo "== H3: cdで作業ディレクトリを変えないことを明記する（#96） =="
+
+# --- core/roles/generator.md: 「#### `cd` で作業ディレクトリを変えない」節が存在する ---
+H3_GEN_CD_SECTION="$(awk '/^#### `cd` で作業ディレクトリを変えない/{f=1} /^#### シェルスクリプトを新規生成したら/{f=0} f' \
+  "${REPO_ROOT}/core/roles/generator.md")"
+
+if [ -z "$H3_GEN_CD_SECTION" ]; then
+  fail "core/roles/generator.md: 『cdで作業ディレクトリを変えない』節が見つかる（#96）" "節が空でした"
+else
+  pass "core/roles/generator.md: 『cdで作業ディレクトリを変えない』節が見つかる（#96）"
+fi
+
+# --- core/roles/generator.md: sandbox-exec.shが呼び出し元cwdからworkdirを解決し、cdがそれを上書きする旨が理由として書かれている ---
+case "$H3_GEN_CD_SECTION" in
+  *'呼び出し元 cwd'*'workdir'*'上書き'*)
+    pass "core/roles/generator.md: workdirが呼び出し元cwdから解決されcdが上書きする旨が理由として書かれている（#96）" ;;
+  *)
+    fail "core/roles/generator.md: workdirが呼び出し元cwdから解決されcdが上書きする旨が理由として書かれている（#96）" \
+      "$H3_GEN_CD_SECTION" ;;
+esac
+
+# --- core/roles/generator.md: 自分の変更を検証しないままゲートが緑になる危険が明示されている ---
+case "$H3_GEN_CD_SECTION" in
+  *'自分の変更'*'検証されていない'*)
+    pass "core/roles/generator.md: 自分の変更が検証されないまま緑になる危険が明示されている（#96）" ;;
+  *)
+    fail "core/roles/generator.md: 自分の変更が検証されないまま緑になる危険が明示されている（#96）" \
+      "$H3_GEN_CD_SECTION" ;;
+esac
+
+# --- core/roles/generator.md: 悪い例・良い例が書かれている ---
+case "$H3_GEN_CD_SECTION" in
+  *'悪い例'*'cd /workspace'*'良い例'*)
+    pass "core/roles/generator.md: 悪い例・良い例が書かれている（#96）" ;;
+  *)
+    fail "core/roles/generator.md: 悪い例・良い例が書かれている（#96）" \
+      "$H3_GEN_CD_SECTION" ;;
+esac
+
+# --- core/roles/generator.md: サブディレクトリを対象にする場合の代替手段（コマンド側の相対指定）が書かれている ---
+case "$H3_GEN_CD_SECTION" in
+  *'サブディレクトリ'*'相対指定'*'make -C'*)
+    pass "core/roles/generator.md: サブディレクトリを対象にする場合の代替手段が書かれている（#96）" ;;
+  *)
+    fail "core/roles/generator.md: サブディレクトリを対象にする場合の代替手段が書かれている（#96）" \
+      "$H3_GEN_CD_SECTION" ;;
+esac
+
+# --- skills/run/SKILL.md: Step 3 の雛形に同趣旨の1行がある ---
+H3_RS_STEP3="$(awk '/^### Step 3:/{f=1} /^### Step 4:/{f=0} f' "${REPO_ROOT}/skills/run/SKILL.md")"
+
+case "$H3_RS_STEP3" in
+  *'サンドボックスに渡すコマンドの中で `cd`'*'workdir'*)
+    pass "SKILL.md: Step 3 の雛形に『cdで作業ディレクトリを変えない』旨の1行がある（#96）" ;;
+  *)
+    fail "SKILL.md: Step 3 の雛形に『cdで作業ディレクトリを変えない』旨の1行がある（#96）" \
+      "$H3_RS_STEP3" ;;
+esac
+
+# --- skills/run/SKILL.md: 駆動先プロジェクト固有の値をハードコードしていない（epicXX・汎用コマンド名のみ） ---
+if printf '%s\n' "$H3_RS_STEP3" | grep -Eq 'cd .*&& (go |make |npm )'; then
+  fail "SKILL.md: Step 3 の雛形に駆動先プロジェクト固有のcd例をハードコードしていない（#96）" \
+    "$H3_RS_STEP3"
+else
+  pass "SKILL.md: Step 3 の雛形に駆動先プロジェクト固有のcd例をハードコードしていない（#96）"
+fi
+
+# --- skills-codex/dev-workflow-run/SKILL.md: Step 3 のプロンプトが同趣旨・core/roles/generator.mdと揃った表現になっている ---
+H3_CRS_STEP3="$(awk '/^### Step 3:/{f=1} /^#### トークン消費の記録/{f=0} f' \
+  "${REPO_ROOT}/skills-codex/dev-workflow-run/SKILL.md")"
+
+case "$H3_CRS_STEP3" in
+  *'ここから移動しないこと'*'サンドボックスに渡すコマンドの中で `cd`'*'workdir'*)
+    pass "SKILL.md(codex): Step 3 のプロンプトがcore/roles/generator.mdと揃った表現でcd禁止を明記している（#96）" ;;
+  *)
+    fail "SKILL.md(codex): Step 3 のプロンプトがcore/roles/generator.mdと揃った表現でcd禁止を明記している（#96）" \
+      "$H3_CRS_STEP3" ;;
+esac
+
+# --- scripts/sandbox-exec.sh: このタスクでは変更しない（H3の「やらないこと」） ---
+H3_SANDBOX_EXEC="${REPO_ROOT}/scripts/sandbox-exec.sh"
+if [ -f "$H3_SANDBOX_EXEC" ]; then
+  pass "scripts/sandbox-exec.sh: ファイルが存在する（変更対象外であることの前提確認）（#96）"
+else
+  fail "scripts/sandbox-exec.sh: ファイルが存在する（変更対象外であることの前提確認）（#96）" \
+    "ファイルが見つかりません"
+fi
+
+# ---------------------------------------------------------------------------
 # 結果集計
 # ---------------------------------------------------------------------------
 

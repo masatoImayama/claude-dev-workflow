@@ -180,6 +180,27 @@ bash "${CLAUDE_PLUGIN_ROOT}/scripts/sandbox-exec.sh" '[test-command]'
 bash "${CLAUDE_PLUGIN_ROOT}/scripts/sandbox-exec.sh" --epic epic3 '[test-command]'
 ```
 
+#### `cd` で作業ディレクトリを変えない
+
+**サンドボックスに渡すコマンドの中で `cd` して作業ディレクトリを変えてはならない。**
+`sandbox-exec.sh` は**呼び出し元 cwd（あなたの作業ディレクトリ）から workdir を解決する**。
+コマンドの中で `cd` するとその解決結果を上書きしてしまい、**自分の変更を含まないツリー**
+（`sandbox-exec.sh` のマウント元＝リポジトリルート等）を検証してしまう。テストが
+「全パッケージ緑・SKIP 0件」と報告されても、それは**自分の変更が一切検証されていない**
+という意味である。`sandbox-exec.sh` はマウント元をリポジトリルートにするため、コンテナ内から
+別ツリーは常に見えており、この `cd` は容易に成功してしまう（＝エラーで気づけない）。
+
+```bash
+# 悪い例: 解決済みの workdir を上書きし、自分の変更を含まないツリーを検証する
+bash .../sandbox-exec.sh --epic epicXX 'cd /workspace && make test'
+
+# 良い例: workdir の解決を sandbox-exec.sh に任せる
+bash .../sandbox-exec.sh --epic epicXX 'make test'
+```
+
+モノレポ等でサブディレクトリだけを対象にしたい場合も `cd` は使わず、**コマンド側の相対指定**
+で行う（`make -C sub test` / `go test ./sub/...` 等）。
+
 #### シェルスクリプトを新規生成したら `.gitattributes` を確認する
 
 Windows（`core.autocrlf=true`）で生成した `.sh` は CRLF になり、サンドボックス

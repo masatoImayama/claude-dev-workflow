@@ -265,6 +265,10 @@ Task #<番号> を実装してください。
 - **`git fetch` / `git checkout` / `git pull` は実行しないこと。** 同期は run が Epic 専用
   worktree で既に済ませている。手順2の `git reset --hard` のみが例外として許可されている
 - 作業ディレクトリ: <EPIC_WT>（ここから移動しないこと）
+- **サンドボックスに渡すコマンドの中で `cd` して作業ディレクトリを変えないこと。**
+  `sandbox-exec.sh` は呼び出し元cwdから workdir を解決するため、`cd` はそれを上書きし、
+  自分の変更を含まないツリーを検証してしまう（サブディレクトリだけを対象にしたい場合は
+  `cd` ではなく `make -C sub test` のようにコマンド側の相対指定で行うこと）
 - サンドボックスへのコマンド投入は `${CLAUDE_PLUGIN_ROOT}/scripts/sandbox-exec.sh` 経由で行い、
   ビルド・テストは1回の呼び出しにまとめること（分けると待ち時間が倍増する）
 - `sandbox-exec.sh` を呼ぶ際は必ず `--epic "$EPIC_NUM"` を渡すこと。省略すると環境変数
