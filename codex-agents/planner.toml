@@ -122,6 +122,29 @@ code-review-graph build
 ```
 ````
 
+#### SKIPパターン（該当する場合のみ）
+
+`scripts/count-skips.sh` はテスト出力の SKIP 件数を機械的に数えるが、built-in で判定できる
+ランナーは go / jest / pytest の3形式のみである。**駆動先プロジェクトのテスト出力がこの3形式の
+いずれとも異なる場合**（自作テストランナー・他言語のフレームワーク等）、書かないと
+`count-skips.sh` が既定で `skips=unknown` になり、SKIP件数の検証が効かないまま run が進む。
+該当する場合は Epic issue 本文に `## SKIPパターン` 節を**必ず書く**。
+
+書式は SKIP行に一致する ERE（拡張正規表現）を1行だけ書く。
+
+````markdown
+## SKIPパターン
+
+```
+^  skip - 
+```
+````
+
+節があれば run がその内容を `DEV_WORKFLOW_SKIP_PATTERN` として読み取り、Step 3 の各 generator
+プロンプトと統合ゲートの両方に渡す（`## 準備コマンド` 節と同じ抽出方法）。書き方の詳細は
+README「Epic の `## SKIPパターン` 節」を参照。Task issue 側にはこの節を書かない
+（`## 準備コマンド` 節と同じく、Epic 側に1回書けば全タスクに効く）。
+
 #### Task issue の自己完結化
 
 Task issue は、それ単体を読むだけで実装に着手できるように書く。Epic 本文（仕様書・計画書で
@@ -252,10 +275,12 @@ main（保護: 人間のみマージ可）
 - 全タスク完了後、Epic ブランチ → main の PR を作成する
 - **main への直接コミット・マージは絶対に行わない。** main へのマージは人間が行う
 - **各ウェーブ開始前に必ず Epic ブランチを最新に同期し、その tip を `WAVE_BASE` として記録する。**
-  そのウェーブに属する全レーンはこの `WAVE_BASE` から分岐し、共有する。古いベースから分岐すると、
-  前ウェーブの変更が反映されずコンフリクトやファイル不整合が発生する
-  （generator 自身は `fetch` / `checkout` / `pull` を行わない。渡された `WAVE_BASE` に対する
-  検証1回だけを行う。詳細は `core/roles/generator.md` を参照）
+  そのウェーブに属する全レーンはこの `WAVE_BASE` から分岐する（共有する、ではない）。
+  **各レーンの分岐元はハーネスが決めるため `WAVE_BASE` とは限らない。** そのため generator は
+  実装着手前に `git reset --hard <WAVE_BASE>` の1コマンドで自分の HEAD を `WAVE_BASE` に
+  合わせる。それ以外の `fetch` / `checkout` / `pull` は行わない。古いベースから分岐したまま
+  実装すると、前ウェーブの変更が反映されずコンフリクトやファイル不整合が発生する
+  （詳細は `core/roles/generator.md` を参照）
 
 ```bash
 git fetch origin
@@ -446,17 +471,33 @@ bash "${CLAUDE_PLUGIN_ROOT}/scripts/sandbox-exec.sh" --epic "$EPIC_NUM" --print-
 ### プロジェクト固有の準備コマンド
 
 生成物の配置（wasm 等）・依存物のダウンロード・コード生成など、**タスクに依らず同じ結果になる
-準備作業**は、タスクごとに繰り返さず Epic 開始時に1回だけ実行する。コンテナは Epic 単位で
-常駐する（`sandbox-exec.sh` の既存挙動）ため、この1回の準備がウェーブ・レーンをまたいで効く。
+準備作業**は、run が Epic 開始時に1回だけ実行する。コンテナは Epic 単位で常駐する
+（`sandbox-exec.sh` の既存挙動）ため、この1回はキャッシュを温め、統合ゲート用のコンテナに
+配置する目的で行う。**適用範囲は run が実行する Epic 専用 worktree に限られ、各レーンの
+isolation worktree には及ばない。**
 
 - Epic issue 本文に `## 準備コマンド` 節があれば、run がその内容を Epic 開始時の
   `--warm`（`sandbox-exec.sh`）に1回だけ渡す
 - 節が無い場合は現行どおり、ビルドコマンドで `--warm` するだけになる（後方互換）
 - `--warm` は失敗してもループを止めない（`sandbox-exec.sh` の既存挙動）。準備が失敗した場合は
   その旨を表示するだけで続行する
-- generator は**タスクごとにこの準備を再実行しない**。準備が効いていないと判断した場合も、
-  自前で再実行はせずその事実を報告する（`core/roles/generator.md`）
+- run から準備コマンドが渡された場合、generator は**自分の作業ディレクトリ（isolation
+  worktree）で初回1回だけ実行**し、**同一 worktree 内で2回目以降は実行しない**。
+  準備が効いていないと判断した場合も、自前で再実行はせずその事実を報告する
+  （`core/roles/generator.md`）
 - 節を書くかどうかの判断は planner が行う（`core/roles/planner.md`）
+
+### Epic 本文の `## SKIPパターン` 節
+
+`scripts/count-skips.sh` は go / jest / pytest の3形式しか built-in で判定できない。
+駆動先プロジェクトのテスト出力がこの3形式のいずれとも異なる場合、Epic issue 本文に
+`## SKIPパターン` 節（SKIP行に一致するERE1行）が無いと `count-skips.sh` は既定で
+`skips=unknown` になり、SKIP件数の検証が働かないまま run が進んでしまう。
+
+- 節があれば run がその内容を `DEV_WORKFLOW_SKIP_PATTERN` として読み取り、Step 3 の各
+  generator プロンプトと統合ゲートの両方に渡す（`## 準備コマンド` 節と同じ抽出方法）
+- 節が無ければ何も設定されず、built-in ランナー（go/jest/pytest）の判定だけが行われる
+- 節を書くかどうかの判断は `## 準備コマンド` 節と同様に planner が行う（`core/roles/planner.md`）
 
 ## 安全ルール（例外なし）
 

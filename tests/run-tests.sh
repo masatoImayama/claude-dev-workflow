@@ -3093,6 +3093,68 @@ PW_ENV_LANES_OUTPUT="$(DEV_WORKFLOW_MAX_LANES=5 bash "$PLAN_WAVES_SCRIPT" --from
 assert_eq "DEV_WORKFLOW_MAX_LANES で既定の lanes を上書きできる" "5" \
   "$(printf '%s\n' "$PW_ENV_LANES_OUTPUT" | awk -F'\t' '$1=="lanes"{print $2}')"
 
+# --- ケース11: 前提未宣言の集計警告（missing-deps-summary、Task #92） ---
+# 全件宣言漏れ（PW_SERIAL_FIXTUREを再利用、既定lanes=3）: 実効並列度は1（完全逐次）に落ちる
+PW_DEPSWARN_ALL_PRINT="$(bash "$PLAN_WAVES_SCRIPT" --from-file "$PW_SERIAL_FIXTURE" --print)"
+case "$PW_DEPSWARN_ALL_PRINT" in
+  *"前提未宣言が 3 件あります（対象タスク 3 件中）"*)
+    pass "missing-deps-summary --print: 件数と対象タスク数が出る（全件宣言漏れ）" ;;
+  *) fail "missing-deps-summary --print: 件数と対象タスク数が出る（全件宣言漏れ）" "output=[${PW_DEPSWARN_ALL_PRINT}]" ;;
+esac
+case "$PW_DEPSWARN_ALL_PRINT" in
+  *"実効並列度は 1 です（指定 lanes=3）"*)
+    pass "missing-deps-summary --print: 実効並列度1・指定lanes=3が出る（完全逐次）" ;;
+  *) fail "missing-deps-summary --print: 実効並列度1・指定lanes=3が出る（完全逐次）" "output=[${PW_DEPSWARN_ALL_PRINT}]" ;;
+esac
+case "$PW_DEPSWARN_ALL_PRINT" in
+  *"- 前提: #N"*"- 前提: なし"*)
+    pass "missing-deps-summary --print: 対処法（- 前提: #N / - 前提: なし）が出る" ;;
+  *) fail "missing-deps-summary --print: 対処法（- 前提: #N / - 前提: なし）が出る" "output=[${PW_DEPSWARN_ALL_PRINT}]" ;;
+esac
+
+assert_eq "missing-deps-summary 機械可読: warn missing-deps-summary 3 3 1 3（全件宣言漏れ）" "1" \
+  "$(printf '%s\n' "$PW_SERIAL_OUTPUT" | grep -c '^warn	missing-deps-summary	3	3	1	3$')"
+
+# 集計行を追加しても既存の warn missing-deps 行は全件・従来書式のまま出る（後方互換）
+assert_eq "missing-deps-summary 追加後も warn missing-deps は3件とも従来書式で出る" "3" \
+  "$(printf '%s\n' "$PW_SERIAL_OUTPUT" | grep -c '^warn	missing-deps	')"
+
+# --- ケース12: 一部だけ宣言漏れ（実効並列度が1にならないケース。lanes=2で2に留まる） ---
+PW_DEPSWARN_PARTIAL_FIXTURE="$(mktemp "${TMPDIR:-/tmp}/dw-test-pw-depswarn-partial.XXXXXX")"
+cat > "$PW_DEPSWARN_PARTIAL_FIXTURE" <<'FIXTURE'
+910	open
+911	open
+912	open	- 前提: なし
+913	open	- 前提: #912
+FIXTURE
+
+PW_DEPSWARN_PARTIAL_OUTPUT="$(bash "$PLAN_WAVES_SCRIPT" --from-file "$PW_DEPSWARN_PARTIAL_FIXTURE" --lanes 2)"
+assert_eq "一部宣言漏れ: warn missing-deps-summary 2 4 2 2（実効並列度2で1にならない）" "1" \
+  "$(printf '%s\n' "$PW_DEPSWARN_PARTIAL_OUTPUT" | grep -c '^warn	missing-deps-summary	2	4	2	2$')"
+assert_eq "一部宣言漏れ: 宣言漏れした#910と#911だけにwarn missing-depsが出る" "2" \
+  "$(printf '%s\n' "$PW_DEPSWARN_PARTIAL_OUTPUT" | grep -c '^warn	missing-deps	91[01]$')"
+
+# --- ケース13: 宣言漏れが0件のときは missing-deps-summary 行も前提未宣言の警告も出ない（後方互換） ---
+PW_DEPSWARN_NONE_FIXTURE="$(mktemp "${TMPDIR:-/tmp}/dw-test-pw-depswarn-none.XXXXXX")"
+cat > "$PW_DEPSWARN_NONE_FIXTURE" <<'FIXTURE'
+920	open	- 前提: なし
+921	open	- 前提: #920
+FIXTURE
+
+PW_DEPSWARN_NONE_OUTPUT="$(bash "$PLAN_WAVES_SCRIPT" --from-file "$PW_DEPSWARN_NONE_FIXTURE")"
+if printf '%s\n' "$PW_DEPSWARN_NONE_OUTPUT" | grep -q '^warn	missing-deps-summary	'; then
+  fail "宣言漏れ0件: missing-deps-summary 行が出ない（後方互換）" "output=[${PW_DEPSWARN_NONE_OUTPUT}]"
+else
+  pass "宣言漏れ0件: missing-deps-summary 行が出ない（後方互換）"
+fi
+
+PW_DEPSWARN_NONE_PRINT="$(bash "$PLAN_WAVES_SCRIPT" --from-file "$PW_DEPSWARN_NONE_FIXTURE" --print)"
+if printf '%s\n' "$PW_DEPSWARN_NONE_PRINT" | grep -q '前提未宣言'; then
+  fail "宣言漏れ0件: --print に前提未宣言の警告が出ない（後方互換）" "output=[${PW_DEPSWARN_NONE_PRINT}]"
+else
+  pass "宣言漏れ0件: --print に前提未宣言の警告が出ない（後方互換）"
+fi
+
 # --- ケース11: --epic に非数値を渡すと exit 2（Task #39: sandbox-exec.sh の --epic とは
 #     別契約で、plan-waves.sh の --epic は数値のEpic issue番号でなければならない） ---
 bash "$PLAN_WAVES_SCRIPT" --epic epic14 >/dev/null 2>&1
@@ -6349,13 +6411,13 @@ DOC55_README="${REPO_ROOT}/README.md"
 DOC55_AGENT_GENERATOR="${REPO_ROOT}/agents/generator.md"
 DOC55_CODEX_AGENT_GENERATOR="${REPO_ROOT}/codex-agents/generator.toml"
 
-# --- 両 plugin.json のバージョンが 0.14.1 で一致している（#78 でパッチ更新） ---
+# --- 両 plugin.json のバージョンが 0.15.0 で一致している（#98 でマイナー更新） ---
 
 DOC55_CLAUDE_VERSION="$(grep -m1 '"version"' "$DOC55_CLAUDE_PLUGIN_JSON" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+')"
 DOC55_CODEX_VERSION="$(grep -m1 '"version"' "$DOC55_CODEX_PLUGIN_JSON" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+')"
 
-assert_eq ".claude-plugin/plugin.json のバージョンが0.14.1である" "0.14.1" "$DOC55_CLAUDE_VERSION"
-assert_eq ".codex-plugin/plugin.json のバージョンが0.14.1である" "0.14.1" "$DOC55_CODEX_VERSION"
+assert_eq ".claude-plugin/plugin.json のバージョンが0.15.0である" "0.15.0" "$DOC55_CLAUDE_VERSION"
+assert_eq ".codex-plugin/plugin.json のバージョンが0.15.0である" "0.15.0" "$DOC55_CODEX_VERSION"
 assert_eq "両plugin.jsonのバージョンが一致している" "$DOC55_CLAUDE_VERSION" "$DOC55_CODEX_VERSION"
 
 # --- core/instructions.md に watchdog の3点の記述がある ---
@@ -7738,6 +7800,1328 @@ else
     fi
   done <<< "$DOC84_REFS"
 fi
+
+# ---------------------------------------------------------------------------
+# H1（Task #89）: レーンのHEADをWAVE_BASEに合わせてから実装させる
+#
+# `skills/run/SKILL.md:378-381`（修正前）は generator に対して「あなたの isolation
+# worktree は WAVE_BASE から分岐している」という偽の前提を伝えつつ fetch/checkout/pull を
+# 禁止しており、ウェーブ2以降で必ずベース検証が失敗する（詳細は docs/dev-workflow-handover.md
+# のH1節）。fetch/checkout/pullの禁止は維持したまま git reset --hard <WAVE_BASE> のみを
+# 明示的に許可し、実装着手前に git status --short / git reset --hard /
+# git merge-base --is-ancestor / git log --oneline -1 をこの順で実行させる。
+# ---------------------------------------------------------------------------
+
+echo ""
+echo "== H1: レーンのHEADをWAVE_BASEに合わせてから実装させる（回帰防止 #89） =="
+
+# ある1つのテキストの中で、複数の文字列がこの順序（各1回目の出現）で現れることを検査する。
+assert_order() {
+  # assert_order <説明> <検査対象テキスト> <文字列1> <文字列2> [<文字列3> ...]
+  local desc="$1" text="$2"
+  shift 2
+  local prev_line=0 cur_line ok=1 missing="" needle
+  for needle in "$@"; do
+    cur_line="$(printf '%s\n' "$text" | grep -nF -- "$needle" | head -1 | cut -d: -f1)"
+    if [ -z "$cur_line" ]; then
+      ok=0
+      missing="$needle"
+      break
+    fi
+    if [ "$cur_line" -le "$prev_line" ]; then
+      ok=0
+      missing="$needle（直前より前または同じ行）"
+      break
+    fi
+    prev_line="$cur_line"
+  done
+  if [ "$ok" -eq 1 ]; then
+    pass "$desc"
+  else
+    fail "$desc" "見つからない・順序不正: [${missing}]"
+  fi
+}
+
+# --- skills/run/SKILL.md: Step 3 プロンプト雛形に4手順がこの順で現れる ---
+RS_STEP3="$(awk '/^### Step 3:/{f=1} /^### Step 4:/{f=0} f' "${REPO_ROOT}/skills/run/SKILL.md")"
+
+assert_order "SKILL.md: Step 3 雛形に git status --short → git reset --hard → git merge-base --is-ancestor → git log --oneline -1 がこの順で現れる（#89）" \
+  "$RS_STEP3" \
+  "git status --short" "git reset --hard" "git merge-base --is-ancestor" "git log --oneline -1"
+
+case "$RS_STEP3" in
+  *'あなたの isolation worktree は WAVE_BASE から分岐している'*)
+    fail "SKILL.md: Step 3 雛形から偽の前提（isolation worktreeはWAVE_BASEから分岐している）が消えている（#89）" \
+      "$RS_STEP3" ;;
+  *)
+    pass "SKILL.md: Step 3 雛形から偽の前提（isolation worktreeはWAVE_BASEから分岐している）が消えている（#89）" ;;
+esac
+
+case "$RS_STEP3" in
+  *'git fetch'*'git checkout'*'git pull'*'実行しないこと'*)
+    pass "SKILL.md: Step 3 雛形に fetch/checkout/pull 禁止の記述が残っている（#89）" ;;
+  *)
+    fail "SKILL.md: Step 3 雛形に fetch/checkout/pull 禁止の記述が残っている（#89）" "$RS_STEP3" ;;
+esac
+
+# --- skills-codex/dev-workflow-run/SKILL.md: Step 3 にも同じ4手順がこの順で現れる ---
+CRS_STEP3="$(awk '/^### Step 3:/{f=1} /^### Step 4:/{f=0} f' "${REPO_ROOT}/skills-codex/dev-workflow-run/SKILL.md")"
+
+assert_order "SKILL.md(codex): Step 3 に git status --short → git reset --hard → git merge-base --is-ancestor → git log --oneline -1 がこの順で現れる（#89）" \
+  "$CRS_STEP3" \
+  "git status --short" "git reset --hard" "git merge-base --is-ancestor" "git log --oneline -1"
+
+case "$CRS_STEP3" in
+  *'git fetch'*'git checkout'*'git pull'*'実行しないこと'*)
+    pass "SKILL.md(codex): Step 3 に fetch/checkout/pull 禁止の記述が残っている（#89）" ;;
+  *)
+    fail "SKILL.md(codex): Step 3 に fetch/checkout/pull 禁止の記述が残っている（#89）" "$CRS_STEP3" ;;
+esac
+
+# --- core/roles/generator.md: 「0. ...」節に同じ4手順・1回だけ・再実行しない旨がある ---
+GEN_STEP0="$(awk '/^### 0\. /{f=1} /^### 1\. /{f=0} f' "${REPO_ROOT}/core/roles/generator.md")"
+
+if [ -z "$GEN_STEP0" ]; then
+  fail "core/roles/generator.md: 「0. 」節が見つかる（#89）" "節が抽出できませんでした"
+else
+  pass "core/roles/generator.md: 「0. 」節が見つかる（#89）"
+fi
+
+# 手順の順序は「実行する具体的なコマンド列」（```bash フェンス内）だけで検査する。
+# 節の冒頭には reset --hard の許可理由を説明する散文（同じ文字列を含む）があるため、
+# 節全体を対象にすると散文側の言及に引きずられて誤検知する。
+GEN_STEP0_FENCE="$(printf '%s\n' "$GEN_STEP0" | awk '/^```bash/{f=1;next} /^```/{f=0} f')"
+
+assert_order "core/roles/generator.md: 「0. 」節のコマンド列に git status --short → git reset --hard → git merge-base --is-ancestor → git log --oneline -1 がこの順で現れる（#89）" \
+  "$GEN_STEP0_FENCE" \
+  "git status --short" "git reset --hard" "git merge-base --is-ancestor" "git log --oneline -1"
+
+case "$GEN_STEP0" in
+  *'実装着手前に'*'1回だけ'*)
+    pass "core/roles/generator.md: 「0. 」節に『実装着手前に1回だけ』の明記がある（#89）" ;;
+  *)
+    fail "core/roles/generator.md: 「0. 」節に『実装着手前に1回だけ』の明記がある（#89）" "$GEN_STEP0" ;;
+esac
+
+case "$GEN_STEP0" in
+  *'コミットを積んだ後に再実行してはならない'*)
+    pass "core/roles/generator.md: 「0. 」節に『コミット後に再実行してはならない』の明記がある（#89）" ;;
+  *)
+    fail "core/roles/generator.md: 「0. 」節に『コミット後に再実行してはならない』の明記がある（#89）" "$GEN_STEP0" ;;
+esac
+
+case "$GEN_STEP0" in
+  *'`git reset --hard <WAVE_BASE>` のみを例外として許可する'*)
+    pass "core/roles/generator.md: 「0. 」節に reset --hard のみを例外として許可する旨の明記がある（#89）" ;;
+  *)
+    fail "core/roles/generator.md: 「0. 」節に reset --hard のみを例外として許可する旨の明記がある（#89）" "$GEN_STEP0" ;;
+esac
+
+case "$GEN_STEP0" in
+  *'`git fetch`'*'`git checkout`'*'`git pull`'*'実行しない'*)
+    pass "core/roles/generator.md: 「0. 」節に fetch/checkout/pull 禁止の記述が残っている（#89）" ;;
+  *)
+    fail "core/roles/generator.md: 「0. 」節に fetch/checkout/pull 禁止の記述が残っている（#89）" "$GEN_STEP0" ;;
+esac
+
+# --- 偽の前提（「isolation worktree は WAVE_BASE から分岐している」）が
+#     skills/run/SKILL.md・core/roles/generator.md・README.md のいずれにも無い（grepで0件） ---
+for f in "skills/run/SKILL.md" "core/roles/generator.md" "README.md"; do
+  if grep -Fq 'isolation worktree は WAVE_BASE から分岐している' "${REPO_ROOT}/${f}"; then
+    fail "${f}: 「isolation worktree は WAVE_BASE から分岐している」という偽の前提が消えている（#89）" \
+      "$(grep -n 'isolation worktree は WAVE_BASE から分岐している' "${REPO_ROOT}/${f}")"
+  else
+    pass "${f}: 「isolation worktree は WAVE_BASE から分岐している」という偽の前提が消えている（#89）"
+  fi
+done
+
+# --- README.md「ウェーブと wave ブランチ」節: 分岐元がハーネス依存であることに触れている ---
+README_WAVE_SECTION="$(awk '/^### ウェーブと wave ブランチ/{f=1} /^### `--ff-only`/{f=0} f' "${REPO_ROOT}/README.md")"
+
+case "$README_WAVE_SECTION" in
+  *'ハーネスが決めるため'*'WAVE_BASE とは限らない'*)
+    pass "README.md: 「ウェーブと wave ブランチ」節が分岐元はハーネス依存でWAVE_BASEとは限らない旨に改められている（#89）" ;;
+  *)
+    fail "README.md: 「ウェーブと wave ブランチ」節が分岐元はハーネス依存でWAVE_BASEとは限らない旨に改められている（#89）" \
+      "$README_WAVE_SECTION" ;;
+esac
+
+# ---------------------------------------------------------------------------
+echo "== skills/epic/SKILL.md: Task issueテンプレートに「- 前提:」行を追加（#90） =="
+
+# plan-waves.sh は Task issue 本文の「- Epic: #N」「- 前提: #N」の2行だけで
+# Epic絞り込みと依存グラフを構築する（真実の源）。epic skill のテンプレートに
+# 「- 前提:」が無いと、plan skill / planner 経由と挙動が食い違い、epic skill 経由で
+# 作った Task issue が必ず宣言漏れ扱いになり完全逐次にフォールバックする（H4-a）。
+
+DOC90_EPIC_SKILL="${REPO_ROOT}/skills/epic/SKILL.md"
+DOC90_PLAN_WAVES="${REPO_ROOT}/scripts/plan-waves.sh"
+DOC90_README="${REPO_ROOT}/README.md"
+
+# --- Task issueテンプレート本体に「- 前提:」行がある ---
+DOC90_TEMPLATE="$(awk '/^gh issue create \\$/{f=1} /^BODY$/{f=0} f' "$DOC90_EPIC_SKILL")"
+
+case "$DOC90_TEMPLATE" in
+  *'- Epic: #[epic番号]'*'- 前提: #'*)
+    pass "skills/epic/SKILL.md: Task issueテンプレートで「- Epic:」の直後に「- 前提:」行がある（#90）" ;;
+  *)
+    fail "skills/epic/SKILL.md: Task issueテンプレートで「- Epic:」の直後に「- 前提:」行がある（#90）" \
+      "$DOC90_TEMPLATE" ;;
+esac
+
+# --- 依存が無い場合に「- 前提: なし」と書かせる指示がある ---
+if grep -Fq -e '- 前提: なし' "$DOC90_EPIC_SKILL"; then
+  pass "skills/epic/SKILL.md: 依存が無い場合に「- 前提: なし」と明記させる指示がある（#90）"
+else
+  fail "skills/epic/SKILL.md: 依存が無い場合に「- 前提: なし」と明記させる指示がある（#90）"
+fi
+
+# --- 「- Epic: #N」「- 前提: #N」がplan-waves.shの書式であり、表記ゆれが受理されない旨が書かれている ---
+DOC90_SECTION6="$(awk '/^### 6\. Task issue の作成/{f=1} /^### 7\./{f=0} f' "$DOC90_EPIC_SKILL")"
+
+case "$DOC90_SECTION6" in
+  *'plan-waves.sh'*'真実の源'*'表記ゆれ'*'受理されない'*)
+    pass "skills/epic/SKILL.md: plan-waves.shが真実の源であり表記ゆれが受理されない旨が書かれている（#90）" ;;
+  *)
+    fail "skills/epic/SKILL.md: plan-waves.shが真実の源であり表記ゆれが受理されない旨が書かれている（#90）" \
+      "$DOC90_SECTION6" ;;
+esac
+
+# 「scripts/plan-waves.shに差分が無い」「README.mdに差分が無い」はこのタスクの実施者が
+# 対象外ファイルに触れていないことの確認であり、特定のEpicブランチに依存する差分検査を
+# 恒久テストとして埋め込むと当該ブランチが消えた後にテストが壊れるため、ここでは
+# スコープの明記（上記）に留め、機械的な差分検査は行わない。
+
+# ---------------------------------------------------------------------------
+# count-skips.sh（SKIP件数の機械的カウント、Task #91、Epic #88 H5-a）
+#
+# `skills/run/SKILL.md` の「SKIP されたテストがあれば件数と内容を報告に含めること」という
+# 指示は数え方を示しておらず、`tail` で目視して「SKIP 0件」と誤報告する事故を招いた
+# （`docs/dev-workflow-handover.md` H5節）。ここでは呼び出し側の差し替え（#97）は行わず、
+# 数える本体だけを固定入力で検証する。Docker には一切触れない。
+# ---------------------------------------------------------------------------
+
+echo "== count-skips.sh（SKIP件数の機械的カウント） =="
+
+COUNT_SKIPS_SCRIPT="${REPO_ROOT}/scripts/count-skips.sh"
+
+cs_field() {
+  # cs_field <field名(skips|runner|pattern)> <count-skips.shの出力全体>
+  printf '%s\n' "$2" | grep -E "^$1=" | head -1 | sed "s/^$1=//"
+}
+
+# --- bash -n が通る ---
+if bash -n "$COUNT_SKIPS_SCRIPT" 2>/dev/null; then
+  pass "count-skips.sh: bash -n の構文チェックが通る（#91）"
+else
+  fail "count-skips.sh: bash -n の構文チェックが通る（#91）"
+fi
+
+# --- ケース1: Go形式・SKIPが3行 → skips=3 / runner=go / exit 0 ---
+CS_GO3_INPUT="$(printf -- '--- PASS: TestA (0.00s)\n--- SKIP: TestB (0.00s)\n--- SKIP: TestC (0.00s)\n--- SKIP: TestD (0.00s)\nFAIL\nok  \texample.com/pkg\t0.01s\n')"
+CS_GO3_OUTPUT="$(printf '%s\n' "$CS_GO3_INPUT" | bash "$COUNT_SKIPS_SCRIPT")"
+CS_GO3_EXIT=$?
+assert_eq "Go形式（SKIP3行）: skips=3" "3" "$(cs_field skips "$CS_GO3_OUTPUT")"
+assert_eq "Go形式（SKIP3行）: runner=go" "go" "$(cs_field runner "$CS_GO3_OUTPUT")"
+assert_exit_code "Go形式（SKIP3行）: exit 0" 0 "$CS_GO3_EXIT"
+
+# --- ケース2: Go形式・SKIPが0行 → skips=0（unknownにならない） / runner=go / exit 0 ---
+CS_GO0_INPUT="$(printf -- '--- PASS: TestA (0.00s)\nok  \texample.com/pkg\t0.01s\n')"
+CS_GO0_OUTPUT="$(printf '%s\n' "$CS_GO0_INPUT" | bash "$COUNT_SKIPS_SCRIPT")"
+CS_GO0_EXIT=$?
+assert_eq "Go形式（SKIP0行）: skips=0（unknownにならない）" "0" "$(cs_field skips "$CS_GO0_OUTPUT")"
+assert_eq "Go形式（SKIP0行）: runner=go" "go" "$(cs_field runner "$CS_GO0_OUTPUT")"
+assert_exit_code "Go形式（SKIP0行）: exit 0" 0 "$CS_GO0_EXIT"
+
+# --- ケース3: jest形式 → skips=2 / runner=jest / exit 0 ---
+CS_JEST_INPUT="Tests:       2 skipped, 3 passed, 5 total"
+CS_JEST_OUTPUT="$(printf '%s\n' "$CS_JEST_INPUT" | bash "$COUNT_SKIPS_SCRIPT")"
+CS_JEST_EXIT=$?
+assert_eq "jest形式: skips=2" "2" "$(cs_field skips "$CS_JEST_OUTPUT")"
+assert_eq "jest形式: runner=jest" "jest" "$(cs_field runner "$CS_JEST_OUTPUT")"
+assert_exit_code "jest形式: exit 0" 0 "$CS_JEST_EXIT"
+
+# --- ケース4: pytest形式 → skips=2 / runner=pytest / exit 0 ---
+CS_PYTEST_INPUT="$(printf -- '========== test session starts ==========\n1 passed, 2 skipped in 0.01s\n')"
+CS_PYTEST_OUTPUT="$(printf '%s\n' "$CS_PYTEST_INPUT" | bash "$COUNT_SKIPS_SCRIPT")"
+CS_PYTEST_EXIT=$?
+assert_eq "pytest形式: skips=2" "2" "$(cs_field skips "$CS_PYTEST_OUTPUT")"
+assert_eq "pytest形式: runner=pytest" "pytest" "$(cs_field runner "$CS_PYTEST_OUTPUT")"
+assert_exit_code "pytest形式: exit 0" 0 "$CS_PYTEST_EXIT"
+
+# --- ケース5: 認識できない形式 → skips=unknown / runner=unknown / exit 1（fail loud） ---
+CS_UNKNOWN_INPUT="hello world, nothing test-related here"
+CS_UNKNOWN_OUTPUT="$(printf '%s\n' "$CS_UNKNOWN_INPUT" | bash "$COUNT_SKIPS_SCRIPT")"
+CS_UNKNOWN_EXIT=$?
+assert_eq "認識できない形式: skips=unknown" "unknown" "$(cs_field skips "$CS_UNKNOWN_OUTPUT")"
+assert_eq "認識できない形式: runner=unknown" "unknown" "$(cs_field runner "$CS_UNKNOWN_OUTPUT")"
+assert_exit_code "認識できない形式: exit 1（fail loud）" 1 "$CS_UNKNOWN_EXIT"
+
+# --- ケース5': このリポジトリ自身のテスト形式（`bash tests/run-tests.sh` の ok/NG/skip 形式）を
+#     渡すと、built-inランナー（go/jest/pytest）のどれにも一致せず unknown/exit1 になる。
+#     これが「SKIP 0件」（Go形式・ケース2）と「形式を認識できない」（本ケース）を
+#     取り違えない、という本タスクの核心を実際のリポジトリ形式で示す ---
+CS_SELF_INPUT="$(printf '  ok   - サンプルテスト1\n  skip - サンプルテスト2 (依存物未配置)\n\n== 結果: 1 passed, 0 failed, 1 skipped ==\n')"
+CS_SELF_OUTPUT="$(printf '%s\n' "$CS_SELF_INPUT" | bash "$COUNT_SKIPS_SCRIPT")"
+CS_SELF_EXIT=$?
+assert_eq "このリポジトリ自身のok/NG/skip形式: skips=unknown（0件と誤報告しない）" "unknown" "$(cs_field skips "$CS_SELF_OUTPUT")"
+assert_exit_code "このリポジトリ自身のok/NG/skip形式: exit 1（fail loud）" 1 "$CS_SELF_EXIT"
+
+# --- ケース6: --pattern が最優先され runner=custom になる ---
+CS_PATTERN_INPUT="$(printf 'skip - foo (reason)\nskip - bar (reason)\n')"
+CS_PATTERN_OUTPUT="$(printf '%s\n' "$CS_PATTERN_INPUT" | bash "$COUNT_SKIPS_SCRIPT" --pattern '^skip - ')"
+CS_PATTERN_EXIT=$?
+assert_eq "--pattern指定: skips=2" "2" "$(cs_field skips "$CS_PATTERN_OUTPUT")"
+assert_eq "--pattern指定: runner=custom" "custom" "$(cs_field runner "$CS_PATTERN_OUTPUT")"
+assert_eq "--pattern指定: pattern=^skip - " "^skip - " "$(cs_field pattern "$CS_PATTERN_OUTPUT")"
+assert_exit_code "--pattern指定: exit 0" 0 "$CS_PATTERN_EXIT"
+
+# --- ケース7: DEV_WORKFLOW_SKIP_PATTERN 環境変数でも同様に custom になる ---
+CS_ENV_INPUT="$(printf 'skip - foo\nskip - bar\nskip - baz\n')"
+CS_ENV_OUTPUT="$(printf '%s\n' "$CS_ENV_INPUT" | DEV_WORKFLOW_SKIP_PATTERN='^skip - ' bash "$COUNT_SKIPS_SCRIPT")"
+CS_ENV_EXIT=$?
+assert_eq "DEV_WORKFLOW_SKIP_PATTERN指定: skips=3" "3" "$(cs_field skips "$CS_ENV_OUTPUT")"
+assert_eq "DEV_WORKFLOW_SKIP_PATTERN指定: runner=custom" "custom" "$(cs_field runner "$CS_ENV_OUTPUT")"
+assert_exit_code "DEV_WORKFLOW_SKIP_PATTERN指定: exit 0" 0 "$CS_ENV_EXIT"
+
+# --- ケース8: --pattern と DEV_WORKFLOW_SKIP_PATTERN が両方あれば --pattern を優先する ---
+CS_BOTH_OUTPUT="$(printf 'skip - foo\nSKIPPED bar\n' | DEV_WORKFLOW_SKIP_PATTERN='^SKIPPED' bash "$COUNT_SKIPS_SCRIPT" --pattern '^skip - ')"
+assert_eq "--patternとDEV_WORKFLOW_SKIP_PATTERN併存: --patternが優先される" "1" "$(cs_field skips "$CS_BOTH_OUTPUT")"
+
+# --- ケース8': --pattern に不正な ERE（未閉じの角括弧）を渡すと skips=unknown / runner=custom /
+#     pattern=<渡された値> になり exit 1（fail loud）。grepのエラー終了コードを検証せず
+#     そのまま出力していると skips= が空値のまま exit 0 になってしまう（#101） ---
+CS_BADPATTERN_INPUT="$(printf 'a\nb\n')"
+CS_BADPATTERN_OUTPUT="$(printf '%s\n' "$CS_BADPATTERN_INPUT" | bash "$COUNT_SKIPS_SCRIPT" --pattern '[' 2>/dev/null)"
+CS_BADPATTERN_EXIT=$?
+assert_eq "不正なERE: skips=unknown（空値のままにしない）" "unknown" "$(cs_field skips "$CS_BADPATTERN_OUTPUT")"
+assert_eq "不正なERE: runner=custom" "custom" "$(cs_field runner "$CS_BADPATTERN_OUTPUT")"
+assert_eq "不正なERE: pattern=[（渡された値をそのまま出す）" "[" "$(cs_field pattern "$CS_BADPATTERN_OUTPUT")"
+assert_exit_code "不正なERE: exit 1（fail loud）" 1 "$CS_BADPATTERN_EXIT"
+
+# --- ケース8'': --pattern に有効なEREだが一致0件の場合は不正なEREと区別し、
+#     従来どおり skips=0 / exit 0 のまま（正常な「一致なし」を壊さない） ---
+CS_NOMATCH_INPUT="$(printf 'a\nb\n')"
+CS_NOMATCH_OUTPUT="$(printf '%s\n' "$CS_NOMATCH_INPUT" | bash "$COUNT_SKIPS_SCRIPT" --pattern '^zzz$')"
+CS_NOMATCH_EXIT=$?
+assert_eq "有効なEREで一致0件: skips=0" "0" "$(cs_field skips "$CS_NOMATCH_OUTPUT")"
+assert_exit_code "有効なEREで一致0件: exit 0（正常扱いのまま）" 0 "$CS_NOMATCH_EXIT"
+
+# --- ケース9: 引数エラー（exit 2） ---
+bash "$COUNT_SKIPS_SCRIPT" --file >/dev/null 2>&1
+assert_exit_code "引数エラー: --file に値なしで exit 2" 2 "$?"
+
+bash "$COUNT_SKIPS_SCRIPT" --file /path/does/not/exist.log >/dev/null 2>&1
+assert_exit_code "引数エラー: 存在しないファイルで exit 2" 2 "$?"
+
+bash "$COUNT_SKIPS_SCRIPT" --unknown-option >/dev/null 2>&1
+assert_exit_code "引数エラー: 未知のオプションで exit 2" 2 "$?"
+
+# --- ケース10: --file 経由の読み込み ---
+CS_FILE_FIXTURE="$(mktemp "${TMPDIR:-/tmp}/dw-test-cs-file.XXXXXX")"
+printf -- '--- SKIP: T1 (0.00s)\n--- SKIP: T2 (0.00s)\nok  \tpkg\t0.01s\n' > "$CS_FILE_FIXTURE"
+CS_FILE_OUTPUT="$(bash "$COUNT_SKIPS_SCRIPT" --file "$CS_FILE_FIXTURE")"
+CS_FILE_EXIT=$?
+assert_eq "--file経由: skips=2" "2" "$(cs_field skips "$CS_FILE_OUTPUT")"
+assert_eq "--file経由: runner=go" "go" "$(cs_field runner "$CS_FILE_OUTPUT")"
+assert_exit_code "--file経由: exit 0" 0 "$CS_FILE_EXIT"
+
+# --- ケース11: --file と標準入力が両方ある場合、--file を優先する ---
+CS_BOTHIN_OUTPUT="$(printf 'Tests:       0 skipped, 5 passed, 5 total\n' | bash "$COUNT_SKIPS_SCRIPT" --file "$CS_FILE_FIXTURE")"
+assert_eq "--fileと標準入力の併存: --fileを優先（go形式のskips=2のまま）" "2" "$(cs_field skips "$CS_BOTHIN_OUTPUT")"
+assert_eq "--fileと標準入力の併存: runnerもgoのまま" "go" "$(cs_field runner "$CS_BOTHIN_OUTPUT")"
+
+# ---------------------------------------------------------------------------
+# cleanup-lane-worktrees.sh（取り込み済みレーンworktreeの片付け・Task #93）
+#
+# 一時 git リポジトリに Epic ブランチ・複数のレーンブランチ・それぞれの worktree を
+# 組み立てて検証する（Docker 非依存）。ml_commit_file / ml_branch_from / ml_head_of は
+# merge-lane.sh のテスト用に定義済みの汎用ヘルパをそのまま再利用する。
+# 呼び出し側（run からの結線）は #95 の担当なので、ここではスクリプト単体の振る舞いのみを見る。
+# ---------------------------------------------------------------------------
+
+echo "== cleanup-lane-worktrees.sh（取り込み済みレーンworktreeの片付け） =="
+
+CLW_SCRIPT="${REPO_ROOT}/scripts/cleanup-lane-worktrees.sh"
+
+# --- bash -n が通る ---
+if bash -n "$CLW_SCRIPT" 2>/dev/null; then
+  pass "cleanup-lane-worktrees.sh: bash -n の構文チェックが通る（#93）"
+else
+  fail "cleanup-lane-worktrees.sh: bash -n の構文チェックが通る（#93）"
+fi
+
+# --- スクリプト内に rm / rmdir によるディレクトリ削除が無い（安全ルール）。
+#     コメント行は対象外にし、単語境界での一致だけを見る
+#     （ヘッダコメントの「rm / rmdir」という説明文はコメント行なので除外される） ---
+CLW_FORBIDDEN_HITS="$(grep -v '^[[:space:]]*#' "$CLW_SCRIPT" \
+  | grep -E '(^|[^A-Za-z0-9_])(rm|rmdir)([[:space:]]|$)' || true)"
+if [ -z "$CLW_FORBIDDEN_HITS" ]; then
+  pass "cleanup-lane-worktrees.sh: rm / rmdir によるディレクトリ削除が無い"
+else
+  fail "cleanup-lane-worktrees.sh: rm / rmdir によるディレクトリ削除が無い" "$CLW_FORBIDDEN_HITS"
+fi
+
+clw_add_worktree() {
+  # clw_add_worktree <repo_dir> <worktree_dir> <既存のブランチ名>
+  # make_worktree は -b で新規ブランチを作るため、既存ブランチを checkout する
+  # 本テストでは使えない。既存ブランチをそのまま worktree に張るための専用ヘルパ。
+  local repo="$1" wt_dir="$2" branch="$3"
+  (
+    cd "$repo" || exit 1
+    git worktree add -q "$wt_dir" "$branch"
+  ) >/dev/null 2>&1
+}
+
+run_cleanup() {
+  # run_cleanup <repo_dir> [追加の引数...]  戻り値は標準出力（呼び出し側で $? を確認する）
+  local repo="$1"
+  shift
+  (cd "$repo" || exit 1; bash "$CLW_SCRIPT" "$@")
+}
+
+clw_worktree_exists() {
+  # clw_worktree_exists <repo_dir> <branch>  worktreeがあれば "yes" 、無ければ "no"
+  local repo="$1" branch="$2" found
+  found="$(
+    (cd "$repo" || exit 1; git worktree list --porcelain) 2>/dev/null \
+      | awk -v want="refs/heads/${branch}" '
+          $0 == "branch " want { print "yes"; exit }
+        '
+  )"
+  [ -n "$found" ] && echo "yes" || echo "no"
+}
+
+# --- 検証用リポジトリの組み立て ---
+# CLW_DEFAULT_BRANCH（メインworktreeがチェックアウトしているブランチ）
+#   -- init commit
+#     -- CLW_EPIC_BRANCH（epic/testclw/93）-- epic base commit
+#          -- lane-merged      -- merged.txt commit    （epicへ取り込み済み）
+#          -- lane-untouched   -- untouched.txt commit （epicへ取り込み済みだが --lane-branch に渡さない）
+#          -- lane-notmerged   -- notmerged.txt commit （epicへ未取り込みのまま）
+CLW_REPO="$(make_temp_repo)"
+CLW_DEFAULT_BRANCH="$(cd "$CLW_REPO" && git rev-parse --abbrev-ref HEAD)"
+CLW_EPIC_BRANCH="epic/testclw/93"
+
+CLW_ROOT_BASE="$(ml_head_of "$CLW_REPO" HEAD)"
+ml_branch_from "$CLW_REPO" "$CLW_EPIC_BRANCH" "$CLW_ROOT_BASE"
+ml_commit_file "$CLW_REPO" "epic.txt" "epic base\n" "epic base commit"
+CLW_EPIC_TIP1="$(ml_head_of "$CLW_REPO" "$CLW_EPIC_BRANCH")"
+
+ml_branch_from "$CLW_REPO" "lane-merged" "$CLW_EPIC_TIP1"
+ml_commit_file "$CLW_REPO" "merged.txt" "merged\n" "lane merged change"
+
+ml_branch_from "$CLW_REPO" "lane-untouched" "$CLW_EPIC_TIP1"
+ml_commit_file "$CLW_REPO" "untouched.txt" "untouched\n" "lane untouched change"
+
+ml_branch_from "$CLW_REPO" "lane-notmerged" "$CLW_EPIC_TIP1"
+ml_commit_file "$CLW_REPO" "notmerged.txt" "not merged\n" "lane not merged change"
+
+# lane-merged / lane-untouched を epic ブランチへ取り込む（epic ブランチを一時的に checkout）
+(cd "$CLW_REPO" && git checkout -q "$CLW_EPIC_BRANCH" \
+  && git merge -q --no-edit lane-merged \
+  && git merge -q --no-edit lane-untouched \
+  && git checkout -q "$CLW_DEFAULT_BRANCH") >/dev/null 2>&1
+
+# メインworktree は CLW_DEFAULT_BRANCH のまま（epic ブランチを空ける。同じブランチを
+# 2箇所でチェックアウトできないため、linked worktree で epic ブランチを張れるようにする）
+clw_add_worktree "$CLW_REPO" "${CLW_REPO}/.claude/worktrees/epicwt" "$CLW_EPIC_BRANCH"
+clw_add_worktree "$CLW_REPO" "${CLW_REPO}/.claude/worktrees/lane-merged" "lane-merged"
+clw_add_worktree "$CLW_REPO" "${CLW_REPO}/.claude/worktrees/lane-untouched" "lane-untouched"
+clw_add_worktree "$CLW_REPO" "${CLW_REPO}/.claude/worktrees/lane-notmerged" "lane-notmerged"
+
+# --- ケース1: --dry-run では取り込み済みレーンが removed 候補として列挙されるが、
+#     実際には削除されない（受け入れ条件2） ---
+CLW_DRY_OUT="$(run_cleanup "$CLW_REPO" --epic-branch "$CLW_EPIC_BRANCH" \
+  --lane-branch lane-merged --lane-branch lane-notmerged --dry-run)"
+CLW_DRY_EXIT=$?
+assert_exit_code "ケース1: --dry-run は exit 0" 0 "$CLW_DRY_EXIT"
+
+case "$CLW_DRY_OUT" in
+  *"removed"*"lane-merged"*"lane-merged"*)
+    pass "ケース1: 取り込み済みレーン（lane-merged）が removed 候補として出る" ;;
+  *)
+    fail "ケース1: 取り込み済みレーン（lane-merged）が removed 候補として出る" "output=[${CLW_DRY_OUT}]" ;;
+esac
+
+assert_eq "ケース1: --dry-run 後も lane-merged の worktree は残っている（削除されていない）" \
+  "yes" "$(clw_worktree_exists "$CLW_REPO" lane-merged)"
+
+# --- ケース2: 取り込み未の lane-notmerged は --dry-run でも skip reason not-merged になる
+#     （受け入れ条件3） ---
+case "$CLW_DRY_OUT" in
+  *"skip"*"lane-notmerged"*"reason"*"not-merged"*)
+    pass "ケース2: 取り込み未のレーン（lane-notmerged）は skip reason not-merged" ;;
+  *)
+    fail "ケース2: 取り込み未のレーン（lane-notmerged）は skip reason not-merged" "output=[${CLW_DRY_OUT}]" ;;
+esac
+
+# --- ケース3: --dry-run 無しで実行すると、実際にレーン worktree が削除される
+#     （受け入れ条件: --dry-run 無しで実際に削除される） ---
+CLW_REAL_OUT="$(run_cleanup "$CLW_REPO" --epic-branch "$CLW_EPIC_BRANCH" \
+  --lane-branch lane-merged --lane-branch lane-notmerged \
+  --lane-branch "$CLW_DEFAULT_BRANCH" --lane-branch "$CLW_EPIC_BRANCH" \
+  --lane-branch no-such-lane-branch)"
+CLW_REAL_EXIT=$?
+assert_exit_code "ケース3: --dry-run 無しの実行は exit 0（skipが混ざっていても0）" 0 "$CLW_REAL_EXIT"
+
+case "$CLW_REAL_OUT" in
+  *"removed"*"lane-merged"*)
+    pass "ケース3: 取り込み済みレーン（lane-merged）が removed と報告される" ;;
+  *)
+    fail "ケース3: 取り込み済みレーン（lane-merged）が removed と報告される" "output=[${CLW_REAL_OUT}]" ;;
+esac
+
+assert_eq "ケース3: 実行後 lane-merged の worktree が実際に削除される（git worktree list から消える）" \
+  "no" "$(clw_worktree_exists "$CLW_REPO" lane-merged)"
+
+# --- ケース4: 取り込み未のレーンは削除されず worktree が残ったまま（受け入れ条件3） ---
+case "$CLW_REAL_OUT" in
+  *"skip"*"lane-notmerged"*"reason"*"not-merged"*)
+    pass "ケース4: lane-notmerged は skip reason not-merged で削除されない" ;;
+  *)
+    fail "ケース4: lane-notmerged は skip reason not-merged で削除されない" "output=[${CLW_REAL_OUT}]" ;;
+esac
+assert_eq "ケース4: lane-notmerged の worktree は削除されずに残っている" \
+  "yes" "$(clw_worktree_exists "$CLW_REPO" lane-notmerged)"
+
+# --- ケース5: メインworktreeがチェックアウトしているブランチは skip reason protected
+#     （受け入れ条件4。メインworktree自体は消えず、当然 git rev-parse も生きたまま） ---
+case "$CLW_REAL_OUT" in
+  *"skip"*"$CLW_DEFAULT_BRANCH"*"reason"*"protected"*)
+    pass "ケース5: メインworktreeのブランチは skip reason protected" ;;
+  *)
+    fail "ケース5: メインworktreeのブランチは skip reason protected" "output=[${CLW_REAL_OUT}]" ;;
+esac
+assert_eq "ケース5: メインworktreeのブランチは削除後も worktree として残る" \
+  "yes" "$(clw_worktree_exists "$CLW_REPO" "$CLW_DEFAULT_BRANCH")"
+
+# --- ケース6: --epic-branch をチェックアウトしている worktree は skip reason protected
+#     （受け入れ条件4） ---
+case "$CLW_REAL_OUT" in
+  *"skip"*"$CLW_EPIC_BRANCH"*"reason"*"protected"*)
+    pass "ケース6: --epic-branch の worktree は skip reason protected" ;;
+  *)
+    fail "ケース6: --epic-branch の worktree は skip reason protected" "output=[${CLW_REAL_OUT}]" ;;
+esac
+assert_eq "ケース6: --epic-branch の worktree は削除後も残る" \
+  "yes" "$(clw_worktree_exists "$CLW_REPO" "$CLW_EPIC_BRANCH")"
+
+# --- ケース7: worktreeが無い（存在しない）レーンブランチは skip reason no-worktree
+#     （受け入れ条件: no-worktree で exit 0） ---
+case "$CLW_REAL_OUT" in
+  *"skip"*"no-such-lane-branch"*"reason"*"no-worktree"*)
+    pass "ケース7: worktreeの無いレーンブランチは skip reason no-worktree" ;;
+  *)
+    fail "ケース7: worktreeの無いレーンブランチは skip reason no-worktree" "output=[${CLW_REAL_OUT}]" ;;
+esac
+
+# --- ケース8: --lane-branch に明示的に渡されなかった lane-untouched は、取り込み済みでも
+#     一切触れられない（他Epic・未指定worktreeに触れない原則の確認） ---
+assert_eq "ケース8: --lane-branch で渡していない lane-untouched の worktree は残ったまま" \
+  "yes" "$(clw_worktree_exists "$CLW_REPO" lane-untouched)"
+
+# --- ケース9（R7対策の実機確認）: node_modules 等の symlink を解除してから削除するため、
+#     symlink先の実体ディレクトリが誤って消えないこと ---
+CLW_SYM_REPO="$(make_temp_repo)"
+CLW_SYM_DEFAULT_BRANCH="$(cd "$CLW_SYM_REPO" && git rev-parse --abbrev-ref HEAD)"
+CLW_SYM_EPIC_BRANCH="epic/testsym/93"
+CLW_SYM_BASE="$(ml_head_of "$CLW_SYM_REPO" HEAD)"
+ml_branch_from "$CLW_SYM_REPO" "$CLW_SYM_EPIC_BRANCH" "$CLW_SYM_BASE"
+ml_commit_file "$CLW_SYM_REPO" "epic.txt" "epic base\n" "epic base commit"
+CLW_SYM_EPIC_TIP="$(ml_head_of "$CLW_SYM_REPO" "$CLW_SYM_EPIC_BRANCH")"
+ml_branch_from "$CLW_SYM_REPO" "lane-sym" "$CLW_SYM_EPIC_TIP"
+ml_commit_file "$CLW_SYM_REPO" "sym.txt" "sym\n" "lane sym change"
+(cd "$CLW_SYM_REPO" && git checkout -q "$CLW_SYM_EPIC_BRANCH" \
+  && git merge -q --no-edit lane-sym \
+  && git checkout -q "$CLW_SYM_DEFAULT_BRANCH") >/dev/null 2>&1
+clw_add_worktree "$CLW_SYM_REPO" "${CLW_SYM_REPO}/.claude/worktrees/lane-sym" "lane-sym"
+
+CLW_SYM_REAL_TARGET="$(mktemp -d "${TMPDIR:-/tmp}/dw-test-clw-realdir.XXXXXX")"
+printf 'do not delete me\n' > "${CLW_SYM_REAL_TARGET}/marker.txt"
+(cd "${CLW_SYM_REPO}/.claude/worktrees/lane-sym" && ln -s "$CLW_SYM_REAL_TARGET" node_modules) >/dev/null 2>&1
+
+run_cleanup "$CLW_SYM_REPO" --epic-branch "$CLW_SYM_EPIC_BRANCH" --lane-branch lane-sym >/dev/null
+
+assert_eq "ケース9: node_modules症状のレーンworktreeも削除される" \
+  "no" "$(clw_worktree_exists "$CLW_SYM_REPO" lane-sym)"
+
+if [ -f "${CLW_SYM_REAL_TARGET}/marker.txt" ]; then
+  pass "ケース9: symlink解除後の削除でも symlink先の実体ファイルは消えない（R7対策）"
+else
+  fail "ケース9: symlink解除後の削除でも symlink先の実体ファイルは消えない（R7対策）" \
+    "marker.txt が消えました: ${CLW_SYM_REAL_TARGET}"
+fi
+
+# --- ケース10: 引数バリデーション（引数エラーは exit 2） ---
+CLW_REPO_ARGS="$(make_temp_repo)"
+
+run_cleanup "$CLW_REPO_ARGS" >/dev/null 2>&1
+assert_exit_code "引数なしは exit 2" 2 "$?"
+
+run_cleanup "$CLW_REPO_ARGS" --lane-branch dummy >/dev/null 2>&1
+assert_exit_code "--epic-branch 省略は exit 2" 2 "$?"
+
+run_cleanup "$CLW_REPO_ARGS" --epic-branch main >/dev/null 2>&1
+assert_exit_code "--lane-branch 省略は exit 2" 2 "$?"
+
+run_cleanup "$CLW_REPO_ARGS" --epic-branch >/dev/null 2>&1
+assert_exit_code "--epic-branch に値なしは exit 2" 2 "$?"
+
+run_cleanup "$CLW_REPO_ARGS" --epic-branch main --lane-branch >/dev/null 2>&1
+assert_exit_code "--lane-branch に値なしは exit 2" 2 "$?"
+
+run_cleanup "$CLW_REPO_ARGS" --epic-branch main --lane-branch dummy --unknown-option >/dev/null 2>&1
+assert_exit_code "未知のオプションは exit 2" 2 "$?"
+
+# ---------------------------------------------------------------------------
+# H2（Task #94）: 準備コマンドをレーンの作業ディレクトリで初回1回だけ実行させる
+#
+# 「Epic 開始時に1回」は Epic 専用 worktree にしか効かず、generator の isolation
+# worktree（レーンの作業ディレクトリ）には及ばない。にもかかわらず旧
+# `core/roles/generator.md` は「タスクごとに自前で再実行しない」と単独で禁止しており、
+# generator が自力で補うことも抑止していた（詳細は docs/dev-workflow-handover.md のH2節）。
+# ここでは「worktreeごとに1回」の意味に改めたことを機械的に検査する。
+# ---------------------------------------------------------------------------
+
+echo ""
+echo "== H2: 準備コマンドをレーンの作業ディレクトリで初回1回だけ実行させる（回帰防止 #94） =="
+
+# --- skills/run/SKILL.md: Step 3 雛形にPREP_CMDの埋め込みと「初回1回だけ」の指示がある ---
+H2_RS_STEP3="$(awk '/^### Step 3:/{f=1} /^### Step 4:/{f=0} f' "${REPO_ROOT}/skills/run/SKILL.md")"
+
+case "$H2_RS_STEP3" in
+  *'PREP_CMD'*'初回1回だけ'*)
+    pass "SKILL.md: Step 3 雛形に PREP_CMD の埋め込みと『初回1回だけ』実行させる指示がある（#94）" ;;
+  *)
+    fail "SKILL.md: Step 3 雛形に PREP_CMD の埋め込みと『初回1回だけ』実行させる指示がある（#94）" \
+      "$H2_RS_STEP3" ;;
+esac
+
+case "$H2_RS_STEP3" in
+  *'空の場合はこの行を出さない'*)
+    pass "SKILL.md: Step 3 雛形に『準備コマンド節が無い場合はこの行を出さない』旨（後方互換）がある（#94）" ;;
+  *)
+    fail "SKILL.md: Step 3 雛形に『準備コマンド節が無い場合はこの行を出さない』旨（後方互換）がある（#94）" \
+      "$H2_RS_STEP3" ;;
+esac
+
+case "$H2_RS_STEP3" in
+  *'2回目以降は実行しない'*)
+    pass "SKILL.md: Step 3 雛形に『同一worktree内で2回目以降は実行しない』旨がある（#94）" ;;
+  *)
+    fail "SKILL.md: Step 3 雛形に『同一worktree内で2回目以降は実行しない』旨がある（#94）" \
+      "$H2_RS_STEP3" ;;
+esac
+
+# --- skills/run/SKILL.md: Epic開始時1回を残す理由（キャッシュ温め・統合ゲート用Epic worktree配置）が明記されている ---
+H2_RS_PREP="$(awk '/^#### プロジェクト固有の準備コマンド/{f=1} /^### サンドボックスへのコマンド投入/{f=0} f' "${REPO_ROOT}/skills/run/SKILL.md")"
+
+case "$H2_RS_PREP" in
+  *'ビルドキャッシュを温める'*'統合ゲート'*'Epic worktree に生成物を配置'*)
+    pass "SKILL.md: Epic開始時1回を残す理由（キャッシュ温め・統合ゲート用Epic worktree配置）が明記されている（#94）" ;;
+  *)
+    fail "SKILL.md: Epic開始時1回を残す理由（キャッシュ温め・統合ゲート用Epic worktree配置）が明記されている（#94）" \
+      "$H2_RS_PREP" ;;
+esac
+
+# --- skills-codex/dev-workflow-run/SKILL.md: Step 3 の generator プロンプトに準備コマンドを渡していない ---
+H2_CRS_STEP3="$(awk '/^### Step 3:/{f=1} /^#### トークン消費の記録/{f=0} f' "${REPO_ROOT}/skills-codex/dev-workflow-run/SKILL.md")"
+
+if printf '%s\n' "$H2_CRS_STEP3" | grep -Fq 'PREP_CMD'; then
+  fail "SKILL.md(codex): Step 3 の generator プロンプトに PREP_CMD を渡していない（#94）" \
+    "$H2_CRS_STEP3"
+else
+  pass "SKILL.md(codex): Step 3 の generator プロンプトに PREP_CMD を渡していない（#94）"
+fi
+
+# --- skills-codex/dev-workflow-run/SKILL.md: 渡さない理由（Epic worktreeで直接作業するため）が明記されている ---
+H2_CRS_PREP="$(awk '/^## サンドボックスの準備/{f=1} /^## 自律実行の開始を記録/{f=0} f' "${REPO_ROOT}/skills-codex/dev-workflow-run/SKILL.md")"
+
+case "$H2_CRS_PREP" in
+  *'generator にはこの準備コマンドを渡さない'*'二重実行'*)
+    pass "SKILL.md(codex): 準備コマンドをgeneratorに渡さない理由（二重実行の回避）が明記されている（#94）" ;;
+  *)
+    fail "SKILL.md(codex): 準備コマンドをgeneratorに渡さない理由（二重実行の回避）が明記されている（#94）" \
+      "見つかりませんでした" ;;
+esac
+
+# --- core/roles/generator.md: 「タスクごとに自前で再実行しない」という単独の禁止表現が消えている ---
+if grep -Fq -- '**タスクごとに自前で再実行しない。**' "${REPO_ROOT}/core/roles/generator.md"; then
+  fail "core/roles/generator.md: 「タスクごとに自前で再実行しない」という単独の禁止表現が消えている（#94）" \
+    "$(grep -n -- 'タスクごとに自前で再実行しない' "${REPO_ROOT}/core/roles/generator.md")"
+else
+  pass "core/roles/generator.md: 「タスクごとに自前で再実行しない」という単独の禁止表現が消えている（#94）"
+fi
+
+# --- core/roles/generator.md: 「worktreeごとに1回」を意味する記述に置き換わっている ---
+# 節の終端は「### 1. 」（review#100 で準備コマンド節を「0. 」の後ろへ移したため、
+# 「0. 」は準備コマンド節より前にある。「0. 」を終端にすると節を抽出できない）
+GEN_PREP_SECTION="$(awk '/^### プロジェクト固有の準備/{f=1} /^### 1\. /{f=0} f' "${REPO_ROOT}/core/roles/generator.md")"
+
+case "$GEN_PREP_SECTION" in
+  *'初回1回だけ'*'同一 worktree 内で2回目以降は実行しない'*)
+    pass "core/roles/generator.md: 『worktreeごとに1回』を意味する記述（初回1回だけ・2回目以降は実行しない）がある（#94）" ;;
+  *)
+    fail "core/roles/generator.md: 『worktreeごとに1回』を意味する記述（初回1回だけ・2回目以降は実行しない）がある（#94）" \
+      "$GEN_PREP_SECTION" ;;
+esac
+
+case "$GEN_PREP_SECTION" in
+  *'渡されていない場合'*'実行しない'*)
+    pass "core/roles/generator.md: 準備コマンドが渡されていない場合は自分で探して実行しない旨が残っている（#94）" ;;
+  *)
+    fail "core/roles/generator.md: 準備コマンドが渡されていない場合は自分で探して実行しない旨が残っている（#94）" \
+      "$GEN_PREP_SECTION" ;;
+esac
+
+# --- core/roles/generator.md: #89 が入れた「0. 」節（ベース合わせ）が引き続き直後に存在し、壊れていない ---
+GEN_STEP0_H2="$(awk '/^### 0\. /{f=1} /^### 1\. /{f=0} f' "${REPO_ROOT}/core/roles/generator.md")"
+
+assert_order "core/roles/generator.md: H2向け編集後も「0. 」節のコマンド列の順序（#89）が保たれている（#94）" \
+  "$(printf '%s\n' "$GEN_STEP0_H2" | awk '/^```bash/{f=1;next} /^```/{f=0} f')" \
+  "git status --short" "git reset --hard" "git merge-base --is-ancestor" "git log --oneline -1"
+
+# --- README.md: 「この1回の準備がウェーブ・レーンをまたいで効く」が消えている ---
+if grep -Fq -- 'この1回の準備がウェーブ・レーンをまたいで効く' "${REPO_ROOT}/README.md"; then
+  fail "README.md: 『この1回の準備がウェーブ・レーンをまたいで効く』という誤った記述が消えている（#94）" \
+    "$(grep -n -- 'この1回の準備がウェーブ・レーンをまたいで効く' "${REPO_ROOT}/README.md")"
+else
+  pass "README.md: 『この1回の準備がウェーブ・レーンをまたいで効く』という誤った記述が消えている（#94）"
+fi
+
+# --- README.md: 準備コマンド節の他の記述（実際の適用範囲）に書き換わっている ---
+README_PREP_SECTION="$(awk '/^### Epic の `## 準備コマンド` 節/{f=1} /^## YOLOモード/{f=0} f' "${REPO_ROOT}/README.md")"
+
+case "$README_PREP_SECTION" in
+  *'Epic 専用 worktree だけ'*)
+    pass "README.md: 準備コマンド節の適用範囲がEpic専用worktreeだけである旨に書き換わっている（#94）" ;;
+  *)
+    fail "README.md: 準備コマンド節の適用範囲がEpic専用worktreeだけである旨に書き換わっている（#94）" \
+      "$README_PREP_SECTION" ;;
+esac
+
+# ---------------------------------------------------------------------------
+# review#100: core/roles/generator.md の準備コマンド節が「0. 」節より後ろにある
+#
+# #94 時点の並びは「準備コマンド節 → 0.（ベース合わせ） → 1.」だった。上から読む
+# generator は準備を WAVE_BASE に合わせる前に実行してしまうため、順序を
+# 「0. → 準備コマンド節 → 1.」へ入れ替えた。この順序が壊れないことを機械的に固定する。
+# ---------------------------------------------------------------------------
+
+echo ""
+echo "== review#100: 準備コマンド節が「0. 」節より後にある（回帰防止） =="
+
+GEN_FLOW_SECTION="$(awk '/^## 作業フロー/{f=1;next} /^## コーディングルール/{f=0} f' "${REPO_ROOT}/core/roles/generator.md")"
+
+assert_order "core/roles/generator.md: 「## 作業フロー」節で 0.（ベース合わせ）→ プロジェクト固有の準備 → 1.（タスク確認）の順で並んでいる（#100）" \
+  "$GEN_FLOW_SECTION" \
+  "### 0. 渡されたベースにHEADを合わせる" \
+  "### プロジェクト固有の準備は自分の作業ディレクトリで初回1回だけ実行する" \
+  "### 1. タスクの確認"
+
+case "$GEN_PREP_SECTION" in
+  *'0. 渡されたベースにHEADを合わせる'*'終わってから実行する'*)
+    pass "core/roles/generator.md: 準備コマンド節に『0.が終わってから実行する』旨の注記がある（#100）" ;;
+  *)
+    fail "core/roles/generator.md: 準備コマンド節に『0.が終わってから実行する』旨の注記がある（#100）" \
+      "$GEN_PREP_SECTION" ;;
+esac
+
+# ---------------------------------------------------------------------------
+# review#99: H1・H2 が否定した旧文言が、正本・生成物のいずれにも残っていない
+#
+# #94/#89 時点の退行防止テストは skills/run/SKILL.md・core/roles/generator.md・README.md の
+# 3ファイル限定だった。同じ内容を連結する core/instructions.md が対象外だったため、
+# 生成物（agents/*.md・codex-agents/*.toml）内に新旧の記述が同居する状態を検出できなかった。
+# 検査対象を「core/instructions.md を連結する全生成物」まで広げ、同じ見落としを再発させない。
+# ---------------------------------------------------------------------------
+
+echo ""
+echo "== review#99: core/instructions.md と生成物から旧文言が消えている（回帰防止） =="
+
+# for/whileのパイプはbashではサブシェルになりPASS/FAILカウンタが親シェルに伝播しない
+# ため、配列 + for（サブシェルを作らない）で回す。
+REVIEW99_OLD_PHRASES=(
+  "検証1回だけを行う"
+  "ウェーブ・レーンをまたいで効く"
+  "タスクごとにこの準備を再実行しない"
+)
+
+REVIEW99_FILES=(
+  "core/instructions.md"
+  "docs/dev-workflow-multi-vendor-guide.md"
+  "core/roles/generator.md"
+  "skills/run/SKILL.md"
+  "README.md"
+  "agents/generator.md"
+  "agents/evaluator.md"
+  "agents/planner.md"
+  "codex-agents/generator.toml"
+  "codex-agents/evaluator.toml"
+  "codex-agents/planner.toml"
+)
+
+for f in "${REVIEW99_FILES[@]}"; do
+  for phrase in "${REVIEW99_OLD_PHRASES[@]}"; do
+    if grep -Fq -- "$phrase" "${REPO_ROOT}/${f}"; then
+      fail "${f}: 旧文言『${phrase}』が消えている（#99）" \
+        "$(grep -n -- "$phrase" "${REPO_ROOT}/${f}")"
+    else
+      pass "${f}: 旧文言『${phrase}』が消えている（#99）"
+    fi
+  done
+done
+
+# ---------------------------------------------------------------------------
+# H6-b（Task #95）: run の後片付けで当該 Epic 分のレーン worktree を削除する
+#
+# 前提タスク #93 で新設した scripts/cleanup-lane-worktrees.sh を run のクリーンアップ節に
+# 結線したことを機械的に検査する。スクリプト自体の振る舞い（削除/skip の判定）は #93 の
+# テスト（上の「cleanup-lane-worktrees.sh」節）で検証済みなので、ここでは SKILL.md /
+# README.md の記述内容だけを見る。
+# ---------------------------------------------------------------------------
+
+echo ""
+echo "== H6-b: runの後片付けで当該Epic分のレーンworktreeを削除する（#95） =="
+
+# --- skills/run/SKILL.md: 「isolation worktree はハーネスが自動整理する」という誤った
+#     断定が消えている（#93以前の原文そのまま） ---
+if grep -Fq -- 'isolation worktree（`.claude/worktrees/agent-*`）はハーネスが自動整理する' \
+  "${REPO_ROOT}/skills/run/SKILL.md"; then
+  fail "SKILL.md: 『isolation worktreeはハーネスが自動整理する』という誤った記述が消えている（#95）" \
+    "$(grep -n -- 'ハーネスが自動整理する' "${REPO_ROOT}/skills/run/SKILL.md")"
+else
+  pass "SKILL.md: 『isolation worktreeはハーネスが自動整理する』という誤った記述が消えている（#95）"
+fi
+
+# --- skills/run/SKILL.md: 「worktree クリーンアップ」節を切り出す ---
+H6_RS_CLEANUP="$(awk '/^## worktree クリーンアップ/{f=1} /^## 自律動作ポリシー（YOLOモード）/{f=0} f' \
+  "${REPO_ROOT}/skills/run/SKILL.md")"
+
+if [ -z "$H6_RS_CLEANUP" ]; then
+  fail "SKILL.md: 『worktree クリーンアップ』節が見つかる（前提）（#95）" "節が空でした"
+else
+  pass "SKILL.md: 『worktree クリーンアップ』節が見つかる（前提）（#95）"
+fi
+
+# --- クリーンアップ節が cleanup-lane-worktrees.sh を --epic-branch / --lane-branch 付きで呼ぶ ---
+case "$H6_RS_CLEANUP" in
+  *'cleanup-lane-worktrees.sh'*'--epic-branch'*'--lane-branch'*)
+    pass "SKILL.md: クリーンアップ節が cleanup-lane-worktrees.sh を --epic-branch と --lane-branch 付きで呼んでいる（#95）" ;;
+  *)
+    fail "SKILL.md: クリーンアップ節が cleanup-lane-worktrees.sh を --epic-branch と --lane-branch 付きで呼んでいる（#95）" \
+      "$H6_RS_CLEANUP" ;;
+esac
+
+# --- 削除に失敗してもrun全体を落とさない（|| true 等） ---
+case "$H6_RS_CLEANUP" in
+  *'cleanup-lane-worktrees.sh'*'|| true'*)
+    pass "SKILL.md: cleanup-lane-worktrees.sh の呼び出しが失敗してもrun全体を止めない（|| true）（#95）" ;;
+  *)
+    fail "SKILL.md: cleanup-lane-worktrees.sh の呼び出しが失敗してもrun全体を止めない（|| true）（#95）" \
+      "$H6_RS_CLEANUP" ;;
+esac
+
+# --- 他Epicのworktreeには触れない旨が明記されている ---
+case "$H6_RS_CLEANUP" in
+  *'他Epic'*'触れない'*)
+    pass "SKILL.md: 他Epicのレーンworktreeには触れない旨が明記されている（#95）" ;;
+  *)
+    fail "SKILL.md: 他Epicのレーンworktreeには触れない旨が明記されている（#95）" \
+      "$H6_RS_CLEANUP" ;;
+esac
+
+# --- 取り込めなかったレーンは削除されない（not-merged）旨が明記されている ---
+case "$H6_RS_CLEANUP" in
+  *'not-merged'*)
+    pass "SKILL.md: 取り込めなかったレーンは削除されない（not-merged）旨が明記されている（#95）" ;;
+  *)
+    fail "SKILL.md: 取り込めなかったレーンは削除されない（not-merged）旨が明記されている（#95）" \
+      "$H6_RS_CLEANUP" ;;
+esac
+
+# --- 人間向けの棚卸し導線（git worktree list と --dry-run）が案内されている ---
+case "$H6_RS_CLEANUP" in
+  *'git worktree list'*'--dry-run'*)
+    pass "SKILL.md: 人間向けの棚卸し導線（git worktree list と --dry-run）が案内されている（#95）" ;;
+  *)
+    fail "SKILL.md: 人間向けの棚卸し導線（git worktree list と --dry-run）が案内されている（#95）" \
+      "$H6_RS_CLEANUP" ;;
+esac
+
+# --- 既存の警告（symlink解除・Epic専用worktreeの削除）が消えずに残っている（統合による破壊が無いこと） ---
+case "$H6_RS_CLEANUP" in
+  *'symlink越しに実体ファイルが削除される'*'git worktree remove "$EPIC_WT" --force'*)
+    pass "SKILL.md: 既存のsymlink警告・Epic専用worktree削除の記述が壊れずに残っている（#95）" ;;
+  *)
+    fail "SKILL.md: 既存のsymlink警告・Epic専用worktree削除の記述が壊れずに残っている（#95）" \
+      "$H6_RS_CLEANUP" ;;
+esac
+
+# --- skills/run/SKILL.md に駆動先プロジェクト固有の値（master 等）をハードコードしていない ---
+case "$H6_RS_CLEANUP" in
+  *'master'*)
+    fail "SKILL.md: クリーンアップ節に駆動先プロジェクト固有の値（master）をハードコードしていない（#95）" \
+      "$H6_RS_CLEANUP" ;;
+  *)
+    pass "SKILL.md: クリーンアップ節に駆動先プロジェクト固有の値（master）をハードコードしていない（#95）" ;;
+esac
+
+# --- skills-codex/dev-workflow-run/SKILL.md: Codexでは該当なしである旨が明記されている ---
+H6_CRS_CLEANUP="$(awk '/^## クリーンアップ（worktree）/{f=1} /^## 自律動作ポリシー/{f=0} f' \
+  "${REPO_ROOT}/skills-codex/dev-workflow-run/SKILL.md")"
+
+case "$H6_CRS_CLEANUP" in
+  *'該当なし'*'サブエージェント専用worktree'*)
+    pass "SKILL.md(codex): レーンworktreeの片付けはCodexでは該当なしである旨が明記されている（#95）" ;;
+  *)
+    fail "SKILL.md(codex): レーンworktreeの片付けはCodexでは該当なしである旨が明記されている（#95）" \
+      "$H6_CRS_CLEANUP" ;;
+esac
+
+# --- skills-codex/dev-workflow-run/SKILL.md: 既存のEpic worktree削除手順は壊れていない ---
+case "$H6_CRS_CLEANUP" in
+  *'git worktree remove ".codex/worktrees/${EPIC_NUM}" --force'*'git worktree prune'*)
+    pass "SKILL.md(codex): 既存のEpic worktree削除手順（node_modules symlink解除・remove・prune）が壊れずに残っている（#95）" ;;
+  *)
+    fail "SKILL.md(codex): 既存のEpic worktree削除手順（node_modules symlink解除・remove・prune）が壊れずに残っている（#95）" \
+      "$H6_CRS_CLEANUP" ;;
+esac
+
+# --- README.md: 「worktree運用の注意」節にレーンworktreeの蓄積とcleanup-lane-worktrees.shが書かれている ---
+H6_README_SECTION="$(awk '/^### worktree運用の注意/{f=1} /^## 並列実行（ウェーブ実行）/{f=0} f' \
+  "${REPO_ROOT}/README.md")"
+
+if [ -z "$H6_README_SECTION" ]; then
+  fail "README.md: 『worktree運用の注意』節が見つかる（前提）（#95）" "節が空でした"
+else
+  pass "README.md: 『worktree運用の注意』節が見つかる（前提）（#95）"
+fi
+
+case "$H6_README_SECTION" in
+  *'蓄積'*'cleanup-lane-worktrees.sh'*)
+    pass "README.md: 『worktree運用の注意』節にレーンworktreeの蓄積とcleanup-lane-worktrees.shが書かれている（#95）" ;;
+  *)
+    fail "README.md: 『worktree運用の注意』節にレーンworktreeの蓄積とcleanup-lane-worktrees.shが書かれている（#95）" \
+      "$H6_README_SECTION" ;;
+esac
+
+# --- README.md: 既存のsymlink警告（#87由来）は消えずに残っている ---
+case "$H6_README_SECTION" in
+  *'symlink越しにメインリポの実体ファイルを削除する'*)
+    pass "README.md: 既存のsymlink警告が壊れずに残っている（#95）" ;;
+  *)
+    fail "README.md: 既存のsymlink警告が壊れずに残っている（#95）" \
+      "$H6_README_SECTION" ;;
+esac
+
+# ---------------------------------------------------------------------------
+# H3（Task #96）: generator が `cd` で作業ディレクトリを変えないことの明示
+# ---------------------------------------------------------------------------
+
+echo ""
+echo "== H3: cdで作業ディレクトリを変えないことを明記する（#96） =="
+
+# --- core/roles/generator.md: 「#### `cd` で作業ディレクトリを変えない」節が存在する ---
+H3_GEN_CD_SECTION="$(awk '/^#### `cd` で作業ディレクトリを変えない/{f=1} /^#### シェルスクリプトを新規生成したら/{f=0} f' \
+  "${REPO_ROOT}/core/roles/generator.md")"
+
+if [ -z "$H3_GEN_CD_SECTION" ]; then
+  fail "core/roles/generator.md: 『cdで作業ディレクトリを変えない』節が見つかる（#96）" "節が空でした"
+else
+  pass "core/roles/generator.md: 『cdで作業ディレクトリを変えない』節が見つかる（#96）"
+fi
+
+# --- core/roles/generator.md: sandbox-exec.shが呼び出し元cwdからworkdirを解決し、cdがそれを上書きする旨が理由として書かれている ---
+case "$H3_GEN_CD_SECTION" in
+  *'呼び出し元 cwd'*'workdir'*'上書き'*)
+    pass "core/roles/generator.md: workdirが呼び出し元cwdから解決されcdが上書きする旨が理由として書かれている（#96）" ;;
+  *)
+    fail "core/roles/generator.md: workdirが呼び出し元cwdから解決されcdが上書きする旨が理由として書かれている（#96）" \
+      "$H3_GEN_CD_SECTION" ;;
+esac
+
+# --- core/roles/generator.md: 自分の変更を検証しないままゲートが緑になる危険が明示されている ---
+case "$H3_GEN_CD_SECTION" in
+  *'自分の変更'*'検証されていない'*)
+    pass "core/roles/generator.md: 自分の変更が検証されないまま緑になる危険が明示されている（#96）" ;;
+  *)
+    fail "core/roles/generator.md: 自分の変更が検証されないまま緑になる危険が明示されている（#96）" \
+      "$H3_GEN_CD_SECTION" ;;
+esac
+
+# --- core/roles/generator.md: 悪い例・良い例が書かれている ---
+case "$H3_GEN_CD_SECTION" in
+  *'悪い例'*'cd /workspace'*'良い例'*)
+    pass "core/roles/generator.md: 悪い例・良い例が書かれている（#96）" ;;
+  *)
+    fail "core/roles/generator.md: 悪い例・良い例が書かれている（#96）" \
+      "$H3_GEN_CD_SECTION" ;;
+esac
+
+# --- core/roles/generator.md: サブディレクトリを対象にする場合の代替手段（コマンド側の相対指定）が書かれている ---
+case "$H3_GEN_CD_SECTION" in
+  *'サブディレクトリ'*'相対指定'*'make -C'*)
+    pass "core/roles/generator.md: サブディレクトリを対象にする場合の代替手段が書かれている（#96）" ;;
+  *)
+    fail "core/roles/generator.md: サブディレクトリを対象にする場合の代替手段が書かれている（#96）" \
+      "$H3_GEN_CD_SECTION" ;;
+esac
+
+# --- skills/run/SKILL.md: Step 3 の雛形に同趣旨の1行がある ---
+H3_RS_STEP3="$(awk '/^### Step 3:/{f=1} /^### Step 4:/{f=0} f' "${REPO_ROOT}/skills/run/SKILL.md")"
+
+case "$H3_RS_STEP3" in
+  *'サンドボックスに渡すコマンドの中で `cd`'*'workdir'*)
+    pass "SKILL.md: Step 3 の雛形に『cdで作業ディレクトリを変えない』旨の1行がある（#96）" ;;
+  *)
+    fail "SKILL.md: Step 3 の雛形に『cdで作業ディレクトリを変えない』旨の1行がある（#96）" \
+      "$H3_RS_STEP3" ;;
+esac
+
+# --- skills/run/SKILL.md: 駆動先プロジェクト固有の値をハードコードしていない（epicXX・汎用コマンド名のみ） ---
+if printf '%s\n' "$H3_RS_STEP3" | grep -Eq 'cd .*&& (go |make |npm )'; then
+  fail "SKILL.md: Step 3 の雛形に駆動先プロジェクト固有のcd例をハードコードしていない（#96）" \
+    "$H3_RS_STEP3"
+else
+  pass "SKILL.md: Step 3 の雛形に駆動先プロジェクト固有のcd例をハードコードしていない（#96）"
+fi
+
+# --- skills-codex/dev-workflow-run/SKILL.md: Step 3 のプロンプトが同趣旨・core/roles/generator.mdと揃った表現になっている ---
+H3_CRS_STEP3="$(awk '/^### Step 3:/{f=1} /^#### トークン消費の記録/{f=0} f' \
+  "${REPO_ROOT}/skills-codex/dev-workflow-run/SKILL.md")"
+
+case "$H3_CRS_STEP3" in
+  *'ここから移動しないこと'*'サンドボックスに渡すコマンドの中で `cd`'*'workdir'*)
+    pass "SKILL.md(codex): Step 3 のプロンプトがcore/roles/generator.mdと揃った表現でcd禁止を明記している（#96）" ;;
+  *)
+    fail "SKILL.md(codex): Step 3 のプロンプトがcore/roles/generator.mdと揃った表現でcd禁止を明記している（#96）" \
+      "$H3_CRS_STEP3" ;;
+esac
+
+# --- scripts/sandbox-exec.sh: このタスクでは変更しない（H3の「やらないこと」） ---
+H3_SANDBOX_EXEC="${REPO_ROOT}/scripts/sandbox-exec.sh"
+if [ -f "$H3_SANDBOX_EXEC" ]; then
+  pass "scripts/sandbox-exec.sh: ファイルが存在する（変更対象外であることの前提確認）（#96）"
+else
+  fail "scripts/sandbox-exec.sh: ファイルが存在する（変更対象外であることの前提確認）（#96）" \
+    "ファイルが見つかりません"
+fi
+
+# ---------------------------------------------------------------------------
+# H5-b（Task #97）: レーン内ゲート・統合ゲートのSKIP計測をcount-skips.shに置き換える
+#
+# `skills/run/SKILL.md:388`（修正前）は「SKIP されたテストがあれば件数と内容を報告に含める
+# こと」とだけ指示し、数え方を示していなかった（H5節）。前提タスク #91 で新設した
+# scripts/count-skips.sh（本タスクでは変更しない）を呼び出し側に結線する。
+# scripts/count-skips.sh 自体の振る舞い（Go/jest/pytest判定・--pattern・
+# DEV_WORKFLOW_SKIP_PATTERN・引数エラー）は #91 のテスト（上の「count-skips.sh」節）で
+# 検証済みなので、ここでは呼び出し側（generator.md / SKILL.md / SKILL.md(codex) /
+# README.md）の記述内容だけを見る。
+# ---------------------------------------------------------------------------
+
+echo ""
+echo "== H5-b: レーン内ゲート・統合ゲートのSKIP計測をcount-skips.shに置き換える（#97） =="
+
+# --- scripts/count-skips.sh はこのタスクでは変更しない（#91の成果物のまま） ---
+if [ -f "${REPO_ROOT}/scripts/count-skips.sh" ]; then
+  pass "scripts/count-skips.sh: ファイルが存在する（#91の成果物。本タスクでは変更しない前提）（#97）"
+else
+  fail "scripts/count-skips.sh: ファイルが存在する（#91の成果物。本タスクでは変更しない前提）（#97）" \
+    "ファイルが見つかりません"
+fi
+
+# --- core/roles/generator.md: 「#### SKIP を通過扱いにしない」節を切り出す ---
+H97_GEN_SKIP="$(awk '/^#### SKIP を通過扱いにしない/{f=1} /^### 5\. コミット/{f=0} f' \
+  "${REPO_ROOT}/core/roles/generator.md")"
+
+if [ -z "$H97_GEN_SKIP" ]; then
+  fail "core/roles/generator.md: 『SKIP を通過扱いにしない』節が見つかる（前提）（#97）" "節が空でした"
+else
+  pass "core/roles/generator.md: 『SKIP を通過扱いにしない』節が見つかる（前提）（#97）"
+fi
+
+case "$H97_GEN_SKIP" in
+  *'tail'*'目視'*'てはならない'*'count-skips.sh'*)
+    pass "core/roles/generator.md: SKIP節が tail の目視を禁止しcount-skips.shで数える手順になっている（#97）" ;;
+  *)
+    fail "core/roles/generator.md: SKIP節が tail の目視を禁止しcount-skips.shで数える手順になっている（#97）" \
+      "$H97_GEN_SKIP" ;;
+esac
+
+case "$H97_GEN_SKIP" in
+  *'skips=unknown'*'0件」と報告してはならない'*'DEV_WORKFLOW_SKIP_PATTERN'*)
+    pass "core/roles/generator.md: skips=unknownを『0件』と報告してはならない旨が明記されている（#97）" ;;
+  *)
+    fail "core/roles/generator.md: skips=unknownを『0件』と報告してはならない旨が明記されている（#97）" \
+      "$H97_GEN_SKIP" ;;
+esac
+
+# --- core/roles/generator.md: 完了報告テンプレートがcount-skips.shの出力を貼る形になっている ---
+H97_GEN_REPORT="$(awk '/^## 完了報告/{f=1} f' "${REPO_ROOT}/core/roles/generator.md")"
+
+case "$H97_GEN_REPORT" in
+  *'count-skips.sh'*'skips=[件数 または unknown]'*)
+    pass "core/roles/generator.md: 完了報告テンプレートのSKIP件数欄がcount-skips.shの出力を貼る形になっている（#97）" ;;
+  *)
+    fail "core/roles/generator.md: 完了報告テンプレートのSKIP件数欄がcount-skips.shの出力を貼る形になっている（#97）" \
+      "$H97_GEN_REPORT" ;;
+esac
+
+# --- skills/run/SKILL.md: 「SKIP されたテストがあれば件数と内容を報告に含めること」という
+#     数え方の指定が無い表現が消えている（grepで0件。H5の受け入れ条件） ---
+if grep -Fq -- 'SKIP されたテストがあれば件数と内容を報告に含めること' "${REPO_ROOT}/skills/run/SKILL.md"; then
+  fail "SKILL.md: 数え方の指定が無い旧表現『SKIP されたテストがあれば件数と内容を報告に含めること』が消えている（#97）" \
+    "$(grep -n -- 'SKIP されたテストがあれば件数と内容を報告に含めること' "${REPO_ROOT}/skills/run/SKILL.md")"
+else
+  pass "SKILL.md: 数え方の指定が無い旧表現『SKIP されたテストがあれば件数と内容を報告に含めること』が消えている（#97）"
+fi
+
+# --- skills/run/SKILL.md: Step 3 雛形がcount-skips.shを使う手順になっている ---
+H97_RS_STEP3="$(awk '/^### Step 3:/{f=1} /^### Step 4:/{f=0} f' "${REPO_ROOT}/skills/run/SKILL.md")"
+
+case "$H97_RS_STEP3" in
+  *'tail'*'count-skips.sh'*'tee'*)
+    pass "SKILL.md: Step 3 雛形がテスト出力をteeで保存しcount-skips.shで数える手順になっている（#97）" ;;
+  *)
+    fail "SKILL.md: Step 3 雛形がテスト出力をteeで保存しcount-skips.shで数える手順になっている（#97）" \
+      "$H97_RS_STEP3" ;;
+esac
+
+case "$H97_RS_STEP3" in
+  *'skips=unknown'*'0件」と報告してはならない'*'DEV_WORKFLOW_SKIP_PATTERN'*)
+    pass "SKILL.md: Step 3 雛形がskips=unknownを『0件』と報告してはならない旨を明記している（#97）" ;;
+  *)
+    fail "SKILL.md: Step 3 雛形がskips=unknownを『0件』と報告してはならない旨を明記している（#97）" \
+      "$H97_RS_STEP3" ;;
+esac
+
+# --- skills/run/SKILL.md: SKIP_PATTERN（Epic本文の「## SKIPパターン」節）の抽出手順がある ---
+H97_RS_SKIPPATTERN="$(awk '/^## 起動時の確認/{f=1} /^## 2エージェント体制/{f=0} f' \
+  "${REPO_ROOT}/skills/run/SKILL.md")"
+
+case "$H97_RS_SKIPPATTERN" in
+  *'## SKIPパターン'*'DEV_WORKFLOW_SKIP_PATTERN'*)
+    pass "SKILL.md: Epic本文の『## SKIPパターン』節を読みDEV_WORKFLOW_SKIP_PATTERNとして保持する手順がある（#97）" ;;
+  *)
+    fail "SKILL.md: Epic本文の『## SKIPパターン』節を読みDEV_WORKFLOW_SKIP_PATTERNとして保持する手順がある（#97）" \
+      "$H97_RS_SKIPPATTERN" ;;
+esac
+
+# --- skills/run/SKILL.md: Step 6（統合ゲート）がrun自身でcount-skips.shを実行し、
+#     0件でも必ず表示し、レーンの自己申告と食い違った場合は統合ゲートの値を採用する ---
+H97_RS_STEP6="$(awk '/^### Step 6:/{f=1} /^### Step 7:/{f=0} f' "${REPO_ROOT}/skills/run/SKILL.md")"
+
+case "$H97_RS_STEP6" in
+  *'tee'*'count-skips.sh'*)
+    pass "SKILL.md: Step 6 統合ゲートがテスト出力をteeで保存しcount-skips.shで数えている（#97）" ;;
+  *)
+    fail "SKILL.md: Step 6 統合ゲートがテスト出力をteeで保存しcount-skips.shで数えている（#97）" \
+      "$H97_RS_STEP6" ;;
+esac
+
+case "$H97_RS_STEP6" in
+  *'0件でも必ず表示'*)
+    pass "SKILL.md: Step 6 統合ゲートがSKIP件数を0件でも必ず表示する旨を明記している（#97）" ;;
+  *)
+    fail "SKILL.md: Step 6 統合ゲートがSKIP件数を0件でも必ず表示する旨を明記している（#97）" \
+      "$H97_RS_STEP6" ;;
+esac
+
+case "$H97_RS_STEP6" in
+  *'食い違った場合は統合ゲートの値を採用'*'Epic issue にコメント'*)
+    pass "SKILL.md: Step 6 統合ゲートがレーンの自己申告と食い違った場合に統合ゲートの値を採用しEpic issueにコメントする旨を明記している（#97）" ;;
+  *)
+    fail "SKILL.md: Step 6 統合ゲートがレーンの自己申告と食い違った場合に統合ゲートの値を採用しEpic issueにコメントする旨を明記している（#97）" \
+      "$H97_RS_STEP6" ;;
+esac
+
+# --- skills/run/SKILL.md: 「SKIP を通過扱いにしない」節がskips=unknownの扱いを明記している ---
+H97_RS_SKIPSECTION="$(awk '/^#### SKIP を通過扱いにしない/{f=1} /^### Step 7:/{f=0} f' \
+  "${REPO_ROOT}/skills/run/SKILL.md")"
+
+case "$H97_RS_SKIPSECTION" in
+  *'skips=unknown'*'「0件」として扱ってはならない'*)
+    pass "SKILL.md: 『SKIP を通過扱いにしない』節がskips=unknownを0件扱いしない旨を明記している（#97）" ;;
+  *)
+    fail "SKILL.md: 『SKIP を通過扱いにしない』節がskips=unknownを0件扱いしない旨を明記している（#97）" \
+      "$H97_RS_SKIPSECTION" ;;
+esac
+
+# --- skills/run/SKILL.md: Step 3 雛形に駆動先プロジェクト固有のSKIPパターン値をハードコード
+#     していない（例: このリポジトリ自身のパターン「^  skip - 」が literal で入っていない） ---
+if printf '%s\n' "$H97_RS_STEP3" | grep -Fq -- '^  skip - '; then
+  fail "SKILL.md: Step 3 雛形に駆動先プロジェクト固有のSKIPパターンをハードコードしていない（#97）" \
+    "$H97_RS_STEP3"
+else
+  pass "SKILL.md: Step 3 雛形に駆動先プロジェクト固有のSKIPパターンをハードコードしていない（#97）"
+fi
+
+# --- skills-codex/dev-workflow-run/SKILL.md: 同様にcount-skips.shを使う手順になっている ---
+if grep -Fq -- 'SKIP されたテストがあれば件数と内容を報告に含めること' \
+  "${REPO_ROOT}/skills-codex/dev-workflow-run/SKILL.md"; then
+  fail "SKILL.md(codex): 数え方の指定が無い旧表現が消えている（#97）" \
+    "$(grep -n -- 'SKIP されたテストがあれば件数と内容を報告に含めること' \
+      "${REPO_ROOT}/skills-codex/dev-workflow-run/SKILL.md")"
+else
+  pass "SKILL.md(codex): 数え方の指定が無い旧表現が消えている（#97）"
+fi
+
+H97_CRS_STEP3="$(awk '/^### Step 3:/{f=1} /^#### トークン消費の記録/{f=0} f' \
+  "${REPO_ROOT}/skills-codex/dev-workflow-run/SKILL.md")"
+
+case "$H97_CRS_STEP3" in
+  *'tail'*'count-skips.sh'*'tee'*'skips=unknown'*)
+    pass "SKILL.md(codex): Step 3 プロンプトがcount-skips.shを使いskips=unknownの扱いも明記している（#97）" ;;
+  *)
+    fail "SKILL.md(codex): Step 3 プロンプトがcount-skips.shを使いskips=unknownの扱いも明記している（#97）" \
+      "$H97_CRS_STEP3" ;;
+esac
+
+H97_CRS_STEP5="$(awk '/^### Step 5:/{f=1} /^### Step 6:/{f=0} f' \
+  "${REPO_ROOT}/skills-codex/dev-workflow-run/SKILL.md")"
+
+case "$H97_CRS_STEP5" in
+  *'tee'*'count-skips.sh'*'0件でも必ず表示'*)
+    pass "SKILL.md(codex): Step 5 統合ゲートがteeで保存しcount-skips.shで数え0件でも表示する（#97）" ;;
+  *)
+    fail "SKILL.md(codex): Step 5 統合ゲートがteeで保存しcount-skips.shで数え0件でも表示する（#97）" \
+      "$H97_CRS_STEP5" ;;
+esac
+
+case "$H97_CRS_STEP5" in
+  *'skips=unknown'*'「0件」として扱ってはならない'*)
+    pass "SKILL.md(codex): 『SKIP を通過扱いにしない』節がskips=unknownを0件扱いしない旨を明記している（#97）" ;;
+  *)
+    fail "SKILL.md(codex): 『SKIP を通過扱いにしない』節がskips=unknownを0件扱いしない旨を明記している（#97）" \
+      "$H97_CRS_STEP5" ;;
+esac
+
+# --- README.md: count-skips.sh の使い方・出力・判定順序・DEV_WORKFLOW_SKIP_PATTERN が書かれている ---
+H97_README_CS="$(awk '/^### `scripts\/count-skips.sh`/{f=1} /^### Epic の `## SKIPパターン` 節/{f=0} f' \
+  "${REPO_ROOT}/README.md")"
+
+if [ -z "$H97_README_CS" ]; then
+  fail "README.md: 『scripts/count-skips.sh』節が見つかる（#97）" "節が空でした"
+else
+  pass "README.md: 『scripts/count-skips.sh』節が見つかる（#97）"
+fi
+
+case "$H97_README_CS" in
+  *'skips=<件数 または unknown>'*'runner=<go|pytest|jest|custom|unknown>'*'判定順序'*'DEV_WORKFLOW_SKIP_PATTERN'*)
+    pass "README.md: count-skips.sh節に出力・判定順序・DEV_WORKFLOW_SKIP_PATTERNが書かれている（#97）" ;;
+  *)
+    fail "README.md: count-skips.sh節に出力・判定順序・DEV_WORKFLOW_SKIP_PATTERNが書かれている（#97）" \
+      "$H97_README_CS" ;;
+esac
+
+# --- README.md: Epic の「## SKIPパターン」節の書き方が案内されている ---
+H97_README_EPICSECTION="$(awk '/^### Epic の `## SKIPパターン` 節/{f=1} /^## YOLOモード/{f=0} f' \
+  "${REPO_ROOT}/README.md")"
+
+case "$H97_README_EPICSECTION" in
+  *'## SKIPパターン'*'DEV_WORKFLOW_SKIP_PATTERN'*'skips=unknown'*)
+    pass "README.md: Epicの『## SKIPパターン』節の書き方とDEV_WORKFLOW_SKIP_PATTERNの関係が案内されている（#97）" ;;
+  *)
+    fail "README.md: Epicの『## SKIPパターン』節の書き方とDEV_WORKFLOW_SKIP_PATTERNの関係が案内されている（#97）" \
+      "$H97_README_EPICSECTION" ;;
+esac
+
+# ---------------------------------------------------------------------------
+# review#102: Epic本文の「## SKIPパターン」節がplanner側に結線されている
+#
+# 消費側（README.md/skills SKILL.md/generator.md）にしか記載が無く、Epic本文を書く側
+# （planner.md/instructions.md）に規定が無かったため、人間が手で追記しない限り節が
+# 生成されず、built-inランナー以外のプロジェクトでは常にskips=unknownになっていた。
+# 既存の「## 準備コマンド」節（planner.md/instructions.mdの両方に規定済み）と同じ
+# 対称性を持たせる。
+# ---------------------------------------------------------------------------
+
+echo ""
+echo "== review#102: Epic本文の『## SKIPパターン』節がplanner側に結線されている =="
+
+# --- core/roles/planner.md: 「プロジェクト固有の準備コマンド」の隣にSKIPパターン節の書き方がある ---
+PLANNER_SKIP_SECTION="$(awk '/^#### SKIPパターン（該当する場合のみ）/{f=1} /^#### Task issue の自己完結化/{f=0} f' \
+  "${REPO_ROOT}/core/roles/planner.md")"
+
+if [ -z "$PLANNER_SKIP_SECTION" ]; then
+  fail "core/roles/planner.md: 『#### SKIPパターン（該当する場合のみ）』節が見つかる（#102）" "節が空でした"
+else
+  pass "core/roles/planner.md: 『#### SKIPパターン（該当する場合のみ）』節が見つかる（#102）"
+fi
+
+case "$PLANNER_SKIP_SECTION" in
+  *'go / jest / pytest'*'## SKIPパターン'*'必ず書く'*'ERE'*)
+    pass "core/roles/planner.md: SKIPパターン節がgo/jest/pytest以外は必ず書く旨とERE1行の書式を明記している（#102）" ;;
+  *)
+    fail "core/roles/planner.md: SKIPパターン節がgo/jest/pytest以外は必ず書く旨とERE1行の書式を明記している（#102）" \
+      "$PLANNER_SKIP_SECTION" ;;
+esac
+
+case "$PLANNER_SKIP_SECTION" in
+  *'count-skips.sh'*'skips=unknown'*)
+    pass "core/roles/planner.md: SKIPパターン節が書かないとcount-skips.shがunknownになる旨を明記している（#102）" ;;
+  *)
+    fail "core/roles/planner.md: SKIPパターン節が書かないとcount-skips.shがunknownになる旨を明記している（#102）" \
+      "$PLANNER_SKIP_SECTION" ;;
+esac
+
+# --- core/instructions.md: 「## 準備コマンド」節と対称に「Epic本文の『## SKIPパターン』節」が
+#     planner が判断する規定として存在する ---
+INSTR_SKIP_SECTION="$(awk '/^### Epic 本文の `## SKIPパターン` 節/{f=1} /^## 安全ルール/{f=0} f' \
+  "${REPO_ROOT}/core/instructions.md")"
+
+if [ -z "$INSTR_SKIP_SECTION" ]; then
+  fail "core/instructions.md: 『### Epic 本文の \`## SKIPパターン\` 節』が見つかる（#102）" "節が空でした"
+else
+  pass "core/instructions.md: 『### Epic 本文の \`## SKIPパターン\` 節』が見つかる（#102）"
+fi
+
+case "$INSTR_SKIP_SECTION" in
+  *'節を書くかどうかの判断は'*'準備コマンド'*'節と同様に planner が行う'*)
+    pass "core/instructions.md: SKIPパターン節を書くかどうかの判断もplannerが行う旨が準備コマンド節と対称に規定されている（#102）" ;;
+  *)
+    fail "core/instructions.md: SKIPパターン節を書くかどうかの判断もplannerが行う旨が準備コマンド節と対称に規定されている（#102）" \
+      "$INSTR_SKIP_SECTION" ;;
+esac
+
+# --- 生成物（agents/*.md・codex-agents/*.toml）にもcore/instructions.mdのSKIPパターン節が
+#     伝播している（build.shの再生成漏れを検知する） ---
+for f in agents/planner.md agents/generator.md agents/evaluator.md \
+         codex-agents/planner.toml codex-agents/generator.toml codex-agents/evaluator.toml; do
+  if grep -Fq -- '### Epic 本文の `## SKIPパターン` 節' "${REPO_ROOT}/${f}"; then
+    pass "${f}: core/instructions.mdのSKIPパターン節が生成物に反映されている（#102）"
+  else
+    fail "${f}: core/instructions.mdのSKIPパターン節が生成物に反映されている（#102）" \
+      "節が見つかりませんでした"
+  fi
+done
+
+# --- 生成物（agents/planner.md・codex-agents/planner.toml）にもcore/roles/planner.mdの
+#     SKIPパターン節が伝播している ---
+for f in agents/planner.md codex-agents/planner.toml; do
+  if grep -Fq -- '#### SKIPパターン（該当する場合のみ）' "${REPO_ROOT}/${f}"; then
+    pass "${f}: core/roles/planner.mdのSKIPパターン節が生成物に反映されている（#102）"
+  else
+    fail "${f}: core/roles/planner.mdのSKIPパターン節が生成物に反映されている（#102）" \
+      "節が見つかりませんでした"
+  fi
+done
+
+# --- skills/run/SKILL.md Step 6: skips=unknownの恒久対処として「次のrunまでに
+#     ## SKIPパターン節を追加する」ことが明記されている（都度Epic issueにコメントするだけでは
+#     同じrunが来るたびにskips=unknownを繰り返すだけの状態が固定化するため） ---
+RUN_SKILL_UNKNOWN="$(awk '/^#### SKIP を通過扱いにしない/{f=1} /^### Step 7: Epicブランチへ取り込んで次のウェーブへ/{f=0} f' \
+  "${REPO_ROOT}/skills/run/SKILL.md")"
+
+case "$RUN_SKILL_UNKNOWN" in
+  *'恒久対処'*'次の run までに'*'## SKIPパターン'*)
+    pass "SKILL.md: skips=unknown時に次のrunまでに『## SKIPパターン』節を追加することが恒久対処として明記されている（#102）" ;;
+  *)
+    fail "SKILL.md: skips=unknown時に次のrunまでに『## SKIPパターン』節を追加することが恒久対処として明記されている（#102）" \
+      "$RUN_SKILL_UNKNOWN" ;;
+esac
 
 # ---------------------------------------------------------------------------
 # 結果集計

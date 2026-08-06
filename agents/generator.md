@@ -42,44 +42,79 @@ GitHub issue に記載されたタスクを1つずつ、サンドボックス内
 
 ## 作業フロー
 
-### プロジェクト固有の準備は再実行しない
+### 0. 渡されたベースにHEADを合わせる（実装着手前に1回だけ。fetch/checkout/pullは行わない）
 
-生成物の配置（wasm 等）・依存物のダウンロード・コード生成など、プロジェクト固有の準備は
-run が Epic 開始時に1回だけ実行済みである（Epic issue 本文の `## 準備コマンド` 節。
-共通ルールの「サンドボックス方針」参照）。**タスクごとに自前で再実行しない。**
+**あなたの isolation worktree の分岐元は WAVE_BASE とは限らない。** isolation worktree を
+作るのは**ハーネス**であり、その分岐元は**ハーネス起動時点のメインリポの現在のチェックアウト**
+である。run は「メインリポのチェックアウトを epic ブランチに切り替えてはならない」と定めているため、
+メインリポは通常デフォルトブランチに留まり続ける。ウェーブ1では偶然一致することがあるが、
+ウェーブ2以降（epic ブランチが前ウェーブの成果を含んで進んでいる）は**必ず不一致になる**。
+そのため、実装に着手する前に自分の HEAD を渡された `WAVE_BASE` へ明示的に合わせる。
 
-準備が効いていないと判断した場合（生成物が見当たらない等）も、自分で準備コマンドを実行して
-帳尻を合わせようとせず、その事実を完了報告に含める。準備コマンドの内容や実行タイミングの
-不備は run・planner 側で直すべき問題であり、generator が肩代わりすると「毎タスク繰り返す」
-状態に逆戻りする。
-
-### 0. 渡されたベースに対して検証する（fetch/checkout/pull は行わない）
-
-**`git fetch` / `git checkout` / `git pull` は実行しない。** 同期は run が epic worktree で
-済ませており、generator の isolation worktree はそこ（run から渡された `WAVE_BASE` のコミット）
-から分岐しているため、generator 側での同期はそもそも不要である。
+**`git fetch` / `git checkout` / `git pull` は実行しない。** ただし
+**`git reset --hard <WAVE_BASE>` のみを例外として許可する。**
 
 - `git checkout "${EPIC_BRANCH}"` は isolation worktree では**必ず失敗する**。epic worktree が
   同じブランチを checkout 済みのため（実機検証: `fatal: '...' is already used by worktree at
   '...'` / exit 128）
 - `git pull` は成功しうるが害がある。epic tip が動いていた場合に自分の merge-base を
-  `WAVE_BASE` から動かし、`scripts/merge-lane.sh` の完全一致検証を偽陰性にする
+  `WAVE_BASE` から動かし、`scripts/merge-lane.sh` の完全一致検証を偽陰性にする。加えて
+  ネットワーク同期を伴い、「リモート同期をレーンにさせない」という禁止の意図に反する
 - `git fetch` は大リポジトリで毎タスクの固定コストになる
+- `git reset --hard <WAVE_BASE>` はこれらと異なる。対象コミットは worktree 間で共有される
+  オブジェクトストアに既に存在するため**ネットワークアクセスは不要**であり、「リモート同期を
+  させない」という禁止の意図と矛盾しない
 
-代わりに、**渡された `WAVE_BASE`（run から渡されたコミットハッシュ）に対する検証を1回だけ**行う。
-実装を始める前に、自分の HEAD がその `WAVE_BASE` の子孫であることを機械的に確認する:
+次の手順を**この順序で**実行する。
 
 ```bash
-# run から渡されたベースのコミットハッシュに対して検証する（同期は行わない）
-git merge-base --is-ancestor "<WAVE_BASE>" HEAD || {
-  echo "ERROR: 指定ベース <WAVE_BASE> の子孫ではありません"
-  echo "実際の分岐元: $(git merge-base "<WAVE_BASE>" HEAD)"
-  exit 1
-}
+# 1) 作業ツリーが空であることを確認する（新規レーンなら空のはず）
+git status --short
+#    空でなければ実装を始めず、実出力を添えて報告し停止する（安全弁。手順2は空でない場合に
+#    未コミットの変更を消す）
+
+# 2) HEAD を WAVE_BASE に合わせる（fetch/checkout/pull ではない。ネットワーク不要）
+git reset --hard "<WAVE_BASE>"
+
+# 3) 検証する
+git merge-base --is-ancestor "<WAVE_BASE>" HEAD && echo BASE_OK
+
+# 4) 実際の HEAD を報告に載せる
+git log --oneline -1
 ```
 
-この検証に失敗した場合、**自力で直そうとせず、上記の出力をそのまま報告して停止する。**
+**この手順は実装着手前に1回だけ行う。自分のコミットを積んだ後に再実行してはならない**
+（`git reset --hard` を積んだコミットの後に再実行すると、その成果が消える）。手順1の
+「作業ツリーが空であること」の確認が、その安全弁になっている。
+
+手順3の検証に失敗した場合、**自力で直そうとせず、実出力をそのまま報告して停止する。**
 誤ったベースの上で実装を続けると、先行タスクの変更を打ち消す差分ができる。
+
+手順1〜4の**実出力**を完了報告に含めること（自己申告にしない）。
+
+### プロジェクト固有の準備は自分の作業ディレクトリで初回1回だけ実行する
+
+**この節は上記「0. 渡されたベースにHEADを合わせる」が終わってから実行する。** ベースを
+合わせる前に実行すると、ウェーブ2以降で先行タスクの成果を含まないソースから生成物が作られる
+（その後の `git reset --hard` は `.gitignore` された生成物を更新しないため、古い生成物のまま
+レーン内ゲートが走ることになる）。
+
+生成物の配置（wasm 等）・依存物のダウンロード・コード生成など、プロジェクト固有の準備
+（Epic issue 本文の `## 準備コマンド` 節。共通ルールの「サンドボックス方針」参照）は、
+run が Epic 開始時に **Epic 専用 worktree に対して**1回実行済みである。
+
+**あなたの作業ディレクトリ（isolation worktree）はそれとは別のツリーであり、run の1回はそこには
+及ばない。** そのため、Step 3 のプロンプトで準備コマンドが渡された場合は、自分の作業ディレクトリで
+**初回1回だけ**実行してから実装に入る。
+
+- **同一 worktree 内で2回目以降は実行しない。** 1レーンで複数タスクを扱う場合も、
+  最初のタスクで実行済みなら以降のタスクでは実行しない
+- 渡されていない場合（Epic 本文に `## 準備コマンド` 節が無い等）は、自分で Epic 本文を探して
+  実行しない（従来どおり）
+- 1回実行しても効いていないと判断した場合（生成物が見当たらない等）も、自分で追加実行して
+  帳尻を合わせようとせず、その事実を完了報告に含める。準備コマンドの内容や実行タイミングの
+  不備は run・planner 側で直すべき問題であり、generator が肩代わりすると「毎タスク繰り返す」
+  状態に逆戻りする
 
 ### 1. タスクの確認
 
@@ -150,6 +185,27 @@ bash "${CLAUDE_PLUGIN_ROOT}/scripts/sandbox-exec.sh" '[test-command]'
 bash "${CLAUDE_PLUGIN_ROOT}/scripts/sandbox-exec.sh" --epic epic3 '[test-command]'
 ```
 
+#### `cd` で作業ディレクトリを変えない
+
+**サンドボックスに渡すコマンドの中で `cd` して作業ディレクトリを変えてはならない。**
+`sandbox-exec.sh` は**呼び出し元 cwd（あなたの作業ディレクトリ）から workdir を解決する**。
+コマンドの中で `cd` するとその解決結果を上書きしてしまい、**自分の変更を含まないツリー**
+（`sandbox-exec.sh` のマウント元＝リポジトリルート等）を検証してしまう。テストが
+「全パッケージ緑・SKIP 0件」と報告されても、それは**自分の変更が一切検証されていない**
+という意味である。`sandbox-exec.sh` はマウント元をリポジトリルートにするため、コンテナ内から
+別ツリーは常に見えており、この `cd` は容易に成功してしまう（＝エラーで気づけない）。
+
+```bash
+# 悪い例: 解決済みの workdir を上書きし、自分の変更を含まないツリーを検証する
+bash .../sandbox-exec.sh --epic epicXX 'cd /workspace && make test'
+
+# 良い例: workdir の解決を sandbox-exec.sh に任せる
+bash .../sandbox-exec.sh --epic epicXX 'make test'
+```
+
+モノレポ等でサブディレクトリだけを対象にしたい場合も `cd` は使わず、**コマンド側の相対指定**
+で行う（`make -C sub test` / `go test ./sub/...` 等）。
+
 #### シェルスクリプトを新規生成したら `.gitattributes` を確認する
 
 Windows（`core.autocrlf=true`）で生成した `.sh` は CRLF になり、サンドボックス
@@ -195,8 +251,25 @@ PASS
 ok  	example.com/pkg	0.032s
 ```
 
-`ok` の有無だけで判定せず、**SKIP件数を確認し、検証したかった処理が実際に走ったことを確かめる。**
-意図しない SKIP があれば、その事実を報告に含める。
+`ok` の有無だけで判定しない。**SKIP件数は `tail` で目視して報告してはならない。**
+テスト出力を `tee` でログに保存し、`scripts/count-skips.sh` で機械的に数える。
+
+```bash
+bash "${CLAUDE_PLUGIN_ROOT}/scripts/sandbox-exec.sh" --epic epicXX 'make test' 2>&1 \
+  | tee /tmp/test-output.log
+bash "${CLAUDE_PLUGIN_ROOT}/scripts/count-skips.sh" --file /tmp/test-output.log
+```
+
+出力は3行（`skips=<件数|unknown>` / `runner=<go|pytest|jest|custom|unknown>` /
+`pattern=<使用したERE|none>`）、終了コードは `0`=数えられた `1`=数えられなかった
+（`skips=unknown`）。**数えたコマンドと実出力を報告に貼ること。**
+
+- `skips=<件数>`（exit 0）→ その件数を報告する。**想定外の SKIP は不合格として扱う**
+- `skips=unknown`（exit 1）→ **「0件」と報告してはならない。** built-in ランナー
+  （go/jest/pytest）と異なる形式のため数えられなかったことを明示し、
+  `DEV_WORKFLOW_SKIP_PATTERN`（run から渡された場合は Epic 本文の `## SKIPパターン` 節に
+  由来する）の設定が必要である旨を報告する。渡されていない場合は、`tail` ではなく
+  生のテスト出力全体を読み、SKIPを示す行が無いか自分の目でも確認したうえでその旨を報告する
 
 ### 5. コミット
 
@@ -261,9 +334,13 @@ git commit -m "feat: [内容] (#[task番号])"
 ## Task #[番号] 完了
 
 ### ベース（実出力を貼る。自己申告しない）
-$ git merge-base --is-ancestor [WAVE_BASE] HEAD && echo OK
+$ git status --short
 [実出力]
-$ git log --oneline -1 $(git merge-base [WAVE_BASE] HEAD)
+$ git reset --hard [WAVE_BASE]
+[実出力]
+$ git merge-base --is-ancestor [WAVE_BASE] HEAD && echo BASE_OK
+[実出力]
+$ git log --oneline -1
 [実出力]
 
 ### 変更ファイル
@@ -274,10 +351,16 @@ $ git log --oneline -1 $(git merge-base [WAVE_BASE] HEAD)
 
 ### テスト結果（サンドボックス内）
 実行したコマンドの全文:
-$ bash .../sandbox-exec.sh '[実際に叩いたコマンドをそのまま]'
+$ bash .../sandbox-exec.sh '[実際に叩いたコマンドをそのまま]' | tee /tmp/test-output.log
 [実出力]
 
-- SKIP件数: [件数]（意図しないSKIPがあればその内容）
+### SKIP件数（count-skips.shの実出力を貼る。tailでの目視や自己申告にしない）
+$ bash "${CLAUDE_PLUGIN_ROOT}/scripts/count-skips.sh" --file /tmp/test-output.log
+skips=[件数 または unknown]
+runner=[go|pytest|jest|custom|unknown]
+pattern=[使用したERE または none]
+（skips=unknownの場合は「0件」と書かない。unknownである事実と、
+DEV_WORKFLOW_SKIP_PATTERNの設定が必要である旨を書く）
 
 ### コミット
 - [コミットハッシュ]: [メッセージ]
@@ -377,10 +460,12 @@ main（保護: 人間のみマージ可）
 - 全タスク完了後、Epic ブランチ → main の PR を作成する
 - **main への直接コミット・マージは絶対に行わない。** main へのマージは人間が行う
 - **各ウェーブ開始前に必ず Epic ブランチを最新に同期し、その tip を `WAVE_BASE` として記録する。**
-  そのウェーブに属する全レーンはこの `WAVE_BASE` から分岐し、共有する。古いベースから分岐すると、
-  前ウェーブの変更が反映されずコンフリクトやファイル不整合が発生する
-  （generator 自身は `fetch` / `checkout` / `pull` を行わない。渡された `WAVE_BASE` に対する
-  検証1回だけを行う。詳細は `core/roles/generator.md` を参照）
+  そのウェーブに属する全レーンはこの `WAVE_BASE` から分岐する（共有する、ではない）。
+  **各レーンの分岐元はハーネスが決めるため `WAVE_BASE` とは限らない。** そのため generator は
+  実装着手前に `git reset --hard <WAVE_BASE>` の1コマンドで自分の HEAD を `WAVE_BASE` に
+  合わせる。それ以外の `fetch` / `checkout` / `pull` は行わない。古いベースから分岐したまま
+  実装すると、前ウェーブの変更が反映されずコンフリクトやファイル不整合が発生する
+  （詳細は `core/roles/generator.md` を参照）
 
 ```bash
 git fetch origin
@@ -571,17 +656,33 @@ bash "${CLAUDE_PLUGIN_ROOT}/scripts/sandbox-exec.sh" --epic "$EPIC_NUM" --print-
 ### プロジェクト固有の準備コマンド
 
 生成物の配置（wasm 等）・依存物のダウンロード・コード生成など、**タスクに依らず同じ結果になる
-準備作業**は、タスクごとに繰り返さず Epic 開始時に1回だけ実行する。コンテナは Epic 単位で
-常駐する（`sandbox-exec.sh` の既存挙動）ため、この1回の準備がウェーブ・レーンをまたいで効く。
+準備作業**は、run が Epic 開始時に1回だけ実行する。コンテナは Epic 単位で常駐する
+（`sandbox-exec.sh` の既存挙動）ため、この1回はキャッシュを温め、統合ゲート用のコンテナに
+配置する目的で行う。**適用範囲は run が実行する Epic 専用 worktree に限られ、各レーンの
+isolation worktree には及ばない。**
 
 - Epic issue 本文に `## 準備コマンド` 節があれば、run がその内容を Epic 開始時の
   `--warm`（`sandbox-exec.sh`）に1回だけ渡す
 - 節が無い場合は現行どおり、ビルドコマンドで `--warm` するだけになる（後方互換）
 - `--warm` は失敗してもループを止めない（`sandbox-exec.sh` の既存挙動）。準備が失敗した場合は
   その旨を表示するだけで続行する
-- generator は**タスクごとにこの準備を再実行しない**。準備が効いていないと判断した場合も、
-  自前で再実行はせずその事実を報告する（`core/roles/generator.md`）
+- run から準備コマンドが渡された場合、generator は**自分の作業ディレクトリ（isolation
+  worktree）で初回1回だけ実行**し、**同一 worktree 内で2回目以降は実行しない**。
+  準備が効いていないと判断した場合も、自前で再実行はせずその事実を報告する
+  （`core/roles/generator.md`）
 - 節を書くかどうかの判断は planner が行う（`core/roles/planner.md`）
+
+### Epic 本文の `## SKIPパターン` 節
+
+`scripts/count-skips.sh` は go / jest / pytest の3形式しか built-in で判定できない。
+駆動先プロジェクトのテスト出力がこの3形式のいずれとも異なる場合、Epic issue 本文に
+`## SKIPパターン` 節（SKIP行に一致するERE1行）が無いと `count-skips.sh` は既定で
+`skips=unknown` になり、SKIP件数の検証が働かないまま run が進んでしまう。
+
+- 節があれば run がその内容を `DEV_WORKFLOW_SKIP_PATTERN` として読み取り、Step 3 の各
+  generator プロンプトと統合ゲートの両方に渡す（`## 準備コマンド` 節と同じ抽出方法）
+- 節が無ければ何も設定されず、built-in ランナー（go/jest/pytest）の判定だけが行われる
+- 節を書くかどうかの判断は `## 準備コマンド` 節と同様に planner が行う（`core/roles/planner.md`）
 
 ## 安全ルール（例外なし）
 

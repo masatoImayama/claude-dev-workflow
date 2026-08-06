@@ -104,6 +104,29 @@ code-review-graph build
 ```
 ````
 
+#### SKIPパターン（該当する場合のみ）
+
+`scripts/count-skips.sh` はテスト出力の SKIP 件数を機械的に数えるが、built-in で判定できる
+ランナーは go / jest / pytest の3形式のみである。**駆動先プロジェクトのテスト出力がこの3形式の
+いずれとも異なる場合**（自作テストランナー・他言語のフレームワーク等）、書かないと
+`count-skips.sh` が既定で `skips=unknown` になり、SKIP件数の検証が効かないまま run が進む。
+該当する場合は Epic issue 本文に `## SKIPパターン` 節を**必ず書く**。
+
+書式は SKIP行に一致する ERE（拡張正規表現）を1行だけ書く。
+
+````markdown
+## SKIPパターン
+
+```
+^  skip - 
+```
+````
+
+節があれば run がその内容を `DEV_WORKFLOW_SKIP_PATTERN` として読み取り、Step 3 の各 generator
+プロンプトと統合ゲートの両方に渡す（`## 準備コマンド` 節と同じ抽出方法）。書き方の詳細は
+README「Epic の `## SKIPパターン` 節」を参照。Task issue 側にはこの節を書かない
+（`## 準備コマンド` 節と同じく、Epic 側に1回書けば全タスクに効く）。
+
 #### Task issue の自己完結化
 
 Task issue は、それ単体を読むだけで実装に着手できるように書く。Epic 本文（仕様書・計画書で

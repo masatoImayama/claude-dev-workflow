@@ -145,8 +145,34 @@ fi
   既存の Epic（`## 準備コマンド` 節が無いもの）はこの追加ステップの影響を受けない
 - `--warm` は失敗してもループを止めない（`sandbox-exec.sh` の既存挙動）。準備コマンドが失敗しても
   表示だけしてそのまま先へ進む
-- コンテナは Epic 単位で常駐するため、この1回の準備が以降の全ウェーブ・全レーンに効く。
-  generator 側には「タスクごとに再実行しない」旨を明記済み（`core/roles/generator.md`）
+- **この1回が効くのは Epic 専用 worktree（`$EPIC_WT`）だけである。** コンテナは Epic 単位で
+  常駐するが、共有されるのはコンテナとキャッシュ volume であって作業ディレクトリではない。
+  generator の isolation worktree はこの後にタスクごとに作られる別ツリーであり、ここで配置した
+  生成物（`.gitignore` されたビルド成果物・wasm 等）はそこには存在しない。この1回の役割は
+  （a）ビルドキャッシュを温めること、（b）統合ゲートが実行される Epic worktree に生成物を配置しておくこと、
+  の2点に限られる
+- `$PREP_CMD` は変数として保持しておき、Step 3 で各レーンの generator プロンプトに
+  そのまま埋め込む（レーンの作業ディレクトリで初回1回だけ実行させるため）
+
+#### SKIP件数の判定パターン（Epic 本文の `## SKIPパターン` 節。任意）
+
+`scripts/count-skips.sh`（SKIP件数を機械的に数えるスクリプト。詳細はREADME参照）は
+built-inランナー（go/jest/pytest）の出力形式しか自動認識できず、それ以外の形式では
+`skips=unknown`（exit 1）になる。駆動先プロジェクトの形式が独自の場合に備え、Epic本文に
+任意の節を置けるようにする。
+
+```bash
+# Epic本文に「## SKIPパターン」節があれば、その中身（フェンスコードブロックの内容）を取り出す
+SKIP_PATTERN="$(gh issue view $ARGUMENTS --json body -q '.body' \
+  | awk '/^## SKIPパターン/{f=1; next} /^## /{f=0} f' \
+  | sed -n '/^```/,/^```/p' | sed '1d;$d')"
+```
+
+- **節が無ければ何もしない**（`$SKIP_PATTERN` は空文字のまま）。built-inランナーの形式で
+  数えられるプロジェクトはこの節を書かなくてよい
+- `$SKIP_PATTERN` は変数として保持しておき、Step 3 の各レーンの generator プロンプトと
+  Step 6 の統合ゲートの両方に、`DEV_WORKFLOW_SKIP_PATTERN` として渡す
+- 節の書き方は README「Epic の `## SKIPパターン` 節」を参照
 
 ### サンドボックスへのコマンド投入は sandbox-exec.sh 経由に統一する
 
@@ -234,7 +260,11 @@ main (保護: 人間のみマージ可)
 ```
 
 - Epic 専用 worktree は **`.claude/worktrees/<epicN>`** に作る（`../<repo>-epicN` の兄弟は作らない）。additionalDirectories はリポジトリルート許可で足り、他リポジトリに権限が及ばない。
-- 各レーン（generator の isolation worktree）は、そのウェーブ開始時点のEpicブランチtip（`WAVE_BASE`）から分岐する
+- 各レーン（generator の isolation worktree）が実装着手前に自分のHEADを合わせるべき唯一の
+  正しい基準点が、そのウェーブ開始時点のEpicブランチtip（`WAVE_BASE`）である。isolation
+  worktree を作るのは**ハーネス**であり、その分岐元はハーネスが決めるため WAVE_BASE とは
+  限らない。そのため generator は `git reset --hard "$WAVE_BASE"` で自分の HEAD を明示的に
+  合わせてから実装に着手する（Step 3 のプロンプト雛形参照）
 - レーンは wave ブランチを経由し、**統合ゲート通過後にのみ** `--ff-only` でEpicブランチへ合流する
 - 実装・テスト・ビルドは全てDockerコンテナ内で実行する
 - 全タスク完了後、Epicブランチ→mainのPRを作成する
@@ -329,6 +359,8 @@ echo "$PLAN"
 - `PLAN_EXIT` が **3**（循環依存）なら、列挙されたタスクをそのままEpic issueにコメントし停止する
 - `warn missing-deps <番号>` / `warn unknown-dep <番号> <dep番号>` が出力に含まれる場合、
   該当タスクの宣言漏れ・不明な依存を報告に含める（fail-safeで完全逐次扱いになっている旨も明記）
+- `warn missing-deps-summary <件数> <対象タスク数> <実効並列度> <指定lanes>` が出力に含まれる場合、
+  この集計行（宣言漏れの件数・実効並列度が指定lanesからどれだけ落ちたか）も報告に含める
 - 出力に `wave` 行が無い（＝全タスク完了）→ ループを終了し **「Epic一括レビュー」** へ進む
 - `wave 1 tasks 4,5,10` のような行から、今回処理するタスク番号の集合を取り出す。各タスクの
   `subbatch` 列（`task` 行）を見て、サブバッチ単位に分割する
@@ -358,9 +390,11 @@ bash "${CLAUDE_PLUGIN_ROOT}/scripts/watchdog.sh" --wave --epic "$EPIC_NUM" \
 ```
 
 **同期はここ（ウェーブの先頭）でだけ行う。** タスクごとには行わない。この `WAVE_BASE` が、
-このウェーブに属する全レーンが共有する唯一の正しい分岐元になる。各レーン（generatorの
-isolation worktree）はこの `WAVE_BASE` から分岐するため、generator自身は
-`fetch` / `checkout` / `pull` を行わない（`core/roles/generator.md`）。
+このウェーブに属する全レーンが実装着手前に自分のHEADを合わせるべき唯一の正しい基準点になる。
+**各レーン（generatorのisolation worktree）の分岐元はハーネスが決めるため、WAVE_BASEとは
+限らない。** そのため generator は実装着手前に `git reset --hard "$WAVE_BASE"` の1コマンドで
+自分のHEADをWAVE_BASEへ明示的に合わせる（Step 3のプロンプト雛形参照）。この1コマンドを除き、
+generator自身は `fetch` / `checkout` / `pull` を行わない（`core/roles/generator.md`）。
 
 ### Step 3: サブバッチごとに generator を並列起動する
 
@@ -375,17 +409,54 @@ issue番号の小さい順に `lanes` 件ずつのサブバッチへ分割済み
 Task #[番号A] を実装してください（レーン A）。
 - Epicブランチ: [epic/epicXX/機能名]
 - WAVE_BASE: [WAVE_BASEのコミットハッシュ]（ブランチ名ではなくこのハッシュそのものに対して検証すること）
-- 作業開始前に `git merge-base --is-ancestor "[WAVE_BASE]" HEAD` でベースを検証すること。
-  偽なら実装を始めず、実出力を添えて報告し停止すること
+- **あなたの isolation worktree の分岐元は WAVE_BASE とは限らない**（worktree を作るのは
+  ハーネスであり、分岐元はハーネスが決める）。**実装に着手する前に、次の手順を1回だけ**
+  この順序で実行し、自分の HEAD を WAVE_BASE に合わせること。**自分のコミットを積んだ後に
+  再実行しないこと**（手順2を再実行すると積んだコミットが失われる）。
+  1) `git status --short`（空であることを確認。空でなければ実装を始めず、実出力を添えて
+     報告し停止すること）
+  2) `git reset --hard "[WAVE_BASE]"`（HEADをWAVE_BASEに合わせる。fetch/checkout/pullでは
+     ないためネットワーク不要）
+  3) `git merge-base --is-ancestor "[WAVE_BASE]" HEAD && echo BASE_OK`（偽なら実装を始めず、
+     実出力を添えて報告し停止すること）
+  4) `git log --oneline -1`（実際のHEADを報告に載せる）
+  手順1〜4の実出力を完了報告に含めること（自己申告にしない）
 - **`git fetch` / `git checkout` / `git pull` は実行しないこと。** 同期は run が Epic 専用
-  worktree で既に済ませており、あなたの isolation worktree は WAVE_BASE から分岐している
+  worktree で既に済ませている。手順2の `git reset --hard` のみが例外として許可されている
 - サンドボックスへのコマンド投入は `${CLAUDE_PLUGIN_ROOT}/scripts/sandbox-exec.sh` 経由で行い、
   ビルド・テストは1回の呼び出しにまとめること（分けると待ち時間が倍増する）
 - `sandbox-exec.sh` を呼ぶ際は必ず `--epic "$EPIC_NUM"` を渡すこと（例: `--epic "$EPIC_NUM" 'make test'`）
-- プロジェクト固有の準備（wasm配置等）は Epic 開始時に run が1回実行済み。**タスクごとに
-  再実行しないこと**。効いていないと判断した場合も自前で再実行せず、その事実を報告すること
+- **サンドボックスに渡すコマンドの中で `cd` して作業ディレクトリを変えないこと。**
+  `sandbox-exec.sh` は呼び出し元cwdから workdir を解決するため、`cd` はそれを上書きし、
+  自分の変更を含まないツリーを検証してしまう（サブディレクトリだけを対象にしたい場合は
+  `cd` ではなく `make -C sub test` のようにコマンド側の相対指定で行うこと）
+- （`$PREP_CMD` が空でない場合のみ、次の行を追加する。空の場合はこの行を出さない。
+  既存の Epic に後方互換）プロジェクト固有の準備コマンド（Epic本文の `## 準備コマンド` 節の
+  内容をそのまま埋め込む）:
+  [PREP_CMDの内容をそのまま貼り付ける]
+  これを**自分の作業ディレクトリで初回1回だけ**実行してから実装に入ること。Epic開始時に run が
+  実行した1回は Epic 専用 worktree にしか効かず、レーンの作業ディレクトリ（isolation worktree）
+  には及ばないため、この実行が別途必要になる。**同一worktree内で2回目以降は実行しないこと**
+  （1レーンで複数タスクを扱う場合を含む）。1回実行しても効いていないと判断した場合も自前で
+  追加実行せず、その事実を報告すること
 - 回帰確認はプロジェクトの全テストで行うこと。`-run` で絞った結果を「回帰なし」と報告しないこと
-- SKIP されたテストがあれば件数と内容を報告に含めること
+- **SKIP件数は `tail` の目視ではなく `scripts/count-skips.sh` で機械的に数えること。**
+  テスト出力を `tee` でログに保存してから数え、**数えたコマンドと実出力をそのまま報告に貼ること**
+  （`tail` で目視して「0件」と報告することは明示的に禁止する）:
+  ```bash
+  bash "${CLAUDE_PLUGIN_ROOT}/scripts/sandbox-exec.sh" --epic "$EPIC_NUM" '[全テストコマンド]' \
+    2>&1 | tee /tmp/test-output.log
+  bash "${CLAUDE_PLUGIN_ROOT}/scripts/count-skips.sh" --file /tmp/test-output.log
+  ```
+  （`$SKIP_PATTERN` が空でない場合のみ、次の行を追加する。空の場合はこの行を出さない）
+  このプロジェクトのテスト出力は built-in ランナー（go/jest/pytest）と形式が異なるため、
+  `count-skips.sh` を呼ぶ前に次を実行してから数えること:
+  `export DEV_WORKFLOW_SKIP_PATTERN='[SKIP_PATTERNの内容]'`
+  - `skips=<件数>`（exit 0）→ その件数を報告する。想定外のSKIPは不合格として扱う
+  - `skips=unknown`（exit 1）→ **「0件」と報告してはならない。** built-inランナー以外の
+    形式のため数えられなかった事実と、`DEV_WORKFLOW_SKIP_PATTERN`（Epic本文の
+    `## SKIPパターン` 節）の設定が必要である旨を報告すること。この場合に限り、
+    `tail` ではなく生のテスト出力全体を読み、SKIPを示す行が無いか自分の目でも確認すること
 - issueの要件を確認
 - Task issueの記載だけで着手できない場合に限り、親Epic issueの本文を参照すること
 - テストファーストで実装
@@ -508,7 +579,13 @@ git checkout "wave/${EPIC_NUM}/${WAVE_NO}"
 GATE_START_SEC=$(date +%s)   # 「統合ゲート」フェーズの計測開始
 
 # 1) テスト（Docker sandbox内）— 1回にまとめる。落ちたら不合格
-bash "${CLAUDE_PLUGIN_ROOT}/scripts/sandbox-exec.sh" --epic "$EPIC_NUM" '[全テストを走らせるコマンド]'
+bash "${CLAUDE_PLUGIN_ROOT}/scripts/sandbox-exec.sh" --epic "$EPIC_NUM" '[全テストを走らせるコマンド]' \
+  2>&1 | tee /tmp/gate-test-output.log
+
+# 1b) SKIP件数はレーンの自己申告に依存せず、run自身がcount-skips.shで機械的に数える。
+#     0件でも必ず表示する（黙って省略しない）
+[ -n "$SKIP_PATTERN" ] && export DEV_WORKFLOW_SKIP_PATTERN="$SKIP_PATTERN"
+bash "${CLAUDE_PLUGIN_ROOT}/scripts/count-skips.sh" --file /tmp/gate-test-output.log
 
 # 2) 可読性ガード — waveブランチの差分に対して実行（PostToolUseフックと同じ判定）
 bash "${CLAUDE_PLUGIN_ROOT}/scripts/check-readability.sh" --git
@@ -519,6 +596,13 @@ GATE_SEC=$((GATE_END_SEC - GATE_START_SEC))
 
 内容の要件は従来と同じ（プロジェクトの全テストを1コマンドで／対象の選択をgeneratorに委ねない／
 SKIPを通過扱いにしない。詳細は下記）。
+
+統合ゲートの `count-skips.sh` の結果は、レーンが完了報告に書いた値と**食い違うことがある**
+（レーン内ゲートは各レーンの isolation worktree に対する結果、統合ゲートは全レーン取り込み後の
+wave ブランチに対する結果であり、対象ツリーが異なるため）。
+**食い違った場合は統合ゲートの値を採用し**、その旨を Epic issue にコメントする。
+統合ゲート側も `skips=unknown` になりうるが、その場合も「0件」として扱わない
+（下記「SKIPを通過扱いにしない」参照）。
 
 **Epic worktreeに対する単独のゲートは廃止する。** レーンの変更がEpicに入るのは統合ゲート
 通過後のマージであり、Epic worktreeを先に検証しても検証対象として意味を持たない。加えて、
@@ -543,8 +627,20 @@ generatorが並列に実施するレーン内ゲートと合わせて毎タス�
 #### SKIP を通過扱いにしない
 
 依存物が未配置だとテストが無言で `SKIP` され、`ok` と表示されて成功に見える。
-**`ok` の有無だけで判定してはならない。** 出力中のSKIP件数を確認し、
-検証したかったテストが実際に走ったことを確かめる。想定外のSKIPは不合格として扱う。
+**`ok` の有無だけで判定してはならない。** SKIP件数の数え方は自然言語の依頼にせず、
+`scripts/count-skips.sh` に固定する（`tail` の目視で「0件」と判定することを禁止する。
+上記1b参照）。
+
+- `skips=<件数>`（exit 0）→ その件数を確認し、検証したかったテストが実際に走ったことを
+  確かめる。**想定外のSKIPは不合格として扱う**
+- `skips=unknown`（exit 1）→ **「0件」として扱ってはならない。** built-inランナー
+  （go/jest/pytest）以外の形式であるため数えられなかったことを Epic issue に明記し、
+  `DEV_WORKFLOW_SKIP_PATTERN`（Epic本文の `## SKIPパターン` 節）の設定を促す。
+  この1件のために run 全体を必ず停止させるわけではないが、「0件」への読み替えは常に禁止する。
+  **恒久対処として、次の run までに Epic issue 本文へ `## SKIPパターン` 節（ERE1行）を
+  追加することを明記する。** 都度コメントで済ませるだけでは同じ run が来るたびに
+  `skips=unknown` を繰り返すだけで、SKIP件数が検証されないまま進む状態が固定化する
+  （書き方は `core/roles/planner.md`「SKIPパターン（該当する場合のみ）」節を参照）
 
 - **通過** → Step 7 へ
 - **失敗** → Step 8「統合ゲート失敗」のリカバリへ（Epicブランチは無傷のまま）
@@ -1064,11 +1160,43 @@ if [ -d "$EPIC_WT" ]; then
   find "$EPIC_WT" -maxdepth 2 -type l -name "node_modules" -exec unlink {} \; 2>/dev/null || true
   git worktree remove "$EPIC_WT" --force 2>/dev/null || true
 fi
+```
 
-# 3) generator の isolation worktree（.claude/worktrees/agent-*）はハーネスが自動整理するが、
-#    残存していれば prune で登録を掃除する
+**generator の isolation worktree（`.claude/worktrees/agent-*`）は、ハーネスが自動整理するわけ
+ではない。** 変更を加えた（＝コミットを持つ）worktree は自動整理の対象外と見られ、Epic を
+重ねるごとに単調増加する。`git worktree prune` は**登録が壊れたもの**しか掃除しないため、
+ディレクトリが実在する worktree は放置され続ける（実測: `docs/dev-workflow-handover.md` H6節）。
+
+本runで実際に使ったレーンの作業ブランチ名（Step 3の完了報告で得た値。Step 5・「統合ゲート失敗時の
+原因特定手順」で`merge-lane.sh --lane-branch`に渡した値と同じもの）をすべて集め、`--lane-branch`に
+渡して`scripts/cleanup-lane-worktrees.sh`を呼ぶ。Epicブランチへ取り込み済みであることの確認は
+スクリプト側が行うため、run側は対象を集めて渡すだけでよい。
+
+```bash
+# 3) 本Epicで使ったレーンworktreeのうち、Epicブランチへ取り込み済みのものだけを削除する
+#    （削除失敗でrun全体を止めない。取り込み判定はスクリプト側が行う。
+#     --lane-branch は本runで使ったレーンの数だけ繰り返す）
+bash "${CLAUDE_PLUGIN_ROOT}/scripts/cleanup-lane-worktrees.sh" \
+  --epic-branch "${EPIC_BRANCH}" \
+  --lane-branch "[レーンAの作業ブランチ]" \
+  --lane-branch "[レーンBの作業ブランチ]" 2>&1 || true
+
+# 4) 上記で保護された（=削除されなかった）worktree はそのまま残る。壊れた登録だけを掃除する
 git worktree prune
 ```
+
+- **本runで使ったレーンブランチだけを渡す。他Epicのレーンworktreeには触れない**
+  （`sandbox-exec.sh --down --all`と同じ「自リポジトリ・自Epic分だけ」の原則。`agent-*`を
+  名前で総なめしてはならない）
+- Epicブランチへ取り込めなかったレーン（レーン内ゲート失敗・ベース逸脱・競合で見送った分を
+  含む）のworktreeは、スクリプトが`skip ... reason not-merged`として保護し削除しない。
+  取り込めなかった分もそのまま渡してよい
+- 人間向けの棚卸し導線として、`git worktree list`で残存状況を確認できる。事前に対象と
+  判定理由だけを見たい場合は`--dry-run`を付ける:
+  ```bash
+  bash "${CLAUDE_PLUGIN_ROOT}/scripts/cleanup-lane-worktrees.sh" \
+    --epic-branch "${EPIC_BRANCH}" --lane-branch "<ブランチ>" --dry-run
+  ```
 
 サンドボックスの後片付け（常駐コンテナの `--down`）は「自律ループ（YOLOモード、ウェーブ単位）」の
 直前の節で**既に実行済み**である（正常終了・異常終了を問わず必ず実行する節）。ここで重複して

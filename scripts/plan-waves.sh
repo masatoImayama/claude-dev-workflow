@@ -38,6 +38,9 @@
 #   task	<番号>	wave	<W>	subbatch	<S>	deps	<dep1,dep2,...>
 #   wave	<W>	tasks	<n1,n2,...>
 #   warn	missing-deps	<番号>
+#   warn	missing-deps-summary	<宣言漏れ件数>	<対象タスク数>	<実効並列度>	<指定lanes>
+#     （宣言漏れが1件以上のときだけ、warn missing-deps の列挙の後に1本だけ出す。
+#      実効並列度 = min(指定lanes, 各ウェーブに属するタスク数の最大値)。0件のときは出さない＝後方互換）
 #   warn	unknown-dep	<番号>	<未知のdep番号>
 #   skip	<番号>	reason	depends-on-skipped	<依存先番号>
 #
@@ -369,6 +372,26 @@ done
 unset _w _n _i _tasks _joined
 
 # ---------------------------------------------------------------------------
+# 実効並列度（宣言漏れ警告で使う。min(指定lanes, 各ウェーブに属するタスク数の最大値)）
+# 完全逐次（全ウェーブが1タスク）なら1になる。既に計算済みのWAVE_TASKS/LANESから機械的に求める。
+# ---------------------------------------------------------------------------
+
+EFFECTIVE_LANES=0
+_w=1
+while [ "$_w" -le "$MAX_WAVE" ]; do
+  _wtasks_csv="${WAVE_TASKS[$_w]:-}"
+  _wcount=0
+  if [ -n "$_wtasks_csv" ]; then
+    IFS=',' read -r -a _wtasks_arr <<< "$_wtasks_csv"
+    _wcount="${#_wtasks_arr[@]}"
+  fi
+  [ "$_wcount" -gt "$EFFECTIVE_LANES" ] && EFFECTIVE_LANES="$_wcount"
+  _w=$((_w + 1))
+done
+unset _w _wtasks_csv _wcount _wtasks_arr
+[ "$EFFECTIVE_LANES" -gt "$LANES" ] && EFFECTIVE_LANES="$LANES"
+
+# ---------------------------------------------------------------------------
 # 出力
 # ---------------------------------------------------------------------------
 
@@ -399,6 +422,7 @@ print_machine() {
     for n in "${sorted_missing[@]}"; do
       echo -e "warn\tmissing-deps\t${n}"
     done
+    echo -e "warn\tmissing-deps-summary\t${#MISSING_DEPS_WARN[@]}\t${#PLAN_LIST[@]}\t${EFFECTIVE_LANES}\t${LANES}"
   fi
 
   if [ "${#UNKNOWN_DEP_WARN[@]}" -gt 0 ]; then
@@ -455,7 +479,10 @@ print_human() {
 
   if [ "${#MISSING_DEPS_WARN[@]}" -gt 0 ]; then
     echo ""
-    echo "[警告] 前提未宣言（宣言漏れ・完全逐次にフォールバック）:"
+    echo "[警告] 前提未宣言が ${#MISSING_DEPS_WARN[@]} 件あります（対象タスク ${#PLAN_LIST[@]} 件中）。"
+    echo "       該当タスクは fail-safe により「自分より小さい issue 番号の全タスク」に依存するとみなされ、"
+    echo "       直列化されます。この計画の実効並列度は ${EFFECTIVE_LANES} です（指定 lanes=${LANES}）。"
+    echo "       Task issue 本文に「- 前提: #N」を、依存が無ければ「- 前提: なし」を追記してください。"
     local sorted_missing n2
     mapfile -t sorted_missing < <(printf '%s\n' "${MISSING_DEPS_WARN[@]}" | sort -n)
     for n2 in "${sorted_missing[@]}"; do

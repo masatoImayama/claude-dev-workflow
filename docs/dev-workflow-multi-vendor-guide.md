@@ -1084,7 +1084,9 @@ Task issue の `- 前提: #N` が作る依存グラフに基づくウェーブ�
 - [x] `skills-codex/dev-workflow-run/SKILL.md` / `adapters/codex/run-loop.sh` を
       `lanes=1` 固定の縮退版として同じ統合手順に合わせる
 - [x] プロジェクト固有準備の Epic 開始時集約（Epic issue 本文の `## 準備コマンド` 節を
-      run が Epic 開始時の `--warm` に1回だけ渡す。generator はタスクごとに再実行しない）
+      run が Epic 開始時の `--warm` に1回だけ渡す。適用範囲は Epic 専用 worktree のみで、
+      generator は自分の isolation worktree で初回1回だけ実行し、同一 worktree 内で
+      2回目以降は実行しない）
 - [x] `tests/run-tests.sh` に新規2スクリプトのケースを追加し決定論を固定
 - [x] README.md / 本ドキュメントに並列実行の節・対応表を追加、両 `plugin.json` を `v0.12.0` に更新
 

@@ -214,6 +214,14 @@ main (保護: 人間のみマージ可)
 
 `node_modules` 等がsymlinkの場合、`git worktree remove --force` がsymlink越しにメインリポの実体ファイルを削除する。worktree削除前に必ずsymlinkを解除すること。
 
+各レーン（generatorのisolation worktree、`.claude/worktrees/agent-*`）は変更を加えた（＝コミットを持つ）ものは自動整理されず、Epicを重ねるごとに蓄積する。`git worktree prune`は登録が壊れたものしか掃除しないため、実在するディレクトリは残り続ける。`scripts/cleanup-lane-worktrees.sh`はrunの完了時に、当該Epicで使ったレーンworktreeのうちEpicブランチへ取り込み済みのものだけを削除する（他Epicの分やまだ取り込まれていない分には触れない）。
+
+```bash
+git worktree list                                          # 残存worktreeの棚卸し
+bash scripts/cleanup-lane-worktrees.sh --epic-branch <ブランチ> \
+  --lane-branch <ブランチ> [--lane-branch <ブランチ> ...] --dry-run   # 削除対象と判定理由だけ確認
+```
+
 ## 並列実行（ウェーブ実行）
 
 `/dev-workflow:run` は Task issue が宣言した依存関係だけを根拠に、依存の無いタスクを**ウェーブ単位で並列実行**する。1タスクずつ直列に流していた従来方式に対し、独立したタスクの待ち時間を短縮する。
@@ -228,7 +236,7 @@ planner は各 Task issue に次のいずれかを必ず書く。
 ```
 
 - パースは「`- 前提:` で始まる行から `#\d+` をすべて拾う」方式。`- 前提: #7, #9（全実装完了後）` のような注釈混じりでも動く
-- **`- 前提:` 行そのものが無い**（＝宣言漏れ）場合は、そのタスクが**自分より issue 番号が小さい全タスクに依存する**とみなす（fail-safe）。結果として宣言漏れの Epic は完全逐次で実行され、現行（並列化前）と同じ挙動になる
+- **`- 前提:` 行そのものが無い**（＝宣言漏れ）場合は、そのタスクが**自分より issue 番号が小さい全タスクに依存する**とみなす（fail-safe）。結果として宣言漏れの Epic は完全逐次で実行され、現行（並列化前）と同じ挙動になる。エラーにはしない（前提行の無い既存 Epic を壊さないため）が、`plan-waves.sh --print` はこの劣化を目立たせる警告を出す（次節参照）
 - 依存が無い場合も `- 前提: なし` の明記が必須。これが無いと「宣言漏れ」と区別できない
 
 ### Phase は実行順序に使わない
@@ -255,7 +263,12 @@ main（保護: 人間のみマージ可）
 ```
 
 - **ウェーブ**とは、依存グラフの同一レベルに属し同時に実行できるタスクの集合。統合ゲートの単位でもある
-- **WAVE_BASE** は、ウェーブ開始時点の Epic ブランチ tip。そのウェーブに属する全レーンが共有する唯一の正しい分岐元
+- **WAVE_BASE** は、ウェーブ開始時点の Epic ブランチ tip。**各レーン（generator の isolation
+  worktree）の分岐元はハーネスが決めるため WAVE_BASE とは限らない。** isolation worktree を
+  作るのはハーネスであり、run はメインリポのチェックアウトを Epic ブランチへ切り替えないため、
+  分岐元は通常メインリポのデフォルトブランチのままである。そのため generator は実装着手前に
+  `git reset --hard "$WAVE_BASE"` で自分の HEAD を明示的に合わせる
+  （`core/roles/generator.md`「渡されたベースにHEADを合わせる」参照）
 - レーン（generator の isolation worktree）は wave ブランチへ merge-base 検証つきで取り込まれ、**wave ブランチ上で統合ゲート（プロジェクトの全テスト・可読性ガード）を1回だけ通過してから** Epic ブランチへ `--ff-only` で進む
 - **Epic ブランチには統合ゲートを通ったコミットだけが載る。** 失敗しても Epic ブランチは無傷なので、`git reset --hard` や force push は不要
 - **Epic ブランチへの force push は行わない。wave ブランチは origin へ push しない**（ローカルの一時ブランチ）
@@ -311,7 +324,10 @@ bash "${CLAUDE_PLUGIN_ROOT}/scripts/plan-waves.sh" --epic 259 --lanes 3 --print
 ウェーブ 2: 6, 8, 9 (サブバッチ1: #6,#8,#9)
 ...
 
-[警告] 前提未宣言（宣言漏れ・完全逐次にフォールバック）:
+[警告] 前提未宣言が 8 件あります（対象タスク 8 件中）。
+       該当タスクは fail-safe により「自分より小さい issue 番号の全タスク」に依存するとみなされ、
+       直列化されます。この計画の実効並列度は 1 です（指定 lanes=3）。
+       Task issue 本文に「- 前提: #N」を、依存が無ければ「- 前提: なし」を追記してください。
   #16
 ```
 
@@ -321,7 +337,11 @@ bash "${CLAUDE_PLUGIN_ROOT}/scripts/plan-waves.sh" --epic 259 --lanes 3 --print
 - `--skipped 4,7`: カンマ区切りの issue 番号。それらに依存するタスクを推移的にスキップする
 - `--print`: 上記のような人間向けの表を出力する（既定は機械可読な TSV）
 
-機械可読な既定出力（`--print` 無し）は run スキルがそのままパースする TSV で、`lanes` / `task ... wave ... subbatch ... deps` / `wave ... tasks ...` / `warn missing-deps` / `warn unknown-dep` / `skip ... reason depends-on-skipped` の各行から成る。終了コードは `0`=成功 `2`=引数エラー `3`=循環依存（循環に含まれるタスクを列挙して停止）。
+宣言漏れは**フェイルオープン**（エラー停止にしない）を維持しつつ、**件数**と**それによって
+実効並列度が指定 `--lanes` からどれだけ落ちたか**（`min(lanes, 各ウェーブに属するタスク数の最大値)`。
+完全逐次なら1）を上記のように必ず表示する。宣言漏れが0件のときはこの警告自体が出ない。
+
+機械可読な既定出力（`--print` 無し）は run スキルがそのままパースする TSV で、`lanes` / `task ... wave ... subbatch ... deps` / `wave ... tasks ...` / `warn missing-deps` / `warn missing-deps-summary <件数> <対象タスク数> <実効並列度> <指定lanes>`（宣言漏れが1件以上のときだけ1本出る後方互換な集計行） / `warn unknown-dep` / `skip ... reason depends-on-skipped` の各行から成る。終了コードは `0`=成功 `2`=引数エラー `3`=循環依存（循環に含まれるタスクを列挙して停止）。
 
 レーンを wave ブランチへ取り込む `scripts/merge-lane.sh` も同様に切り出されている。
 
@@ -351,7 +371,50 @@ make setup && make wasm
 ```
 ````
 
-Epic issue 本文にこの節があれば、run がその内容を Epic 開始時の `sandbox-exec.sh --warm` に1回だけ渡す。コンテナは Epic 単位で常駐するため、この1回の準備がウェーブ・レーンをまたいで効く。節が無ければ従来どおりビルドコマンドで `--warm` するだけになる（後方互換）。generator にはタスクごとに再実行しない旨を明記済み。
+Epic issue 本文にこの節があれば、run がその内容を Epic 開始時の `sandbox-exec.sh --warm` に1回だけ渡す。この1回が効くのは Epic 専用 worktree だけである（キャッシュを温める・統合ゲートが使う Epic worktree に生成物を配置しておく、の2点が目的）。generator のレーン（isolation worktree）はこの後に別ツリーとして作られるため、この1回は及ばない。そのため run は Step 3 で同じ準備コマンドの内容を各 generator のプロンプトにも埋め込み、レーンの作業ディレクトリで初回1回だけ実行させる（同一worktree内で2回目以降は実行しない）。節が無ければ従来どおりビルドコマンドで `--warm` するだけになる（後方互換）。
+
+### `scripts/count-skips.sh`（SKIP件数の機械的カウント）
+
+「SKIP されたテストがあれば件数と内容を報告に含めること」という自然言語の依頼は、`tail` で目視して `--- SKIP` が見えなかったことをもって「SKIP 0件」と誤報告する事故を招いた（依存物が未配置だとテストは無言で `SKIP` され `ok` と表示されるため）。レーン内ゲート（generator）・統合ゲート（run）のどちらも、この自己申告ではなく `count-skips.sh` で機械的に数える。
+
+```bash
+bash "${CLAUDE_PLUGIN_ROOT}/scripts/count-skips.sh" [--file <テスト出力のログ>] [--pattern <ERE>]
+<テスト出力> | bash "${CLAUDE_PLUGIN_ROOT}/scripts/count-skips.sh"
+```
+
+出力（1行1項目・機械可読、この順で必ず3行）:
+
+```
+skips=<件数 または unknown>
+runner=<go|pytest|jest|custom|unknown>
+pattern=<実際に使ったERE または none>
+```
+
+終了コードは `0`=数えられた `1`=数えられなかった（`skips=unknown`。fail loud） `2`=引数エラー。
+
+判定順序（上から最初に一致したものを使う）:
+
+1. `--pattern` または環境変数 `DEV_WORKFLOW_SKIP_PATTERN` があれば `runner=custom` としてそのEREに一致する行数を数える（最優先）
+2. Go と判定できる（`^--- (PASS|FAIL|SKIP)` または `^(ok|FAIL|PASS)` を含む）→ `^--- SKIP` の一致行数
+3. jest と判定できる（`^Tests:` を含む）→ `Tests:` 行の `<N> skipped` の N
+4. pytest と判定できる（`test session starts` を含む）→ サマリ行の最後の `<N> skipped` の N
+5. どれにも当てはまらない → `skips=unknown` / `runner=unknown` / exit 1
+
+built-in ランナー（go/jest/pytest）と異なる出力形式のプロジェクトでは既定で `skips=unknown` になる。この場合に必ず「0件」として扱ってはならない（下記「Epic の `## SKIPパターン` 節」で `DEV_WORKFLOW_SKIP_PATTERN` を設定する）。
+
+### Epic の `## SKIPパターン` 節
+
+駆動先プロジェクトのテスト出力が built-in ランナー（go/jest/pytest）のいずれとも異なる形式で、`count-skips.sh` が既定で `skips=unknown` になる場合に、SKIP行を数える正規表現を Epic issue 本文に明記する。
+
+````markdown
+## SKIPパターン
+
+```
+^  skip - 
+```
+````
+
+節があれば run がその内容を `DEV_WORKFLOW_SKIP_PATTERN` として読み取り、Step 3 の各 generator プロンプトと統合ゲートの両方に渡す（`## 準備コマンド` 節と同じ抽出方法）。節が無ければ何も設定されず、built-in ランナーの判定だけが行われる。`skips=unknown` は「0件」を意味しない。built-in ランナー以外の形式で run を止めずに進めるための既定の逃げ道であり、正しい件数を知るには本節でパターンを明記する必要がある。
 
 ## YOLOモード（完全自律動作）
 
