@@ -8113,6 +8113,249 @@ assert_eq "--fileと標準入力の併存: --fileを優先（go形式のskips=2�
 assert_eq "--fileと標準入力の併存: runnerもgoのまま" "go" "$(cs_field runner "$CS_BOTHIN_OUTPUT")"
 
 # ---------------------------------------------------------------------------
+# cleanup-lane-worktrees.sh（取り込み済みレーンworktreeの片付け・Task #93）
+#
+# 一時 git リポジトリに Epic ブランチ・複数のレーンブランチ・それぞれの worktree を
+# 組み立てて検証する（Docker 非依存）。ml_commit_file / ml_branch_from / ml_head_of は
+# merge-lane.sh のテスト用に定義済みの汎用ヘルパをそのまま再利用する。
+# 呼び出し側（run からの結線）は #95 の担当なので、ここではスクリプト単体の振る舞いのみを見る。
+# ---------------------------------------------------------------------------
+
+echo "== cleanup-lane-worktrees.sh（取り込み済みレーンworktreeの片付け） =="
+
+CLW_SCRIPT="${REPO_ROOT}/scripts/cleanup-lane-worktrees.sh"
+
+# --- bash -n が通る ---
+if bash -n "$CLW_SCRIPT" 2>/dev/null; then
+  pass "cleanup-lane-worktrees.sh: bash -n の構文チェックが通る（#93）"
+else
+  fail "cleanup-lane-worktrees.sh: bash -n の構文チェックが通る（#93）"
+fi
+
+# --- スクリプト内に rm / rmdir によるディレクトリ削除が無い（安全ルール）。
+#     コメント行は対象外にし、単語境界での一致だけを見る
+#     （ヘッダコメントの「rm / rmdir」という説明文はコメント行なので除外される） ---
+CLW_FORBIDDEN_HITS="$(grep -v '^[[:space:]]*#' "$CLW_SCRIPT" \
+  | grep -E '(^|[^A-Za-z0-9_])(rm|rmdir)([[:space:]]|$)' || true)"
+if [ -z "$CLW_FORBIDDEN_HITS" ]; then
+  pass "cleanup-lane-worktrees.sh: rm / rmdir によるディレクトリ削除が無い"
+else
+  fail "cleanup-lane-worktrees.sh: rm / rmdir によるディレクトリ削除が無い" "$CLW_FORBIDDEN_HITS"
+fi
+
+clw_add_worktree() {
+  # clw_add_worktree <repo_dir> <worktree_dir> <既存のブランチ名>
+  # make_worktree は -b で新規ブランチを作るため、既存ブランチを checkout する
+  # 本テストでは使えない。既存ブランチをそのまま worktree に張るための専用ヘルパ。
+  local repo="$1" wt_dir="$2" branch="$3"
+  (
+    cd "$repo" || exit 1
+    git worktree add -q "$wt_dir" "$branch"
+  ) >/dev/null 2>&1
+}
+
+run_cleanup() {
+  # run_cleanup <repo_dir> [追加の引数...]  戻り値は標準出力（呼び出し側で $? を確認する）
+  local repo="$1"
+  shift
+  (cd "$repo" || exit 1; bash "$CLW_SCRIPT" "$@")
+}
+
+clw_worktree_exists() {
+  # clw_worktree_exists <repo_dir> <branch>  worktreeがあれば "yes" 、無ければ "no"
+  local repo="$1" branch="$2" found
+  found="$(
+    (cd "$repo" || exit 1; git worktree list --porcelain) 2>/dev/null \
+      | awk -v want="refs/heads/${branch}" '
+          $0 == "branch " want { print "yes"; exit }
+        '
+  )"
+  [ -n "$found" ] && echo "yes" || echo "no"
+}
+
+# --- 検証用リポジトリの組み立て ---
+# CLW_DEFAULT_BRANCH（メインworktreeがチェックアウトしているブランチ）
+#   -- init commit
+#     -- CLW_EPIC_BRANCH（epic/testclw/93）-- epic base commit
+#          -- lane-merged      -- merged.txt commit    （epicへ取り込み済み）
+#          -- lane-untouched   -- untouched.txt commit （epicへ取り込み済みだが --lane-branch に渡さない）
+#          -- lane-notmerged   -- notmerged.txt commit （epicへ未取り込みのまま）
+CLW_REPO="$(make_temp_repo)"
+CLW_DEFAULT_BRANCH="$(cd "$CLW_REPO" && git rev-parse --abbrev-ref HEAD)"
+CLW_EPIC_BRANCH="epic/testclw/93"
+
+CLW_ROOT_BASE="$(ml_head_of "$CLW_REPO" HEAD)"
+ml_branch_from "$CLW_REPO" "$CLW_EPIC_BRANCH" "$CLW_ROOT_BASE"
+ml_commit_file "$CLW_REPO" "epic.txt" "epic base\n" "epic base commit"
+CLW_EPIC_TIP1="$(ml_head_of "$CLW_REPO" "$CLW_EPIC_BRANCH")"
+
+ml_branch_from "$CLW_REPO" "lane-merged" "$CLW_EPIC_TIP1"
+ml_commit_file "$CLW_REPO" "merged.txt" "merged\n" "lane merged change"
+
+ml_branch_from "$CLW_REPO" "lane-untouched" "$CLW_EPIC_TIP1"
+ml_commit_file "$CLW_REPO" "untouched.txt" "untouched\n" "lane untouched change"
+
+ml_branch_from "$CLW_REPO" "lane-notmerged" "$CLW_EPIC_TIP1"
+ml_commit_file "$CLW_REPO" "notmerged.txt" "not merged\n" "lane not merged change"
+
+# lane-merged / lane-untouched を epic ブランチへ取り込む（epic ブランチを一時的に checkout）
+(cd "$CLW_REPO" && git checkout -q "$CLW_EPIC_BRANCH" \
+  && git merge -q --no-edit lane-merged \
+  && git merge -q --no-edit lane-untouched \
+  && git checkout -q "$CLW_DEFAULT_BRANCH") >/dev/null 2>&1
+
+# メインworktree は CLW_DEFAULT_BRANCH のまま（epic ブランチを空ける。同じブランチを
+# 2箇所でチェックアウトできないため、linked worktree で epic ブランチを張れるようにする）
+clw_add_worktree "$CLW_REPO" "${CLW_REPO}/.claude/worktrees/epicwt" "$CLW_EPIC_BRANCH"
+clw_add_worktree "$CLW_REPO" "${CLW_REPO}/.claude/worktrees/lane-merged" "lane-merged"
+clw_add_worktree "$CLW_REPO" "${CLW_REPO}/.claude/worktrees/lane-untouched" "lane-untouched"
+clw_add_worktree "$CLW_REPO" "${CLW_REPO}/.claude/worktrees/lane-notmerged" "lane-notmerged"
+
+# --- ケース1: --dry-run では取り込み済みレーンが removed 候補として列挙されるが、
+#     実際には削除されない（受け入れ条件2） ---
+CLW_DRY_OUT="$(run_cleanup "$CLW_REPO" --epic-branch "$CLW_EPIC_BRANCH" \
+  --lane-branch lane-merged --lane-branch lane-notmerged --dry-run)"
+CLW_DRY_EXIT=$?
+assert_exit_code "ケース1: --dry-run は exit 0" 0 "$CLW_DRY_EXIT"
+
+case "$CLW_DRY_OUT" in
+  *"removed"*"lane-merged"*"lane-merged"*)
+    pass "ケース1: 取り込み済みレーン（lane-merged）が removed 候補として出る" ;;
+  *)
+    fail "ケース1: 取り込み済みレーン（lane-merged）が removed 候補として出る" "output=[${CLW_DRY_OUT}]" ;;
+esac
+
+assert_eq "ケース1: --dry-run 後も lane-merged の worktree は残っている（削除されていない）" \
+  "yes" "$(clw_worktree_exists "$CLW_REPO" lane-merged)"
+
+# --- ケース2: 取り込み未の lane-notmerged は --dry-run でも skip reason not-merged になる
+#     （受け入れ条件3） ---
+case "$CLW_DRY_OUT" in
+  *"skip"*"lane-notmerged"*"reason"*"not-merged"*)
+    pass "ケース2: 取り込み未のレーン（lane-notmerged）は skip reason not-merged" ;;
+  *)
+    fail "ケース2: 取り込み未のレーン（lane-notmerged）は skip reason not-merged" "output=[${CLW_DRY_OUT}]" ;;
+esac
+
+# --- ケース3: --dry-run 無しで実行すると、実際にレーン worktree が削除される
+#     （受け入れ条件: --dry-run 無しで実際に削除される） ---
+CLW_REAL_OUT="$(run_cleanup "$CLW_REPO" --epic-branch "$CLW_EPIC_BRANCH" \
+  --lane-branch lane-merged --lane-branch lane-notmerged \
+  --lane-branch "$CLW_DEFAULT_BRANCH" --lane-branch "$CLW_EPIC_BRANCH" \
+  --lane-branch no-such-lane-branch)"
+CLW_REAL_EXIT=$?
+assert_exit_code "ケース3: --dry-run 無しの実行は exit 0（skipが混ざっていても0）" 0 "$CLW_REAL_EXIT"
+
+case "$CLW_REAL_OUT" in
+  *"removed"*"lane-merged"*)
+    pass "ケース3: 取り込み済みレーン（lane-merged）が removed と報告される" ;;
+  *)
+    fail "ケース3: 取り込み済みレーン（lane-merged）が removed と報告される" "output=[${CLW_REAL_OUT}]" ;;
+esac
+
+assert_eq "ケース3: 実行後 lane-merged の worktree が実際に削除される（git worktree list から消える）" \
+  "no" "$(clw_worktree_exists "$CLW_REPO" lane-merged)"
+
+# --- ケース4: 取り込み未のレーンは削除されず worktree が残ったまま（受け入れ条件3） ---
+case "$CLW_REAL_OUT" in
+  *"skip"*"lane-notmerged"*"reason"*"not-merged"*)
+    pass "ケース4: lane-notmerged は skip reason not-merged で削除されない" ;;
+  *)
+    fail "ケース4: lane-notmerged は skip reason not-merged で削除されない" "output=[${CLW_REAL_OUT}]" ;;
+esac
+assert_eq "ケース4: lane-notmerged の worktree は削除されずに残っている" \
+  "yes" "$(clw_worktree_exists "$CLW_REPO" lane-notmerged)"
+
+# --- ケース5: メインworktreeがチェックアウトしているブランチは skip reason protected
+#     （受け入れ条件4。メインworktree自体は消えず、当然 git rev-parse も生きたまま） ---
+case "$CLW_REAL_OUT" in
+  *"skip"*"$CLW_DEFAULT_BRANCH"*"reason"*"protected"*)
+    pass "ケース5: メインworktreeのブランチは skip reason protected" ;;
+  *)
+    fail "ケース5: メインworktreeのブランチは skip reason protected" "output=[${CLW_REAL_OUT}]" ;;
+esac
+assert_eq "ケース5: メインworktreeのブランチは削除後も worktree として残る" \
+  "yes" "$(clw_worktree_exists "$CLW_REPO" "$CLW_DEFAULT_BRANCH")"
+
+# --- ケース6: --epic-branch をチェックアウトしている worktree は skip reason protected
+#     （受け入れ条件4） ---
+case "$CLW_REAL_OUT" in
+  *"skip"*"$CLW_EPIC_BRANCH"*"reason"*"protected"*)
+    pass "ケース6: --epic-branch の worktree は skip reason protected" ;;
+  *)
+    fail "ケース6: --epic-branch の worktree は skip reason protected" "output=[${CLW_REAL_OUT}]" ;;
+esac
+assert_eq "ケース6: --epic-branch の worktree は削除後も残る" \
+  "yes" "$(clw_worktree_exists "$CLW_REPO" "$CLW_EPIC_BRANCH")"
+
+# --- ケース7: worktreeが無い（存在しない）レーンブランチは skip reason no-worktree
+#     （受け入れ条件: no-worktree で exit 0） ---
+case "$CLW_REAL_OUT" in
+  *"skip"*"no-such-lane-branch"*"reason"*"no-worktree"*)
+    pass "ケース7: worktreeの無いレーンブランチは skip reason no-worktree" ;;
+  *)
+    fail "ケース7: worktreeの無いレーンブランチは skip reason no-worktree" "output=[${CLW_REAL_OUT}]" ;;
+esac
+
+# --- ケース8: --lane-branch に明示的に渡されなかった lane-untouched は、取り込み済みでも
+#     一切触れられない（他Epic・未指定worktreeに触れない原則の確認） ---
+assert_eq "ケース8: --lane-branch で渡していない lane-untouched の worktree は残ったまま" \
+  "yes" "$(clw_worktree_exists "$CLW_REPO" lane-untouched)"
+
+# --- ケース9（R7対策の実機確認）: node_modules 等の symlink を解除してから削除するため、
+#     symlink先の実体ディレクトリが誤って消えないこと ---
+CLW_SYM_REPO="$(make_temp_repo)"
+CLW_SYM_DEFAULT_BRANCH="$(cd "$CLW_SYM_REPO" && git rev-parse --abbrev-ref HEAD)"
+CLW_SYM_EPIC_BRANCH="epic/testsym/93"
+CLW_SYM_BASE="$(ml_head_of "$CLW_SYM_REPO" HEAD)"
+ml_branch_from "$CLW_SYM_REPO" "$CLW_SYM_EPIC_BRANCH" "$CLW_SYM_BASE"
+ml_commit_file "$CLW_SYM_REPO" "epic.txt" "epic base\n" "epic base commit"
+CLW_SYM_EPIC_TIP="$(ml_head_of "$CLW_SYM_REPO" "$CLW_SYM_EPIC_BRANCH")"
+ml_branch_from "$CLW_SYM_REPO" "lane-sym" "$CLW_SYM_EPIC_TIP"
+ml_commit_file "$CLW_SYM_REPO" "sym.txt" "sym\n" "lane sym change"
+(cd "$CLW_SYM_REPO" && git checkout -q "$CLW_SYM_EPIC_BRANCH" \
+  && git merge -q --no-edit lane-sym \
+  && git checkout -q "$CLW_SYM_DEFAULT_BRANCH") >/dev/null 2>&1
+clw_add_worktree "$CLW_SYM_REPO" "${CLW_SYM_REPO}/.claude/worktrees/lane-sym" "lane-sym"
+
+CLW_SYM_REAL_TARGET="$(mktemp -d "${TMPDIR:-/tmp}/dw-test-clw-realdir.XXXXXX")"
+printf 'do not delete me\n' > "${CLW_SYM_REAL_TARGET}/marker.txt"
+(cd "${CLW_SYM_REPO}/.claude/worktrees/lane-sym" && ln -s "$CLW_SYM_REAL_TARGET" node_modules) >/dev/null 2>&1
+
+run_cleanup "$CLW_SYM_REPO" --epic-branch "$CLW_SYM_EPIC_BRANCH" --lane-branch lane-sym >/dev/null
+
+assert_eq "ケース9: node_modules症状のレーンworktreeも削除される" \
+  "no" "$(clw_worktree_exists "$CLW_SYM_REPO" lane-sym)"
+
+if [ -f "${CLW_SYM_REAL_TARGET}/marker.txt" ]; then
+  pass "ケース9: symlink解除後の削除でも symlink先の実体ファイルは消えない（R7対策）"
+else
+  fail "ケース9: symlink解除後の削除でも symlink先の実体ファイルは消えない（R7対策）" \
+    "marker.txt が消えました: ${CLW_SYM_REAL_TARGET}"
+fi
+
+# --- ケース10: 引数バリデーション（引数エラーは exit 2） ---
+CLW_REPO_ARGS="$(make_temp_repo)"
+
+run_cleanup "$CLW_REPO_ARGS" >/dev/null 2>&1
+assert_exit_code "引数なしは exit 2" 2 "$?"
+
+run_cleanup "$CLW_REPO_ARGS" --lane-branch dummy >/dev/null 2>&1
+assert_exit_code "--epic-branch 省略は exit 2" 2 "$?"
+
+run_cleanup "$CLW_REPO_ARGS" --epic-branch main >/dev/null 2>&1
+assert_exit_code "--lane-branch 省略は exit 2" 2 "$?"
+
+run_cleanup "$CLW_REPO_ARGS" --epic-branch >/dev/null 2>&1
+assert_exit_code "--epic-branch に値なしは exit 2" 2 "$?"
+
+run_cleanup "$CLW_REPO_ARGS" --epic-branch main --lane-branch >/dev/null 2>&1
+assert_exit_code "--lane-branch に値なしは exit 2" 2 "$?"
+
+run_cleanup "$CLW_REPO_ARGS" --epic-branch main --lane-branch dummy --unknown-option >/dev/null 2>&1
+assert_exit_code "未知のオプションは exit 2" 2 "$?"
+
+# ---------------------------------------------------------------------------
 # 結果集計
 # ---------------------------------------------------------------------------
 
