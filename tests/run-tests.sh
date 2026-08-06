@@ -7931,6 +7931,126 @@ esac
 # スコープの明記（上記）に留め、機械的な差分検査は行わない。
 
 # ---------------------------------------------------------------------------
+# count-skips.sh（SKIP件数の機械的カウント、Task #91、Epic #88 H5-a）
+#
+# `skills/run/SKILL.md` の「SKIP されたテストがあれば件数と内容を報告に含めること」という
+# 指示は数え方を示しておらず、`tail` で目視して「SKIP 0件」と誤報告する事故を招いた
+# （`docs/dev-workflow-handover.md` H5節）。ここでは呼び出し側の差し替え（#97）は行わず、
+# 数える本体だけを固定入力で検証する。Docker には一切触れない。
+# ---------------------------------------------------------------------------
+
+echo "== count-skips.sh（SKIP件数の機械的カウント） =="
+
+COUNT_SKIPS_SCRIPT="${REPO_ROOT}/scripts/count-skips.sh"
+
+cs_field() {
+  # cs_field <field名(skips|runner|pattern)> <count-skips.shの出力全体>
+  printf '%s\n' "$2" | grep -E "^$1=" | head -1 | sed "s/^$1=//"
+}
+
+# --- bash -n が通る ---
+if bash -n "$COUNT_SKIPS_SCRIPT" 2>/dev/null; then
+  pass "count-skips.sh: bash -n の構文チェックが通る（#91）"
+else
+  fail "count-skips.sh: bash -n の構文チェックが通る（#91）"
+fi
+
+# --- ケース1: Go形式・SKIPが3行 → skips=3 / runner=go / exit 0 ---
+CS_GO3_INPUT="$(printf -- '--- PASS: TestA (0.00s)\n--- SKIP: TestB (0.00s)\n--- SKIP: TestC (0.00s)\n--- SKIP: TestD (0.00s)\nFAIL\nok  \texample.com/pkg\t0.01s\n')"
+CS_GO3_OUTPUT="$(printf '%s\n' "$CS_GO3_INPUT" | bash "$COUNT_SKIPS_SCRIPT")"
+CS_GO3_EXIT=$?
+assert_eq "Go形式（SKIP3行）: skips=3" "3" "$(cs_field skips "$CS_GO3_OUTPUT")"
+assert_eq "Go形式（SKIP3行）: runner=go" "go" "$(cs_field runner "$CS_GO3_OUTPUT")"
+assert_exit_code "Go形式（SKIP3行）: exit 0" 0 "$CS_GO3_EXIT"
+
+# --- ケース2: Go形式・SKIPが0行 → skips=0（unknownにならない） / runner=go / exit 0 ---
+CS_GO0_INPUT="$(printf -- '--- PASS: TestA (0.00s)\nok  \texample.com/pkg\t0.01s\n')"
+CS_GO0_OUTPUT="$(printf '%s\n' "$CS_GO0_INPUT" | bash "$COUNT_SKIPS_SCRIPT")"
+CS_GO0_EXIT=$?
+assert_eq "Go形式（SKIP0行）: skips=0（unknownにならない）" "0" "$(cs_field skips "$CS_GO0_OUTPUT")"
+assert_eq "Go形式（SKIP0行）: runner=go" "go" "$(cs_field runner "$CS_GO0_OUTPUT")"
+assert_exit_code "Go形式（SKIP0行）: exit 0" 0 "$CS_GO0_EXIT"
+
+# --- ケース3: jest形式 → skips=2 / runner=jest / exit 0 ---
+CS_JEST_INPUT="Tests:       2 skipped, 3 passed, 5 total"
+CS_JEST_OUTPUT="$(printf '%s\n' "$CS_JEST_INPUT" | bash "$COUNT_SKIPS_SCRIPT")"
+CS_JEST_EXIT=$?
+assert_eq "jest形式: skips=2" "2" "$(cs_field skips "$CS_JEST_OUTPUT")"
+assert_eq "jest形式: runner=jest" "jest" "$(cs_field runner "$CS_JEST_OUTPUT")"
+assert_exit_code "jest形式: exit 0" 0 "$CS_JEST_EXIT"
+
+# --- ケース4: pytest形式 → skips=2 / runner=pytest / exit 0 ---
+CS_PYTEST_INPUT="$(printf -- '========== test session starts ==========\n1 passed, 2 skipped in 0.01s\n')"
+CS_PYTEST_OUTPUT="$(printf '%s\n' "$CS_PYTEST_INPUT" | bash "$COUNT_SKIPS_SCRIPT")"
+CS_PYTEST_EXIT=$?
+assert_eq "pytest形式: skips=2" "2" "$(cs_field skips "$CS_PYTEST_OUTPUT")"
+assert_eq "pytest形式: runner=pytest" "pytest" "$(cs_field runner "$CS_PYTEST_OUTPUT")"
+assert_exit_code "pytest形式: exit 0" 0 "$CS_PYTEST_EXIT"
+
+# --- ケース5: 認識できない形式 → skips=unknown / runner=unknown / exit 1（fail loud） ---
+CS_UNKNOWN_INPUT="hello world, nothing test-related here"
+CS_UNKNOWN_OUTPUT="$(printf '%s\n' "$CS_UNKNOWN_INPUT" | bash "$COUNT_SKIPS_SCRIPT")"
+CS_UNKNOWN_EXIT=$?
+assert_eq "認識できない形式: skips=unknown" "unknown" "$(cs_field skips "$CS_UNKNOWN_OUTPUT")"
+assert_eq "認識できない形式: runner=unknown" "unknown" "$(cs_field runner "$CS_UNKNOWN_OUTPUT")"
+assert_exit_code "認識できない形式: exit 1（fail loud）" 1 "$CS_UNKNOWN_EXIT"
+
+# --- ケース5': このリポジトリ自身のテスト形式（`bash tests/run-tests.sh` の ok/NG/skip 形式）を
+#     渡すと、built-inランナー（go/jest/pytest）のどれにも一致せず unknown/exit1 になる。
+#     これが「SKIP 0件」（Go形式・ケース2）と「形式を認識できない」（本ケース）を
+#     取り違えない、という本タスクの核心を実際のリポジトリ形式で示す ---
+CS_SELF_INPUT="$(printf '  ok   - サンプルテスト1\n  skip - サンプルテスト2 (依存物未配置)\n\n== 結果: 1 passed, 0 failed, 1 skipped ==\n')"
+CS_SELF_OUTPUT="$(printf '%s\n' "$CS_SELF_INPUT" | bash "$COUNT_SKIPS_SCRIPT")"
+CS_SELF_EXIT=$?
+assert_eq "このリポジトリ自身のok/NG/skip形式: skips=unknown（0件と誤報告しない）" "unknown" "$(cs_field skips "$CS_SELF_OUTPUT")"
+assert_exit_code "このリポジトリ自身のok/NG/skip形式: exit 1（fail loud）" 1 "$CS_SELF_EXIT"
+
+# --- ケース6: --pattern が最優先され runner=custom になる ---
+CS_PATTERN_INPUT="$(printf 'skip - foo (reason)\nskip - bar (reason)\n')"
+CS_PATTERN_OUTPUT="$(printf '%s\n' "$CS_PATTERN_INPUT" | bash "$COUNT_SKIPS_SCRIPT" --pattern '^skip - ')"
+CS_PATTERN_EXIT=$?
+assert_eq "--pattern指定: skips=2" "2" "$(cs_field skips "$CS_PATTERN_OUTPUT")"
+assert_eq "--pattern指定: runner=custom" "custom" "$(cs_field runner "$CS_PATTERN_OUTPUT")"
+assert_eq "--pattern指定: pattern=^skip - " "^skip - " "$(cs_field pattern "$CS_PATTERN_OUTPUT")"
+assert_exit_code "--pattern指定: exit 0" 0 "$CS_PATTERN_EXIT"
+
+# --- ケース7: DEV_WORKFLOW_SKIP_PATTERN 環境変数でも同様に custom になる ---
+CS_ENV_INPUT="$(printf 'skip - foo\nskip - bar\nskip - baz\n')"
+CS_ENV_OUTPUT="$(printf '%s\n' "$CS_ENV_INPUT" | DEV_WORKFLOW_SKIP_PATTERN='^skip - ' bash "$COUNT_SKIPS_SCRIPT")"
+CS_ENV_EXIT=$?
+assert_eq "DEV_WORKFLOW_SKIP_PATTERN指定: skips=3" "3" "$(cs_field skips "$CS_ENV_OUTPUT")"
+assert_eq "DEV_WORKFLOW_SKIP_PATTERN指定: runner=custom" "custom" "$(cs_field runner "$CS_ENV_OUTPUT")"
+assert_exit_code "DEV_WORKFLOW_SKIP_PATTERN指定: exit 0" 0 "$CS_ENV_EXIT"
+
+# --- ケース8: --pattern と DEV_WORKFLOW_SKIP_PATTERN が両方あれば --pattern を優先する ---
+CS_BOTH_OUTPUT="$(printf 'skip - foo\nSKIPPED bar\n' | DEV_WORKFLOW_SKIP_PATTERN='^SKIPPED' bash "$COUNT_SKIPS_SCRIPT" --pattern '^skip - ')"
+assert_eq "--patternとDEV_WORKFLOW_SKIP_PATTERN併存: --patternが優先される" "1" "$(cs_field skips "$CS_BOTH_OUTPUT")"
+
+# --- ケース9: 引数エラー（exit 2） ---
+bash "$COUNT_SKIPS_SCRIPT" --file >/dev/null 2>&1
+assert_exit_code "引数エラー: --file に値なしで exit 2" 2 "$?"
+
+bash "$COUNT_SKIPS_SCRIPT" --file /path/does/not/exist.log >/dev/null 2>&1
+assert_exit_code "引数エラー: 存在しないファイルで exit 2" 2 "$?"
+
+bash "$COUNT_SKIPS_SCRIPT" --unknown-option >/dev/null 2>&1
+assert_exit_code "引数エラー: 未知のオプションで exit 2" 2 "$?"
+
+# --- ケース10: --file 経由の読み込み ---
+CS_FILE_FIXTURE="$(mktemp "${TMPDIR:-/tmp}/dw-test-cs-file.XXXXXX")"
+printf -- '--- SKIP: T1 (0.00s)\n--- SKIP: T2 (0.00s)\nok  \tpkg\t0.01s\n' > "$CS_FILE_FIXTURE"
+CS_FILE_OUTPUT="$(bash "$COUNT_SKIPS_SCRIPT" --file "$CS_FILE_FIXTURE")"
+CS_FILE_EXIT=$?
+assert_eq "--file経由: skips=2" "2" "$(cs_field skips "$CS_FILE_OUTPUT")"
+assert_eq "--file経由: runner=go" "go" "$(cs_field runner "$CS_FILE_OUTPUT")"
+assert_exit_code "--file経由: exit 0" 0 "$CS_FILE_EXIT"
+
+# --- ケース11: --file と標準入力が両方ある場合、--file を優先する ---
+CS_BOTHIN_OUTPUT="$(printf 'Tests:       0 skipped, 5 passed, 5 total\n' | bash "$COUNT_SKIPS_SCRIPT" --file "$CS_FILE_FIXTURE")"
+assert_eq "--fileと標準入力の併存: --fileを優先（go形式のskips=2のまま）" "2" "$(cs_field skips "$CS_BOTHIN_OUTPUT")"
+assert_eq "--fileと標準入力の併存: runnerもgoのまま" "go" "$(cs_field runner "$CS_BOTHIN_OUTPUT")"
+
+# ---------------------------------------------------------------------------
 # 結果集計
 # ---------------------------------------------------------------------------
 
