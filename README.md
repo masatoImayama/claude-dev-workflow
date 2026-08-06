@@ -255,7 +255,12 @@ main（保護: 人間のみマージ可）
 ```
 
 - **ウェーブ**とは、依存グラフの同一レベルに属し同時に実行できるタスクの集合。統合ゲートの単位でもある
-- **WAVE_BASE** は、ウェーブ開始時点の Epic ブランチ tip。そのウェーブに属する全レーンが共有する唯一の正しい分岐元
+- **WAVE_BASE** は、ウェーブ開始時点の Epic ブランチ tip。**各レーン（generator の isolation
+  worktree）の分岐元はハーネスが決めるため WAVE_BASE とは限らない。** isolation worktree を
+  作るのはハーネスであり、run はメインリポのチェックアウトを Epic ブランチへ切り替えないため、
+  分岐元は通常メインリポのデフォルトブランチのままである。そのため generator は実装着手前に
+  `git reset --hard "$WAVE_BASE"` で自分の HEAD を明示的に合わせる
+  （`core/roles/generator.md`「渡されたベースにHEADを合わせる」参照）
 - レーン（generator の isolation worktree）は wave ブランチへ merge-base 検証つきで取り込まれ、**wave ブランチ上で統合ゲート（プロジェクトの全テスト・可読性ガード）を1回だけ通過してから** Epic ブランチへ `--ff-only` で進む
 - **Epic ブランチには統合ゲートを通ったコミットだけが載る。** 失敗しても Epic ブランチは無傷なので、`git reset --hard` や force push は不要
 - **Epic ブランチへの force push は行わない。wave ブランチは origin へ push しない**（ローカルの一時ブランチ）

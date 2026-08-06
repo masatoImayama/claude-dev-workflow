@@ -243,10 +243,21 @@ bash "${CLAUDE_PLUGIN_ROOT}/scripts/watchdog.sh" --wave --epic "$EPIC_NUM" \
 ```
 Task #<番号> を実装してください。
 - WAVE_BASE: <WAVE_BASEのコミットハッシュ>（ブランチ名ではなくこのハッシュそのものに対して検証すること）
-- 作業開始前に `git merge-base --is-ancestor <WAVE_BASE> HEAD` でベースを検証すること。
-  偽なら実装を始めず、実出力を添えて報告し停止すること
+- あなたの作業ブランチ（<LANE_BRANCH>）は Step 2 で `git checkout -B` によって WAVE_BASE から
+  作成済みであり、既に WAVE_BASE の子孫のはずである。**Claude 版の generator と同じ保証を
+  同じ手順で確認するため**、実装に着手する前に次の手順を1回だけこの順序で実行すること
+  （通常はno-opになる）。**自分のコミットを積んだ後に再実行しないこと**（手順2を再実行すると
+  積んだコミットが失われる）。
+  1) `git status --short`（空であることを確認。空でなければ実装を始めず、実出力を添えて
+     報告し停止すること）
+  2) `git reset --hard <WAVE_BASE>`（HEADをWAVE_BASEに合わせる。fetch/checkout/pullでは
+     ないためネットワーク不要）
+  3) `git merge-base --is-ancestor <WAVE_BASE> HEAD && echo BASE_OK`（偽なら実装を始めず、
+     実出力を添えて報告し停止すること）
+  4) `git log --oneline -1`（実際のHEADを報告に載せる）
+  手順1〜4の実出力を報告に含めること（自己申告にしない）
 - **`git fetch` / `git checkout` / `git pull` は実行しないこと。** 同期は run が Epic 専用
-  worktree で既に済ませており、あなたの作業ブランチ（<LANE_BRANCH>）は WAVE_BASE から分岐している
+  worktree で既に済ませている。手順2の `git reset --hard` のみが例外として許可されている
 - 作業ディレクトリ: <EPIC_WT>（ここから移動しないこと）
 - サンドボックスへのコマンド投入は `${CLAUDE_PLUGIN_ROOT}/scripts/sandbox-exec.sh` 経由で行い、
   ビルド・テストは1回の呼び出しにまとめること（分けると待ち時間が倍増する）

@@ -234,7 +234,11 @@ main (保護: 人間のみマージ可)
 ```
 
 - Epic 専用 worktree は **`.claude/worktrees/<epicN>`** に作る（`../<repo>-epicN` の兄弟は作らない）。additionalDirectories はリポジトリルート許可で足り、他リポジトリに権限が及ばない。
-- 各レーン（generator の isolation worktree）は、そのウェーブ開始時点のEpicブランチtip（`WAVE_BASE`）から分岐する
+- 各レーン（generator の isolation worktree）が実装着手前に自分のHEADを合わせるべき唯一の
+  正しい基準点が、そのウェーブ開始時点のEpicブランチtip（`WAVE_BASE`）である。isolation
+  worktree を作るのは**ハーネス**であり、その分岐元はハーネスが決めるため WAVE_BASE とは
+  限らない。そのため generator は `git reset --hard "$WAVE_BASE"` で自分の HEAD を明示的に
+  合わせてから実装に着手する（Step 3 のプロンプト雛形参照）
 - レーンは wave ブランチを経由し、**統合ゲート通過後にのみ** `--ff-only` でEpicブランチへ合流する
 - 実装・テスト・ビルドは全てDockerコンテナ内で実行する
 - 全タスク完了後、Epicブランチ→mainのPRを作成する
@@ -358,9 +362,11 @@ bash "${CLAUDE_PLUGIN_ROOT}/scripts/watchdog.sh" --wave --epic "$EPIC_NUM" \
 ```
 
 **同期はここ（ウェーブの先頭）でだけ行う。** タスクごとには行わない。この `WAVE_BASE` が、
-このウェーブに属する全レーンが共有する唯一の正しい分岐元になる。各レーン（generatorの
-isolation worktree）はこの `WAVE_BASE` から分岐するため、generator自身は
-`fetch` / `checkout` / `pull` を行わない（`core/roles/generator.md`）。
+このウェーブに属する全レーンが実装着手前に自分のHEADを合わせるべき唯一の正しい基準点になる。
+**各レーン（generatorのisolation worktree）の分岐元はハーネスが決めるため、WAVE_BASEとは
+限らない。** そのため generator は実装着手前に `git reset --hard "$WAVE_BASE"` の1コマンドで
+自分のHEADをWAVE_BASEへ明示的に合わせる（Step 3のプロンプト雛形参照）。この1コマンドを除き、
+generator自身は `fetch` / `checkout` / `pull` を行わない（`core/roles/generator.md`）。
 
 ### Step 3: サブバッチごとに generator を並列起動する
 
@@ -375,10 +381,20 @@ issue番号の小さい順に `lanes` 件ずつのサブバッチへ分割済み
 Task #[番号A] を実装してください（レーン A）。
 - Epicブランチ: [epic/epicXX/機能名]
 - WAVE_BASE: [WAVE_BASEのコミットハッシュ]（ブランチ名ではなくこのハッシュそのものに対して検証すること）
-- 作業開始前に `git merge-base --is-ancestor "[WAVE_BASE]" HEAD` でベースを検証すること。
-  偽なら実装を始めず、実出力を添えて報告し停止すること
+- **あなたの isolation worktree の分岐元は WAVE_BASE とは限らない**（worktree を作るのは
+  ハーネスであり、分岐元はハーネスが決める）。**実装に着手する前に、次の手順を1回だけ**
+  この順序で実行し、自分の HEAD を WAVE_BASE に合わせること。**自分のコミットを積んだ後に
+  再実行しないこと**（手順2を再実行すると積んだコミットが失われる）。
+  1) `git status --short`（空であることを確認。空でなければ実装を始めず、実出力を添えて
+     報告し停止すること）
+  2) `git reset --hard "[WAVE_BASE]"`（HEADをWAVE_BASEに合わせる。fetch/checkout/pullでは
+     ないためネットワーク不要）
+  3) `git merge-base --is-ancestor "[WAVE_BASE]" HEAD && echo BASE_OK`（偽なら実装を始めず、
+     実出力を添えて報告し停止すること）
+  4) `git log --oneline -1`（実際のHEADを報告に載せる）
+  手順1〜4の実出力を完了報告に含めること（自己申告にしない）
 - **`git fetch` / `git checkout` / `git pull` は実行しないこと。** 同期は run が Epic 専用
-  worktree で既に済ませており、あなたの isolation worktree は WAVE_BASE から分岐している
+  worktree で既に済ませている。手順2の `git reset --hard` のみが例外として許可されている
 - サンドボックスへのコマンド投入は `${CLAUDE_PLUGIN_ROOT}/scripts/sandbox-exec.sh` 経由で行い、
   ビルド・テストは1回の呼び出しにまとめること（分けると待ち時間が倍増する）
 - `sandbox-exec.sh` を呼ぶ際は必ず `--epic "$EPIC_NUM"` を渡すこと（例: `--epic "$EPIC_NUM" 'make test'`）

@@ -7740,6 +7740,151 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+# H1（Task #89）: レーンのHEADをWAVE_BASEに合わせてから実装させる
+#
+# `skills/run/SKILL.md:378-381`（修正前）は generator に対して「あなたの isolation
+# worktree は WAVE_BASE から分岐している」という偽の前提を伝えつつ fetch/checkout/pull を
+# 禁止しており、ウェーブ2以降で必ずベース検証が失敗する（詳細は docs/dev-workflow-handover.md
+# のH1節）。fetch/checkout/pullの禁止は維持したまま git reset --hard <WAVE_BASE> のみを
+# 明示的に許可し、実装着手前に git status --short / git reset --hard /
+# git merge-base --is-ancestor / git log --oneline -1 をこの順で実行させる。
+# ---------------------------------------------------------------------------
+
+echo ""
+echo "== H1: レーンのHEADをWAVE_BASEに合わせてから実装させる（回帰防止 #89） =="
+
+# ある1つのテキストの中で、複数の文字列がこの順序（各1回目の出現）で現れることを検査する。
+assert_order() {
+  # assert_order <説明> <検査対象テキスト> <文字列1> <文字列2> [<文字列3> ...]
+  local desc="$1" text="$2"
+  shift 2
+  local prev_line=0 cur_line ok=1 missing="" needle
+  for needle in "$@"; do
+    cur_line="$(printf '%s\n' "$text" | grep -nF -- "$needle" | head -1 | cut -d: -f1)"
+    if [ -z "$cur_line" ]; then
+      ok=0
+      missing="$needle"
+      break
+    fi
+    if [ "$cur_line" -le "$prev_line" ]; then
+      ok=0
+      missing="$needle（直前より前または同じ行）"
+      break
+    fi
+    prev_line="$cur_line"
+  done
+  if [ "$ok" -eq 1 ]; then
+    pass "$desc"
+  else
+    fail "$desc" "見つからない・順序不正: [${missing}]"
+  fi
+}
+
+# --- skills/run/SKILL.md: Step 3 プロンプト雛形に4手順がこの順で現れる ---
+RS_STEP3="$(awk '/^### Step 3:/{f=1} /^### Step 4:/{f=0} f' "${REPO_ROOT}/skills/run/SKILL.md")"
+
+assert_order "SKILL.md: Step 3 雛形に git status --short → git reset --hard → git merge-base --is-ancestor → git log --oneline -1 がこの順で現れる（#89）" \
+  "$RS_STEP3" \
+  "git status --short" "git reset --hard" "git merge-base --is-ancestor" "git log --oneline -1"
+
+case "$RS_STEP3" in
+  *'あなたの isolation worktree は WAVE_BASE から分岐している'*)
+    fail "SKILL.md: Step 3 雛形から偽の前提（isolation worktreeはWAVE_BASEから分岐している）が消えている（#89）" \
+      "$RS_STEP3" ;;
+  *)
+    pass "SKILL.md: Step 3 雛形から偽の前提（isolation worktreeはWAVE_BASEから分岐している）が消えている（#89）" ;;
+esac
+
+case "$RS_STEP3" in
+  *'git fetch'*'git checkout'*'git pull'*'実行しないこと'*)
+    pass "SKILL.md: Step 3 雛形に fetch/checkout/pull 禁止の記述が残っている（#89）" ;;
+  *)
+    fail "SKILL.md: Step 3 雛形に fetch/checkout/pull 禁止の記述が残っている（#89）" "$RS_STEP3" ;;
+esac
+
+# --- skills-codex/dev-workflow-run/SKILL.md: Step 3 にも同じ4手順がこの順で現れる ---
+CRS_STEP3="$(awk '/^### Step 3:/{f=1} /^### Step 4:/{f=0} f' "${REPO_ROOT}/skills-codex/dev-workflow-run/SKILL.md")"
+
+assert_order "SKILL.md(codex): Step 3 に git status --short → git reset --hard → git merge-base --is-ancestor → git log --oneline -1 がこの順で現れる（#89）" \
+  "$CRS_STEP3" \
+  "git status --short" "git reset --hard" "git merge-base --is-ancestor" "git log --oneline -1"
+
+case "$CRS_STEP3" in
+  *'git fetch'*'git checkout'*'git pull'*'実行しないこと'*)
+    pass "SKILL.md(codex): Step 3 に fetch/checkout/pull 禁止の記述が残っている（#89）" ;;
+  *)
+    fail "SKILL.md(codex): Step 3 に fetch/checkout/pull 禁止の記述が残っている（#89）" "$CRS_STEP3" ;;
+esac
+
+# --- core/roles/generator.md: 「0. ...」節に同じ4手順・1回だけ・再実行しない旨がある ---
+GEN_STEP0="$(awk '/^### 0\. /{f=1} /^### 1\. /{f=0} f' "${REPO_ROOT}/core/roles/generator.md")"
+
+if [ -z "$GEN_STEP0" ]; then
+  fail "core/roles/generator.md: 「0. 」節が見つかる（#89）" "節が抽出できませんでした"
+else
+  pass "core/roles/generator.md: 「0. 」節が見つかる（#89）"
+fi
+
+# 手順の順序は「実行する具体的なコマンド列」（```bash フェンス内）だけで検査する。
+# 節の冒頭には reset --hard の許可理由を説明する散文（同じ文字列を含む）があるため、
+# 節全体を対象にすると散文側の言及に引きずられて誤検知する。
+GEN_STEP0_FENCE="$(printf '%s\n' "$GEN_STEP0" | awk '/^```bash/{f=1;next} /^```/{f=0} f')"
+
+assert_order "core/roles/generator.md: 「0. 」節のコマンド列に git status --short → git reset --hard → git merge-base --is-ancestor → git log --oneline -1 がこの順で現れる（#89）" \
+  "$GEN_STEP0_FENCE" \
+  "git status --short" "git reset --hard" "git merge-base --is-ancestor" "git log --oneline -1"
+
+case "$GEN_STEP0" in
+  *'実装着手前に'*'1回だけ'*)
+    pass "core/roles/generator.md: 「0. 」節に『実装着手前に1回だけ』の明記がある（#89）" ;;
+  *)
+    fail "core/roles/generator.md: 「0. 」節に『実装着手前に1回だけ』の明記がある（#89）" "$GEN_STEP0" ;;
+esac
+
+case "$GEN_STEP0" in
+  *'コミットを積んだ後に再実行してはならない'*)
+    pass "core/roles/generator.md: 「0. 」節に『コミット後に再実行してはならない』の明記がある（#89）" ;;
+  *)
+    fail "core/roles/generator.md: 「0. 」節に『コミット後に再実行してはならない』の明記がある（#89）" "$GEN_STEP0" ;;
+esac
+
+case "$GEN_STEP0" in
+  *'`git reset --hard <WAVE_BASE>` のみを例外として許可する'*)
+    pass "core/roles/generator.md: 「0. 」節に reset --hard のみを例外として許可する旨の明記がある（#89）" ;;
+  *)
+    fail "core/roles/generator.md: 「0. 」節に reset --hard のみを例外として許可する旨の明記がある（#89）" "$GEN_STEP0" ;;
+esac
+
+case "$GEN_STEP0" in
+  *'`git fetch`'*'`git checkout`'*'`git pull`'*'実行しない'*)
+    pass "core/roles/generator.md: 「0. 」節に fetch/checkout/pull 禁止の記述が残っている（#89）" ;;
+  *)
+    fail "core/roles/generator.md: 「0. 」節に fetch/checkout/pull 禁止の記述が残っている（#89）" "$GEN_STEP0" ;;
+esac
+
+# --- 偽の前提（「isolation worktree は WAVE_BASE から分岐している」）が
+#     skills/run/SKILL.md・core/roles/generator.md・README.md のいずれにも無い（grepで0件） ---
+for f in "skills/run/SKILL.md" "core/roles/generator.md" "README.md"; do
+  if grep -Fq 'isolation worktree は WAVE_BASE から分岐している' "${REPO_ROOT}/${f}"; then
+    fail "${f}: 「isolation worktree は WAVE_BASE から分岐している」という偽の前提が消えている（#89）" \
+      "$(grep -n 'isolation worktree は WAVE_BASE から分岐している' "${REPO_ROOT}/${f}")"
+  else
+    pass "${f}: 「isolation worktree は WAVE_BASE から分岐している」という偽の前提が消えている（#89）"
+  fi
+done
+
+# --- README.md「ウェーブと wave ブランチ」節: 分岐元がハーネス依存であることに触れている ---
+README_WAVE_SECTION="$(awk '/^### ウェーブと wave ブランチ/{f=1} /^### `--ff-only`/{f=0} f' "${REPO_ROOT}/README.md")"
+
+case "$README_WAVE_SECTION" in
+  *'ハーネスが決めるため'*'WAVE_BASE とは限らない'*)
+    pass "README.md: 「ウェーブと wave ブランチ」節が分岐元はハーネス依存でWAVE_BASEとは限らない旨に改められている（#89）" ;;
+  *)
+    fail "README.md: 「ウェーブと wave ブランチ」節が分岐元はハーネス依存でWAVE_BASEとは限らない旨に改められている（#89）" \
+      "$README_WAVE_SECTION" ;;
+esac
+
+# ---------------------------------------------------------------------------
 # 結果集計
 # ---------------------------------------------------------------------------
 

@@ -37,33 +37,55 @@ run が Epic 開始時に1回だけ実行済みである（Epic issue 本文の 
 不備は run・planner 側で直すべき問題であり、generator が肩代わりすると「毎タスク繰り返す」
 状態に逆戻りする。
 
-### 0. 渡されたベースに対して検証する（fetch/checkout/pull は行わない）
+### 0. 渡されたベースにHEADを合わせる（実装着手前に1回だけ。fetch/checkout/pullは行わない）
 
-**`git fetch` / `git checkout` / `git pull` は実行しない。** 同期は run が epic worktree で
-済ませており、generator の isolation worktree はそこ（run から渡された `WAVE_BASE` のコミット）
-から分岐しているため、generator 側での同期はそもそも不要である。
+**あなたの isolation worktree の分岐元は WAVE_BASE とは限らない。** isolation worktree を
+作るのは**ハーネス**であり、その分岐元は**ハーネス起動時点のメインリポの現在のチェックアウト**
+である。run は「メインリポのチェックアウトを epic ブランチに切り替えてはならない」と定めているため、
+メインリポは通常デフォルトブランチに留まり続ける。ウェーブ1では偶然一致することがあるが、
+ウェーブ2以降（epic ブランチが前ウェーブの成果を含んで進んでいる）は**必ず不一致になる**。
+そのため、実装に着手する前に自分の HEAD を渡された `WAVE_BASE` へ明示的に合わせる。
+
+**`git fetch` / `git checkout` / `git pull` は実行しない。** ただし
+**`git reset --hard <WAVE_BASE>` のみを例外として許可する。**
 
 - `git checkout "${EPIC_BRANCH}"` は isolation worktree では**必ず失敗する**。epic worktree が
   同じブランチを checkout 済みのため（実機検証: `fatal: '...' is already used by worktree at
   '...'` / exit 128）
 - `git pull` は成功しうるが害がある。epic tip が動いていた場合に自分の merge-base を
-  `WAVE_BASE` から動かし、`scripts/merge-lane.sh` の完全一致検証を偽陰性にする
+  `WAVE_BASE` から動かし、`scripts/merge-lane.sh` の完全一致検証を偽陰性にする。加えて
+  ネットワーク同期を伴い、「リモート同期をレーンにさせない」という禁止の意図に反する
 - `git fetch` は大リポジトリで毎タスクの固定コストになる
+- `git reset --hard <WAVE_BASE>` はこれらと異なる。対象コミットは worktree 間で共有される
+  オブジェクトストアに既に存在するため**ネットワークアクセスは不要**であり、「リモート同期を
+  させない」という禁止の意図と矛盾しない
 
-代わりに、**渡された `WAVE_BASE`（run から渡されたコミットハッシュ）に対する検証を1回だけ**行う。
-実装を始める前に、自分の HEAD がその `WAVE_BASE` の子孫であることを機械的に確認する:
+次の手順を**この順序で**実行する。
 
 ```bash
-# run から渡されたベースのコミットハッシュに対して検証する（同期は行わない）
-git merge-base --is-ancestor "<WAVE_BASE>" HEAD || {
-  echo "ERROR: 指定ベース <WAVE_BASE> の子孫ではありません"
-  echo "実際の分岐元: $(git merge-base "<WAVE_BASE>" HEAD)"
-  exit 1
-}
+# 1) 作業ツリーが空であることを確認する（新規レーンなら空のはず）
+git status --short
+#    空でなければ実装を始めず、実出力を添えて報告し停止する（安全弁。手順2は空でない場合に
+#    未コミットの変更を消す）
+
+# 2) HEAD を WAVE_BASE に合わせる（fetch/checkout/pull ではない。ネットワーク不要）
+git reset --hard "<WAVE_BASE>"
+
+# 3) 検証する
+git merge-base --is-ancestor "<WAVE_BASE>" HEAD && echo BASE_OK
+
+# 4) 実際の HEAD を報告に載せる
+git log --oneline -1
 ```
 
-この検証に失敗した場合、**自力で直そうとせず、上記の出力をそのまま報告して停止する。**
+**この手順は実装着手前に1回だけ行う。自分のコミットを積んだ後に再実行してはならない**
+（`git reset --hard` を積んだコミットの後に再実行すると、その成果が消える）。手順1の
+「作業ツリーが空であること」の確認が、その安全弁になっている。
+
+手順3の検証に失敗した場合、**自力で直そうとせず、実出力をそのまま報告して停止する。**
 誤ったベースの上で実装を続けると、先行タスクの変更を打ち消す差分ができる。
+
+手順1〜4の**実出力**を完了報告に含めること（自己申告にしない）。
 
 ### 1. タスクの確認
 
@@ -245,9 +267,13 @@ git commit -m "feat: [内容] (#[task番号])"
 ## Task #[番号] 完了
 
 ### ベース（実出力を貼る。自己申告しない）
-$ git merge-base --is-ancestor [WAVE_BASE] HEAD && echo OK
+$ git status --short
 [実出力]
-$ git log --oneline -1 $(git merge-base [WAVE_BASE] HEAD)
+$ git reset --hard [WAVE_BASE]
+[実出力]
+$ git merge-base --is-ancestor [WAVE_BASE] HEAD && echo BASE_OK
+[実出力]
+$ git log --oneline -1
 [実出力]
 
 ### 変更ファイル
