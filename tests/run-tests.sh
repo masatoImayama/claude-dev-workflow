@@ -2767,27 +2767,39 @@ RG35_NO_TRAILING_NEWLINE_EXIT=$?
 assert_exit_code "末尾に改行の無いフックJSONでも最終行(file_path)を取りこぼさず違反を検出する" 2 "$RG35_NO_TRAILING_NEWLINE_EXIT"
 
 # --- PATHから timeout/gtimeout を排除した環境を構築する ---
-# 特定のディレクトリを丸ごとPATHから外すと、同じディレクトリに同居する
-# grep/sed/awk/git 等の必須コマンドまで失われてしまうため、ファイル名単位で
-# timeout/gtimeout だけを除外したシンボリックリンク集を新設のディレクトリに作る。
+# 目的は「timeout/gtimeoutが見つからないPATH」を作ることだけなので、以下で
+# 実行する check-readability.sh が実際に必要とするコマンド（grep/sed/awk/git/head）
+# に加えて、保守的に使われうるもの（bash/env/cat/tr/printf）だけを対象にする。
+# timeout/gtimeout を除外する目的はこれまでと変わらない。
+#
+# 以前はPATH上の全ファイルを `ln -sf` でリンクしていたが、Windows(Git Bash/MSYS)
+# では `ln -s` がシンボリックリンクではなく実体コピーになり、PATH上の実行ファイル
+# （数百MB級のものを含む）を丸ごと複製してしまい、1回の実行で最大36GBを消費して
+# ディスクを枯渇させた（#78）。
+#
+# 対象をホワイトリスト化しても、コピー先に本体だけを置くと Windows(MSYS) では
+# 依存する共有ライブラリ（msys-2.0.dll 等、実行ファイルと同じディレクトリを見に
+# 行く）が見つからずロードに失敗する。実行ファイル自体は元の場所から動かさず、
+# 元の絶対パスをそのまま呼び出すだけの数十バイトのシムスクリプトを置くことで、
+# コピー量をほぼゼロにしつつ依存ライブラリの問題も同時に回避する。
 build_path_without_timeout() {
   local dest="$1"
-  local IFS=':'
-  local p f b
-  for p in $PATH; do
-    [ -n "$p" ] && [ -d "$p" ] || continue
-    for f in "$p"/*; do
-      [ -e "$f" ] || continue
-      b="$(basename "$f")"
-      case "$b" in
-        timeout|gtimeout) continue ;;
-      esac
-      [ -e "${dest}/${b}" ] || ln -sf "$f" "${dest}/${b}" 2>/dev/null
-    done
+  local cmd cmd_path
+  for cmd in bash grep sed awk git env cat head tr printf; do
+    cmd_path="$(command -v "$cmd" 2>/dev/null)" || continue
+    [ -n "$cmd_path" ] && [ -e "$cmd_path" ] || continue
+    [ -e "${dest}/${cmd}" ] && continue
+    printf '#!/bin/sh\nexec "%s" "$@"\n' "$cmd_path" > "${dest}/${cmd}" 2>/dev/null
+    chmod +x "${dest}/${cmd}" 2>/dev/null
   done
 }
 
 RG35_NOTIMEOUT_DIR="$(mktemp -d "${TMPDIR:-/tmp}/dw-test-notimeout-bin.XXXXXX")"
+# 正常終了・異常終了（割り込み等）のいずれでも必ず削除する。長いファイル名
+# （DLL等）で個々の削除が失敗してもテスト全体を失敗させない（#78）。
+# この trap は RG35 のテストブロックを抜けた直後に明示的に解除する
+# （tests/run-tests.sh 内の他の EXIT trap（wd_cleanup_all）と共存させるため）。
+trap 'rm -rf "$RG35_NOTIMEOUT_DIR" 2>/dev/null || true' EXIT
 build_path_without_timeout "$RG35_NOTIMEOUT_DIR"
 RG35_BASH_BIN="$(command -v bash)"
 
@@ -2859,14 +2871,26 @@ assert_exit_code "timeoutコマンドがPATHに無くても、入力が来ない
   0 "$RG35_NOINPUT_EXIT"
 
 # --- timeoutコマンドがPATHに無くても、stdinを開いたまま--gitを叩けば即座に返る（ハング再発なし） ---
+# RG35_TMP_REPO には未追跡の違反ファイル（violation.txt等、上のテストで作成）が残っている
+# ため、--git で検査すると（MAX_BASE64を上書きしていない既定値2000のもとでは）violation.txt
+# 自体が正規表現の対象文字数を超えて違反検出（exit 2）になり得る。ここで確認したいのは
+# 「ハングしないこと」だけなので、RG31（#31, tests/run-tests.sh:2526-2530）と同様に、
+# 違反ファイルの無いクリーンな一時リポジトリを別途使う。
+RG35_HANG_REPO="$(make_temp_repo)"
 RG35_GIT_HANG_EXIT=0
 (
-  cd "$RG35_TMP_REPO" || exit 1
+  cd "$RG35_HANG_REPO" || exit 1
   timeout 8 env PATH="$RG35_NOTIMEOUT_DIR" "$RG35_BASH_BIN" "$CHECK_READABILITY_SCRIPT" --git \
     < <(sleep 30) >/dev/null 2>&1
 )
 RG35_GIT_HANG_EXIT=$?
 assert_exit_code "timeoutコマンドがPATHに無くても、stdinを開いたまま--gitを叩けば即座に返る" 0 "$RG35_GIT_HANG_EXIT"
+
+# RG35用の一時PATHディレクトリはもう不要なので、ここで確実に片付ける。
+# 以降の実行で他のEXIT trap（wd_cleanup_all等）が設定されても上書き競合しないよう、
+# 自分のtrapもここで明示的に解除する。
+rm -rf "$RG35_NOTIMEOUT_DIR" 2>/dev/null || true
+trap - EXIT
 
 # ---------------------------------------------------------------------------
 # plan-waves.sh（依存グラフとウェーブ分解、Task #15、Epic #14 仕様書 5.2）
@@ -6325,13 +6349,13 @@ DOC55_README="${REPO_ROOT}/README.md"
 DOC55_AGENT_GENERATOR="${REPO_ROOT}/agents/generator.md"
 DOC55_CODEX_AGENT_GENERATOR="${REPO_ROOT}/codex-agents/generator.toml"
 
-# --- 両 plugin.json のバージョンが 0.14.0 で一致している（#77でv0.13.0から更新） ---
+# --- 両 plugin.json のバージョンが 0.14.1 で一致している（#78 でパッチ更新） ---
 
 DOC55_CLAUDE_VERSION="$(grep -m1 '"version"' "$DOC55_CLAUDE_PLUGIN_JSON" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+')"
 DOC55_CODEX_VERSION="$(grep -m1 '"version"' "$DOC55_CODEX_PLUGIN_JSON" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+')"
 
-assert_eq ".claude-plugin/plugin.json のバージョンが0.14.0である" "0.14.0" "$DOC55_CLAUDE_VERSION"
-assert_eq ".codex-plugin/plugin.json のバージョンが0.14.0である" "0.14.0" "$DOC55_CODEX_VERSION"
+assert_eq ".claude-plugin/plugin.json のバージョンが0.14.1である" "0.14.1" "$DOC55_CLAUDE_VERSION"
+assert_eq ".codex-plugin/plugin.json のバージョンが0.14.1である" "0.14.1" "$DOC55_CODEX_VERSION"
 assert_eq "両plugin.jsonのバージョンが一致している" "$DOC55_CLAUDE_VERSION" "$DOC55_CODEX_VERSION"
 
 # --- core/instructions.md に watchdog の3点の記述がある ---
@@ -7568,10 +7592,10 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# ドキュメント更新・v0.14.0・両アダプタ再生成（#77）
+# ドキュメント更新・v0.14.x・両アダプタ再生成（#77）
 # ---------------------------------------------------------------------------
 
-echo "== ドキュメント更新・v0.14.0・両アダプタ再生成（#77） =="
+echo "== ドキュメント更新・v0.14.x・両アダプタ再生成（#77） =="
 
 DOC77_CLAUDE_PLUGIN_JSON="${REPO_ROOT}/.claude-plugin/plugin.json"
 DOC77_CODEX_PLUGIN_JSON="${REPO_ROOT}/.codex-plugin/plugin.json"
@@ -7590,7 +7614,10 @@ else
     "claude=[${DOC77_CLAUDE_VERSION}] codex=[${DOC77_CODEX_VERSION}]"
 fi
 
-assert_eq "両plugin.jsonのversionが0.14.0である（#77）" "0.14.0" "$DOC77_CLAUDE_VERSION"
+# 具体的なバージョン値の固定は #55 ブロック（.claude-plugin / .codex-plugin の version を
+# 直接 assert する箇所）が担っている。ここで同じ値を二重に固定するとリリースのたびに
+# 3箇所を直すことになり、実際に v0.14.1 への更新でそれを踏んだため、重複を削った。
+# 本ブロックの責務は「片方だけ上がる事故の検出」（直上の一致テスト）に限る。
 
 # --- README.md に「任意依存の外部ツール」節があり、4点（任意依存・未導入時の挙動・入れ方・外す基準）が書かれている ---
 
