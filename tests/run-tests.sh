@@ -3093,6 +3093,68 @@ PW_ENV_LANES_OUTPUT="$(DEV_WORKFLOW_MAX_LANES=5 bash "$PLAN_WAVES_SCRIPT" --from
 assert_eq "DEV_WORKFLOW_MAX_LANES で既定の lanes を上書きできる" "5" \
   "$(printf '%s\n' "$PW_ENV_LANES_OUTPUT" | awk -F'\t' '$1=="lanes"{print $2}')"
 
+# --- ケース11: 前提未宣言の集計警告（missing-deps-summary、Task #92） ---
+# 全件宣言漏れ（PW_SERIAL_FIXTUREを再利用、既定lanes=3）: 実効並列度は1（完全逐次）に落ちる
+PW_DEPSWARN_ALL_PRINT="$(bash "$PLAN_WAVES_SCRIPT" --from-file "$PW_SERIAL_FIXTURE" --print)"
+case "$PW_DEPSWARN_ALL_PRINT" in
+  *"前提未宣言が 3 件あります（対象タスク 3 件中）"*)
+    pass "missing-deps-summary --print: 件数と対象タスク数が出る（全件宣言漏れ）" ;;
+  *) fail "missing-deps-summary --print: 件数と対象タスク数が出る（全件宣言漏れ）" "output=[${PW_DEPSWARN_ALL_PRINT}]" ;;
+esac
+case "$PW_DEPSWARN_ALL_PRINT" in
+  *"実効並列度は 1 です（指定 lanes=3）"*)
+    pass "missing-deps-summary --print: 実効並列度1・指定lanes=3が出る（完全逐次）" ;;
+  *) fail "missing-deps-summary --print: 実効並列度1・指定lanes=3が出る（完全逐次）" "output=[${PW_DEPSWARN_ALL_PRINT}]" ;;
+esac
+case "$PW_DEPSWARN_ALL_PRINT" in
+  *"- 前提: #N"*"- 前提: なし"*)
+    pass "missing-deps-summary --print: 対処法（- 前提: #N / - 前提: なし）が出る" ;;
+  *) fail "missing-deps-summary --print: 対処法（- 前提: #N / - 前提: なし）が出る" "output=[${PW_DEPSWARN_ALL_PRINT}]" ;;
+esac
+
+assert_eq "missing-deps-summary 機械可読: warn missing-deps-summary 3 3 1 3（全件宣言漏れ）" "1" \
+  "$(printf '%s\n' "$PW_SERIAL_OUTPUT" | grep -c '^warn	missing-deps-summary	3	3	1	3$')"
+
+# 集計行を追加しても既存の warn missing-deps 行は全件・従来書式のまま出る（後方互換）
+assert_eq "missing-deps-summary 追加後も warn missing-deps は3件とも従来書式で出る" "3" \
+  "$(printf '%s\n' "$PW_SERIAL_OUTPUT" | grep -c '^warn	missing-deps	')"
+
+# --- ケース12: 一部だけ宣言漏れ（実効並列度が1にならないケース。lanes=2で2に留まる） ---
+PW_DEPSWARN_PARTIAL_FIXTURE="$(mktemp "${TMPDIR:-/tmp}/dw-test-pw-depswarn-partial.XXXXXX")"
+cat > "$PW_DEPSWARN_PARTIAL_FIXTURE" <<'FIXTURE'
+910	open
+911	open
+912	open	- 前提: なし
+913	open	- 前提: #912
+FIXTURE
+
+PW_DEPSWARN_PARTIAL_OUTPUT="$(bash "$PLAN_WAVES_SCRIPT" --from-file "$PW_DEPSWARN_PARTIAL_FIXTURE" --lanes 2)"
+assert_eq "一部宣言漏れ: warn missing-deps-summary 2 4 2 2（実効並列度2で1にならない）" "1" \
+  "$(printf '%s\n' "$PW_DEPSWARN_PARTIAL_OUTPUT" | grep -c '^warn	missing-deps-summary	2	4	2	2$')"
+assert_eq "一部宣言漏れ: 宣言漏れした#910と#911だけにwarn missing-depsが出る" "2" \
+  "$(printf '%s\n' "$PW_DEPSWARN_PARTIAL_OUTPUT" | grep -c '^warn	missing-deps	91[01]$')"
+
+# --- ケース13: 宣言漏れが0件のときは missing-deps-summary 行も前提未宣言の警告も出ない（後方互換） ---
+PW_DEPSWARN_NONE_FIXTURE="$(mktemp "${TMPDIR:-/tmp}/dw-test-pw-depswarn-none.XXXXXX")"
+cat > "$PW_DEPSWARN_NONE_FIXTURE" <<'FIXTURE'
+920	open	- 前提: なし
+921	open	- 前提: #920
+FIXTURE
+
+PW_DEPSWARN_NONE_OUTPUT="$(bash "$PLAN_WAVES_SCRIPT" --from-file "$PW_DEPSWARN_NONE_FIXTURE")"
+if printf '%s\n' "$PW_DEPSWARN_NONE_OUTPUT" | grep -q '^warn	missing-deps-summary	'; then
+  fail "宣言漏れ0件: missing-deps-summary 行が出ない（後方互換）" "output=[${PW_DEPSWARN_NONE_OUTPUT}]"
+else
+  pass "宣言漏れ0件: missing-deps-summary 行が出ない（後方互換）"
+fi
+
+PW_DEPSWARN_NONE_PRINT="$(bash "$PLAN_WAVES_SCRIPT" --from-file "$PW_DEPSWARN_NONE_FIXTURE" --print)"
+if printf '%s\n' "$PW_DEPSWARN_NONE_PRINT" | grep -q '前提未宣言'; then
+  fail "宣言漏れ0件: --print に前提未宣言の警告が出ない（後方互換）" "output=[${PW_DEPSWARN_NONE_PRINT}]"
+else
+  pass "宣言漏れ0件: --print に前提未宣言の警告が出ない（後方互換）"
+fi
+
 # --- ケース11: --epic に非数値を渡すと exit 2（Task #39: sandbox-exec.sh の --epic とは
 #     別契約で、plan-waves.sh の --epic は数値のEpic issue番号でなければならない） ---
 bash "$PLAN_WAVES_SCRIPT" --epic epic14 >/dev/null 2>&1
