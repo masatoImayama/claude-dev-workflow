@@ -8481,6 +8481,149 @@ case "$README_PREP_SECTION" in
 esac
 
 # ---------------------------------------------------------------------------
+# H6-b（Task #95）: run の後片付けで当該 Epic 分のレーン worktree を削除する
+#
+# 前提タスク #93 で新設した scripts/cleanup-lane-worktrees.sh を run のクリーンアップ節に
+# 結線したことを機械的に検査する。スクリプト自体の振る舞い（削除/skip の判定）は #93 の
+# テスト（上の「cleanup-lane-worktrees.sh」節）で検証済みなので、ここでは SKILL.md /
+# README.md の記述内容だけを見る。
+# ---------------------------------------------------------------------------
+
+echo ""
+echo "== H6-b: runの後片付けで当該Epic分のレーンworktreeを削除する（#95） =="
+
+# --- skills/run/SKILL.md: 「isolation worktree はハーネスが自動整理する」という誤った
+#     断定が消えている（#93以前の原文そのまま） ---
+if grep -Fq -- 'isolation worktree（`.claude/worktrees/agent-*`）はハーネスが自動整理する' \
+  "${REPO_ROOT}/skills/run/SKILL.md"; then
+  fail "SKILL.md: 『isolation worktreeはハーネスが自動整理する』という誤った記述が消えている（#95）" \
+    "$(grep -n -- 'ハーネスが自動整理する' "${REPO_ROOT}/skills/run/SKILL.md")"
+else
+  pass "SKILL.md: 『isolation worktreeはハーネスが自動整理する』という誤った記述が消えている（#95）"
+fi
+
+# --- skills/run/SKILL.md: 「worktree クリーンアップ」節を切り出す ---
+H6_RS_CLEANUP="$(awk '/^## worktree クリーンアップ/{f=1} /^## 自律動作ポリシー（YOLOモード）/{f=0} f' \
+  "${REPO_ROOT}/skills/run/SKILL.md")"
+
+if [ -z "$H6_RS_CLEANUP" ]; then
+  fail "SKILL.md: 『worktree クリーンアップ』節が見つかる（前提）（#95）" "節が空でした"
+else
+  pass "SKILL.md: 『worktree クリーンアップ』節が見つかる（前提）（#95）"
+fi
+
+# --- クリーンアップ節が cleanup-lane-worktrees.sh を --epic-branch / --lane-branch 付きで呼ぶ ---
+case "$H6_RS_CLEANUP" in
+  *'cleanup-lane-worktrees.sh'*'--epic-branch'*'--lane-branch'*)
+    pass "SKILL.md: クリーンアップ節が cleanup-lane-worktrees.sh を --epic-branch と --lane-branch 付きで呼んでいる（#95）" ;;
+  *)
+    fail "SKILL.md: クリーンアップ節が cleanup-lane-worktrees.sh を --epic-branch と --lane-branch 付きで呼んでいる（#95）" \
+      "$H6_RS_CLEANUP" ;;
+esac
+
+# --- 削除に失敗してもrun全体を落とさない（|| true 等） ---
+case "$H6_RS_CLEANUP" in
+  *'cleanup-lane-worktrees.sh'*'|| true'*)
+    pass "SKILL.md: cleanup-lane-worktrees.sh の呼び出しが失敗してもrun全体を止めない（|| true）（#95）" ;;
+  *)
+    fail "SKILL.md: cleanup-lane-worktrees.sh の呼び出しが失敗してもrun全体を止めない（|| true）（#95）" \
+      "$H6_RS_CLEANUP" ;;
+esac
+
+# --- 他Epicのworktreeには触れない旨が明記されている ---
+case "$H6_RS_CLEANUP" in
+  *'他Epic'*'触れない'*)
+    pass "SKILL.md: 他Epicのレーンworktreeには触れない旨が明記されている（#95）" ;;
+  *)
+    fail "SKILL.md: 他Epicのレーンworktreeには触れない旨が明記されている（#95）" \
+      "$H6_RS_CLEANUP" ;;
+esac
+
+# --- 取り込めなかったレーンは削除されない（not-merged）旨が明記されている ---
+case "$H6_RS_CLEANUP" in
+  *'not-merged'*)
+    pass "SKILL.md: 取り込めなかったレーンは削除されない（not-merged）旨が明記されている（#95）" ;;
+  *)
+    fail "SKILL.md: 取り込めなかったレーンは削除されない（not-merged）旨が明記されている（#95）" \
+      "$H6_RS_CLEANUP" ;;
+esac
+
+# --- 人間向けの棚卸し導線（git worktree list と --dry-run）が案内されている ---
+case "$H6_RS_CLEANUP" in
+  *'git worktree list'*'--dry-run'*)
+    pass "SKILL.md: 人間向けの棚卸し導線（git worktree list と --dry-run）が案内されている（#95）" ;;
+  *)
+    fail "SKILL.md: 人間向けの棚卸し導線（git worktree list と --dry-run）が案内されている（#95）" \
+      "$H6_RS_CLEANUP" ;;
+esac
+
+# --- 既存の警告（symlink解除・Epic専用worktreeの削除）が消えずに残っている（統合による破壊が無いこと） ---
+case "$H6_RS_CLEANUP" in
+  *'symlink越しに実体ファイルが削除される'*'git worktree remove "$EPIC_WT" --force'*)
+    pass "SKILL.md: 既存のsymlink警告・Epic専用worktree削除の記述が壊れずに残っている（#95）" ;;
+  *)
+    fail "SKILL.md: 既存のsymlink警告・Epic専用worktree削除の記述が壊れずに残っている（#95）" \
+      "$H6_RS_CLEANUP" ;;
+esac
+
+# --- skills/run/SKILL.md に駆動先プロジェクト固有の値（master 等）をハードコードしていない ---
+case "$H6_RS_CLEANUP" in
+  *'master'*)
+    fail "SKILL.md: クリーンアップ節に駆動先プロジェクト固有の値（master）をハードコードしていない（#95）" \
+      "$H6_RS_CLEANUP" ;;
+  *)
+    pass "SKILL.md: クリーンアップ節に駆動先プロジェクト固有の値（master）をハードコードしていない（#95）" ;;
+esac
+
+# --- skills-codex/dev-workflow-run/SKILL.md: Codexでは該当なしである旨が明記されている ---
+H6_CRS_CLEANUP="$(awk '/^## クリーンアップ（worktree）/{f=1} /^## 自律動作ポリシー/{f=0} f' \
+  "${REPO_ROOT}/skills-codex/dev-workflow-run/SKILL.md")"
+
+case "$H6_CRS_CLEANUP" in
+  *'該当なし'*'サブエージェント専用worktree'*)
+    pass "SKILL.md(codex): レーンworktreeの片付けはCodexでは該当なしである旨が明記されている（#95）" ;;
+  *)
+    fail "SKILL.md(codex): レーンworktreeの片付けはCodexでは該当なしである旨が明記されている（#95）" \
+      "$H6_CRS_CLEANUP" ;;
+esac
+
+# --- skills-codex/dev-workflow-run/SKILL.md: 既存のEpic worktree削除手順は壊れていない ---
+case "$H6_CRS_CLEANUP" in
+  *'git worktree remove ".codex/worktrees/${EPIC_NUM}" --force'*'git worktree prune'*)
+    pass "SKILL.md(codex): 既存のEpic worktree削除手順（node_modules symlink解除・remove・prune）が壊れずに残っている（#95）" ;;
+  *)
+    fail "SKILL.md(codex): 既存のEpic worktree削除手順（node_modules symlink解除・remove・prune）が壊れずに残っている（#95）" \
+      "$H6_CRS_CLEANUP" ;;
+esac
+
+# --- README.md: 「worktree運用の注意」節にレーンworktreeの蓄積とcleanup-lane-worktrees.shが書かれている ---
+H6_README_SECTION="$(awk '/^### worktree運用の注意/{f=1} /^## 並列実行（ウェーブ実行）/{f=0} f' \
+  "${REPO_ROOT}/README.md")"
+
+if [ -z "$H6_README_SECTION" ]; then
+  fail "README.md: 『worktree運用の注意』節が見つかる（前提）（#95）" "節が空でした"
+else
+  pass "README.md: 『worktree運用の注意』節が見つかる（前提）（#95）"
+fi
+
+case "$H6_README_SECTION" in
+  *'蓄積'*'cleanup-lane-worktrees.sh'*)
+    pass "README.md: 『worktree運用の注意』節にレーンworktreeの蓄積とcleanup-lane-worktrees.shが書かれている（#95）" ;;
+  *)
+    fail "README.md: 『worktree運用の注意』節にレーンworktreeの蓄積とcleanup-lane-worktrees.shが書かれている（#95）" \
+      "$H6_README_SECTION" ;;
+esac
+
+# --- README.md: 既存のsymlink警告（#87由来）は消えずに残っている ---
+case "$H6_README_SECTION" in
+  *'symlink越しにメインリポの実体ファイルを削除する'*)
+    pass "README.md: 既存のsymlink警告が壊れずに残っている（#95）" ;;
+  *)
+    fail "README.md: 既存のsymlink警告が壊れずに残っている（#95）" \
+      "$H6_README_SECTION" ;;
+esac
+
+# ---------------------------------------------------------------------------
 # 結果集計
 # ---------------------------------------------------------------------------
 

@@ -214,6 +214,14 @@ main (保護: 人間のみマージ可)
 
 `node_modules` 等がsymlinkの場合、`git worktree remove --force` がsymlink越しにメインリポの実体ファイルを削除する。worktree削除前に必ずsymlinkを解除すること。
 
+各レーン（generatorのisolation worktree、`.claude/worktrees/agent-*`）は変更を加えた（＝コミットを持つ）ものは自動整理されず、Epicを重ねるごとに蓄積する。`git worktree prune`は登録が壊れたものしか掃除しないため、実在するディレクトリは残り続ける。`scripts/cleanup-lane-worktrees.sh`はrunの完了時に、当該Epicで使ったレーンworktreeのうちEpicブランチへ取り込み済みのものだけを削除する（他Epicの分やまだ取り込まれていない分には触れない）。
+
+```bash
+git worktree list                                          # 残存worktreeの棚卸し
+bash scripts/cleanup-lane-worktrees.sh --epic-branch <ブランチ> \
+  --lane-branch <ブランチ> [--lane-branch <ブランチ> ...] --dry-run   # 削除対象と判定理由だけ確認
+```
+
 ## 並列実行（ウェーブ実行）
 
 `/dev-workflow:run` は Task issue が宣言した依存関係だけを根拠に、依存の無いタスクを**ウェーブ単位で並列実行**する。1タスクずつ直列に流していた従来方式に対し、独立したタスクの待ち時間を短縮する。

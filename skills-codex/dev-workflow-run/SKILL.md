@@ -671,6 +671,11 @@ git worktree remove ".codex/worktrees/${EPIC_NUM}" --force 2>/dev/null || true
 git worktree prune
 ```
 
+**`scripts/cleanup-lane-worktrees.sh`（レーンworktreeの片付け）は該当なし。** Codex の
+generatorはサブエージェント専用worktreeを持たず、Epic worktree（`<EPIC_WT>`）で直接作業する
+ため、Claude Codeの`.claude/worktrees/agent-*`に相当するレーンworktreeの蓄積自体が起きない。
+上記のEpic worktree削除だけで足りる。
+
 ## 自律動作ポリシー
 
 - ユーザーへの確認・質問は行わない
