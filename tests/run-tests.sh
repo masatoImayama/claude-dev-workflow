@@ -8356,6 +8356,131 @@ run_cleanup "$CLW_REPO_ARGS" --epic-branch main --lane-branch dummy --unknown-op
 assert_exit_code "未知のオプションは exit 2" 2 "$?"
 
 # ---------------------------------------------------------------------------
+# H2（Task #94）: 準備コマンドをレーンの作業ディレクトリで初回1回だけ実行させる
+#
+# 「Epic 開始時に1回」は Epic 専用 worktree にしか効かず、generator の isolation
+# worktree（レーンの作業ディレクトリ）には及ばない。にもかかわらず旧
+# `core/roles/generator.md` は「タスクごとに自前で再実行しない」と単独で禁止しており、
+# generator が自力で補うことも抑止していた（詳細は docs/dev-workflow-handover.md のH2節）。
+# ここでは「worktreeごとに1回」の意味に改めたことを機械的に検査する。
+# ---------------------------------------------------------------------------
+
+echo ""
+echo "== H2: 準備コマンドをレーンの作業ディレクトリで初回1回だけ実行させる（回帰防止 #94） =="
+
+# --- skills/run/SKILL.md: Step 3 雛形にPREP_CMDの埋め込みと「初回1回だけ」の指示がある ---
+H2_RS_STEP3="$(awk '/^### Step 3:/{f=1} /^### Step 4:/{f=0} f' "${REPO_ROOT}/skills/run/SKILL.md")"
+
+case "$H2_RS_STEP3" in
+  *'PREP_CMD'*'初回1回だけ'*)
+    pass "SKILL.md: Step 3 雛形に PREP_CMD の埋め込みと『初回1回だけ』実行させる指示がある（#94）" ;;
+  *)
+    fail "SKILL.md: Step 3 雛形に PREP_CMD の埋め込みと『初回1回だけ』実行させる指示がある（#94）" \
+      "$H2_RS_STEP3" ;;
+esac
+
+case "$H2_RS_STEP3" in
+  *'空の場合はこの行を出さない'*)
+    pass "SKILL.md: Step 3 雛形に『準備コマンド節が無い場合はこの行を出さない』旨（後方互換）がある（#94）" ;;
+  *)
+    fail "SKILL.md: Step 3 雛形に『準備コマンド節が無い場合はこの行を出さない』旨（後方互換）がある（#94）" \
+      "$H2_RS_STEP3" ;;
+esac
+
+case "$H2_RS_STEP3" in
+  *'2回目以降は実行しない'*)
+    pass "SKILL.md: Step 3 雛形に『同一worktree内で2回目以降は実行しない』旨がある（#94）" ;;
+  *)
+    fail "SKILL.md: Step 3 雛形に『同一worktree内で2回目以降は実行しない』旨がある（#94）" \
+      "$H2_RS_STEP3" ;;
+esac
+
+# --- skills/run/SKILL.md: Epic開始時1回を残す理由（キャッシュ温め・統合ゲート用Epic worktree配置）が明記されている ---
+H2_RS_PREP="$(awk '/^#### プロジェクト固有の準備コマンド/{f=1} /^### サンドボックスへのコマンド投入/{f=0} f' "${REPO_ROOT}/skills/run/SKILL.md")"
+
+case "$H2_RS_PREP" in
+  *'ビルドキャッシュを温める'*'統合ゲート'*'Epic worktree に生成物を配置'*)
+    pass "SKILL.md: Epic開始時1回を残す理由（キャッシュ温め・統合ゲート用Epic worktree配置）が明記されている（#94）" ;;
+  *)
+    fail "SKILL.md: Epic開始時1回を残す理由（キャッシュ温め・統合ゲート用Epic worktree配置）が明記されている（#94）" \
+      "$H2_RS_PREP" ;;
+esac
+
+# --- skills-codex/dev-workflow-run/SKILL.md: Step 3 の generator プロンプトに準備コマンドを渡していない ---
+H2_CRS_STEP3="$(awk '/^### Step 3:/{f=1} /^#### トークン消費の記録/{f=0} f' "${REPO_ROOT}/skills-codex/dev-workflow-run/SKILL.md")"
+
+if printf '%s\n' "$H2_CRS_STEP3" | grep -Fq 'PREP_CMD'; then
+  fail "SKILL.md(codex): Step 3 の generator プロンプトに PREP_CMD を渡していない（#94）" \
+    "$H2_CRS_STEP3"
+else
+  pass "SKILL.md(codex): Step 3 の generator プロンプトに PREP_CMD を渡していない（#94）"
+fi
+
+# --- skills-codex/dev-workflow-run/SKILL.md: 渡さない理由（Epic worktreeで直接作業するため）が明記されている ---
+H2_CRS_PREP="$(awk '/^## サンドボックスの準備/{f=1} /^## 自律実行の開始を記録/{f=0} f' "${REPO_ROOT}/skills-codex/dev-workflow-run/SKILL.md")"
+
+case "$H2_CRS_PREP" in
+  *'generator にはこの準備コマンドを渡さない'*'二重実行'*)
+    pass "SKILL.md(codex): 準備コマンドをgeneratorに渡さない理由（二重実行の回避）が明記されている（#94）" ;;
+  *)
+    fail "SKILL.md(codex): 準備コマンドをgeneratorに渡さない理由（二重実行の回避）が明記されている（#94）" \
+      "見つかりませんでした" ;;
+esac
+
+# --- core/roles/generator.md: 「タスクごとに自前で再実行しない」という単独の禁止表現が消えている ---
+if grep -Fq -- '**タスクごとに自前で再実行しない。**' "${REPO_ROOT}/core/roles/generator.md"; then
+  fail "core/roles/generator.md: 「タスクごとに自前で再実行しない」という単独の禁止表現が消えている（#94）" \
+    "$(grep -n -- 'タスクごとに自前で再実行しない' "${REPO_ROOT}/core/roles/generator.md")"
+else
+  pass "core/roles/generator.md: 「タスクごとに自前で再実行しない」という単独の禁止表現が消えている（#94）"
+fi
+
+# --- core/roles/generator.md: 「worktreeごとに1回」を意味する記述に置き換わっている ---
+GEN_PREP_SECTION="$(awk '/^### プロジェクト固有の準備/{f=1} /^### 0\. /{f=0} f' "${REPO_ROOT}/core/roles/generator.md")"
+
+case "$GEN_PREP_SECTION" in
+  *'初回1回だけ'*'同一 worktree 内で2回目以降は実行しない'*)
+    pass "core/roles/generator.md: 『worktreeごとに1回』を意味する記述（初回1回だけ・2回目以降は実行しない）がある（#94）" ;;
+  *)
+    fail "core/roles/generator.md: 『worktreeごとに1回』を意味する記述（初回1回だけ・2回目以降は実行しない）がある（#94）" \
+      "$GEN_PREP_SECTION" ;;
+esac
+
+case "$GEN_PREP_SECTION" in
+  *'渡されていない場合'*'実行しない'*)
+    pass "core/roles/generator.md: 準備コマンドが渡されていない場合は自分で探して実行しない旨が残っている（#94）" ;;
+  *)
+    fail "core/roles/generator.md: 準備コマンドが渡されていない場合は自分で探して実行しない旨が残っている（#94）" \
+      "$GEN_PREP_SECTION" ;;
+esac
+
+# --- core/roles/generator.md: #89 が入れた「0. 」節（ベース合わせ）が引き続き直後に存在し、壊れていない ---
+GEN_STEP0_H2="$(awk '/^### 0\. /{f=1} /^### 1\. /{f=0} f' "${REPO_ROOT}/core/roles/generator.md")"
+
+assert_order "core/roles/generator.md: H2向け編集後も「0. 」節のコマンド列の順序（#89）が保たれている（#94）" \
+  "$(printf '%s\n' "$GEN_STEP0_H2" | awk '/^```bash/{f=1;next} /^```/{f=0} f')" \
+  "git status --short" "git reset --hard" "git merge-base --is-ancestor" "git log --oneline -1"
+
+# --- README.md: 「この1回の準備がウェーブ・レーンをまたいで効く」が消えている ---
+if grep -Fq -- 'この1回の準備がウェーブ・レーンをまたいで効く' "${REPO_ROOT}/README.md"; then
+  fail "README.md: 『この1回の準備がウェーブ・レーンをまたいで効く』という誤った記述が消えている（#94）" \
+    "$(grep -n -- 'この1回の準備がウェーブ・レーンをまたいで効く' "${REPO_ROOT}/README.md")"
+else
+  pass "README.md: 『この1回の準備がウェーブ・レーンをまたいで効く』という誤った記述が消えている（#94）"
+fi
+
+# --- README.md: 準備コマンド節の他の記述（実際の適用範囲）に書き換わっている ---
+README_PREP_SECTION="$(awk '/^### Epic の `## 準備コマンド` 節/{f=1} /^## YOLOモード/{f=0} f' "${REPO_ROOT}/README.md")"
+
+case "$README_PREP_SECTION" in
+  *'Epic 専用 worktree だけ'*)
+    pass "README.md: 準備コマンド節の適用範囲がEpic専用worktreeだけである旨に書き換わっている（#94）" ;;
+  *)
+    fail "README.md: 準備コマンド節の適用範囲がEpic専用worktreeだけである旨に書き換わっている（#94）" \
+      "$README_PREP_SECTION" ;;
+esac
+
+# ---------------------------------------------------------------------------
 # 結果集計
 # ---------------------------------------------------------------------------
 

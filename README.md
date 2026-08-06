@@ -363,7 +363,7 @@ make setup && make wasm
 ```
 ````
 
-Epic issue 本文にこの節があれば、run がその内容を Epic 開始時の `sandbox-exec.sh --warm` に1回だけ渡す。コンテナは Epic 単位で常駐するため、この1回の準備がウェーブ・レーンをまたいで効く。節が無ければ従来どおりビルドコマンドで `--warm` するだけになる（後方互換）。generator にはタスクごとに再実行しない旨を明記済み。
+Epic issue 本文にこの節があれば、run がその内容を Epic 開始時の `sandbox-exec.sh --warm` に1回だけ渡す。この1回が効くのは Epic 専用 worktree だけである（キャッシュを温める・統合ゲートが使う Epic worktree に生成物を配置しておく、の2点が目的）。generator のレーン（isolation worktree）はこの後に別ツリーとして作られるため、この1回は及ばない。そのため run は Step 3 で同じ準備コマンドの内容を各 generator のプロンプトにも埋め込み、レーンの作業ディレクトリで初回1回だけ実行させる（同一worktree内で2回目以降は実行しない）。節が無ければ従来どおりビルドコマンドで `--warm` するだけになる（後方互換）。
 
 ## YOLOモード（完全自律動作）
 
