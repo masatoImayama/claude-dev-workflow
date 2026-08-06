@@ -8088,6 +8088,25 @@ assert_exit_code "DEV_WORKFLOW_SKIP_PATTERN指定: exit 0" 0 "$CS_ENV_EXIT"
 CS_BOTH_OUTPUT="$(printf 'skip - foo\nSKIPPED bar\n' | DEV_WORKFLOW_SKIP_PATTERN='^SKIPPED' bash "$COUNT_SKIPS_SCRIPT" --pattern '^skip - ')"
 assert_eq "--patternとDEV_WORKFLOW_SKIP_PATTERN併存: --patternが優先される" "1" "$(cs_field skips "$CS_BOTH_OUTPUT")"
 
+# --- ケース8': --pattern に不正な ERE（未閉じの角括弧）を渡すと skips=unknown / runner=custom /
+#     pattern=<渡された値> になり exit 1（fail loud）。grepのエラー終了コードを検証せず
+#     そのまま出力していると skips= が空値のまま exit 0 になってしまう（#101） ---
+CS_BADPATTERN_INPUT="$(printf 'a\nb\n')"
+CS_BADPATTERN_OUTPUT="$(printf '%s\n' "$CS_BADPATTERN_INPUT" | bash "$COUNT_SKIPS_SCRIPT" --pattern '[' 2>/dev/null)"
+CS_BADPATTERN_EXIT=$?
+assert_eq "不正なERE: skips=unknown（空値のままにしない）" "unknown" "$(cs_field skips "$CS_BADPATTERN_OUTPUT")"
+assert_eq "不正なERE: runner=custom" "custom" "$(cs_field runner "$CS_BADPATTERN_OUTPUT")"
+assert_eq "不正なERE: pattern=[（渡された値をそのまま出す）" "[" "$(cs_field pattern "$CS_BADPATTERN_OUTPUT")"
+assert_exit_code "不正なERE: exit 1（fail loud）" 1 "$CS_BADPATTERN_EXIT"
+
+# --- ケース8'': --pattern に有効なEREだが一致0件の場合は不正なEREと区別し、
+#     従来どおり skips=0 / exit 0 のまま（正常な「一致なし」を壊さない） ---
+CS_NOMATCH_INPUT="$(printf 'a\nb\n')"
+CS_NOMATCH_OUTPUT="$(printf '%s\n' "$CS_NOMATCH_INPUT" | bash "$COUNT_SKIPS_SCRIPT" --pattern '^zzz$')"
+CS_NOMATCH_EXIT=$?
+assert_eq "有効なEREで一致0件: skips=0" "0" "$(cs_field skips "$CS_NOMATCH_OUTPUT")"
+assert_exit_code "有効なEREで一致0件: exit 0（正常扱いのまま）" 0 "$CS_NOMATCH_EXIT"
+
 # --- ケース9: 引数エラー（exit 2） ---
 bash "$COUNT_SKIPS_SCRIPT" --file >/dev/null 2>&1
 assert_exit_code "引数エラー: --file に値なしで exit 2" 2 "$?"

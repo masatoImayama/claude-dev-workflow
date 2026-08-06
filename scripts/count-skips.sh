@@ -86,6 +86,17 @@ EFFECTIVE_PATTERN="${PATTERN:-${DEV_WORKFLOW_SKIP_PATTERN:-}}"
 
 if [ -n "$EFFECTIVE_PATTERN" ]; then
   COUNT="$(printf '%s\n' "$INPUT" | grep -cE -- "$EFFECTIVE_PATTERN")"
+  GREP_STATUS=$?
+  # grep -c の終了コード: 0=一致あり, 1=一致なし（COUNT=0として正常扱い）,
+  # 2=正規表現エラー等。2以上は「数えられなかった」として skips=unknown / exit 1 にする。
+  # ここで判定せずそのまま出力すると、不正なEREでも skips= が空値のまま exit 0 になり、
+  # SKIP検証が空振りしたまま緑に見えてしまう（#101）。
+  if [ "$GREP_STATUS" -ge 2 ]; then
+    echo "skips=unknown"
+    echo "runner=custom"
+    echo "pattern=${EFFECTIVE_PATTERN}"
+    exit 1
+  fi
   echo "skips=${COUNT}"
   echo "runner=custom"
   echo "pattern=${EFFECTIVE_PATTERN}"
