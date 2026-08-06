@@ -7885,6 +7885,52 @@ case "$README_WAVE_SECTION" in
 esac
 
 # ---------------------------------------------------------------------------
+echo "== skills/epic/SKILL.md: Task issueテンプレートに「- 前提:」行を追加（#90） =="
+
+# plan-waves.sh は Task issue 本文の「- Epic: #N」「- 前提: #N」の2行だけで
+# Epic絞り込みと依存グラフを構築する（真実の源）。epic skill のテンプレートに
+# 「- 前提:」が無いと、plan skill / planner 経由と挙動が食い違い、epic skill 経由で
+# 作った Task issue が必ず宣言漏れ扱いになり完全逐次にフォールバックする（H4-a）。
+
+DOC90_EPIC_SKILL="${REPO_ROOT}/skills/epic/SKILL.md"
+DOC90_PLAN_WAVES="${REPO_ROOT}/scripts/plan-waves.sh"
+DOC90_README="${REPO_ROOT}/README.md"
+
+# --- Task issueテンプレート本体に「- 前提:」行がある ---
+DOC90_TEMPLATE="$(awk '/^gh issue create \\$/{f=1} /^BODY$/{f=0} f' "$DOC90_EPIC_SKILL")"
+
+case "$DOC90_TEMPLATE" in
+  *'- Epic: #[epic番号]'*'- 前提: #'*)
+    pass "skills/epic/SKILL.md: Task issueテンプレートで「- Epic:」の直後に「- 前提:」行がある（#90）" ;;
+  *)
+    fail "skills/epic/SKILL.md: Task issueテンプレートで「- Epic:」の直後に「- 前提:」行がある（#90）" \
+      "$DOC90_TEMPLATE" ;;
+esac
+
+# --- 依存が無い場合に「- 前提: なし」と書かせる指示がある ---
+if grep -Fq -e '- 前提: なし' "$DOC90_EPIC_SKILL"; then
+  pass "skills/epic/SKILL.md: 依存が無い場合に「- 前提: なし」と明記させる指示がある（#90）"
+else
+  fail "skills/epic/SKILL.md: 依存が無い場合に「- 前提: なし」と明記させる指示がある（#90）"
+fi
+
+# --- 「- Epic: #N」「- 前提: #N」がplan-waves.shの書式であり、表記ゆれが受理されない旨が書かれている ---
+DOC90_SECTION6="$(awk '/^### 6\. Task issue の作成/{f=1} /^### 7\./{f=0} f' "$DOC90_EPIC_SKILL")"
+
+case "$DOC90_SECTION6" in
+  *'plan-waves.sh'*'真実の源'*'表記ゆれ'*'受理されない'*)
+    pass "skills/epic/SKILL.md: plan-waves.shが真実の源であり表記ゆれが受理されない旨が書かれている（#90）" ;;
+  *)
+    fail "skills/epic/SKILL.md: plan-waves.shが真実の源であり表記ゆれが受理されない旨が書かれている（#90）" \
+      "$DOC90_SECTION6" ;;
+esac
+
+# 「scripts/plan-waves.shに差分が無い」「README.mdに差分が無い」はこのタスクの実施者が
+# 対象外ファイルに触れていないことの確認であり、特定のEpicブランチに依存する差分検査を
+# 恒久テストとして埋め込むと当該ブランチが消えた後にテストが壊れるため、ここでは
+# スコープの明記（上記）に留め、機械的な差分検査は行わない。
+
+# ---------------------------------------------------------------------------
 # 結果集計
 # ---------------------------------------------------------------------------
 
