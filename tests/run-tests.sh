@@ -8717,6 +8717,225 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+# H5-b（Task #97）: レーン内ゲート・統合ゲートのSKIP計測をcount-skips.shに置き換える
+#
+# `skills/run/SKILL.md:388`（修正前）は「SKIP されたテストがあれば件数と内容を報告に含める
+# こと」とだけ指示し、数え方を示していなかった（H5節）。前提タスク #91 で新設した
+# scripts/count-skips.sh（本タスクでは変更しない）を呼び出し側に結線する。
+# scripts/count-skips.sh 自体の振る舞い（Go/jest/pytest判定・--pattern・
+# DEV_WORKFLOW_SKIP_PATTERN・引数エラー）は #91 のテスト（上の「count-skips.sh」節）で
+# 検証済みなので、ここでは呼び出し側（generator.md / SKILL.md / SKILL.md(codex) /
+# README.md）の記述内容だけを見る。
+# ---------------------------------------------------------------------------
+
+echo ""
+echo "== H5-b: レーン内ゲート・統合ゲートのSKIP計測をcount-skips.shに置き換える（#97） =="
+
+# --- scripts/count-skips.sh はこのタスクでは変更しない（#91の成果物のまま） ---
+if [ -f "${REPO_ROOT}/scripts/count-skips.sh" ]; then
+  pass "scripts/count-skips.sh: ファイルが存在する（#91の成果物。本タスクでは変更しない前提）（#97）"
+else
+  fail "scripts/count-skips.sh: ファイルが存在する（#91の成果物。本タスクでは変更しない前提）（#97）" \
+    "ファイルが見つかりません"
+fi
+
+# --- core/roles/generator.md: 「#### SKIP を通過扱いにしない」節を切り出す ---
+H97_GEN_SKIP="$(awk '/^#### SKIP を通過扱いにしない/{f=1} /^### 5\. コミット/{f=0} f' \
+  "${REPO_ROOT}/core/roles/generator.md")"
+
+if [ -z "$H97_GEN_SKIP" ]; then
+  fail "core/roles/generator.md: 『SKIP を通過扱いにしない』節が見つかる（前提）（#97）" "節が空でした"
+else
+  pass "core/roles/generator.md: 『SKIP を通過扱いにしない』節が見つかる（前提）（#97）"
+fi
+
+case "$H97_GEN_SKIP" in
+  *'tail'*'目視'*'てはならない'*'count-skips.sh'*)
+    pass "core/roles/generator.md: SKIP節が tail の目視を禁止しcount-skips.shで数える手順になっている（#97）" ;;
+  *)
+    fail "core/roles/generator.md: SKIP節が tail の目視を禁止しcount-skips.shで数える手順になっている（#97）" \
+      "$H97_GEN_SKIP" ;;
+esac
+
+case "$H97_GEN_SKIP" in
+  *'skips=unknown'*'0件」と報告してはならない'*'DEV_WORKFLOW_SKIP_PATTERN'*)
+    pass "core/roles/generator.md: skips=unknownを『0件』と報告してはならない旨が明記されている（#97）" ;;
+  *)
+    fail "core/roles/generator.md: skips=unknownを『0件』と報告してはならない旨が明記されている（#97）" \
+      "$H97_GEN_SKIP" ;;
+esac
+
+# --- core/roles/generator.md: 完了報告テンプレートがcount-skips.shの出力を貼る形になっている ---
+H97_GEN_REPORT="$(awk '/^## 完了報告/{f=1} f' "${REPO_ROOT}/core/roles/generator.md")"
+
+case "$H97_GEN_REPORT" in
+  *'count-skips.sh'*'skips=[件数 または unknown]'*)
+    pass "core/roles/generator.md: 完了報告テンプレートのSKIP件数欄がcount-skips.shの出力を貼る形になっている（#97）" ;;
+  *)
+    fail "core/roles/generator.md: 完了報告テンプレートのSKIP件数欄がcount-skips.shの出力を貼る形になっている（#97）" \
+      "$H97_GEN_REPORT" ;;
+esac
+
+# --- skills/run/SKILL.md: 「SKIP されたテストがあれば件数と内容を報告に含めること」という
+#     数え方の指定が無い表現が消えている（grepで0件。H5の受け入れ条件） ---
+if grep -Fq -- 'SKIP されたテストがあれば件数と内容を報告に含めること' "${REPO_ROOT}/skills/run/SKILL.md"; then
+  fail "SKILL.md: 数え方の指定が無い旧表現『SKIP されたテストがあれば件数と内容を報告に含めること』が消えている（#97）" \
+    "$(grep -n -- 'SKIP されたテストがあれば件数と内容を報告に含めること' "${REPO_ROOT}/skills/run/SKILL.md")"
+else
+  pass "SKILL.md: 数え方の指定が無い旧表現『SKIP されたテストがあれば件数と内容を報告に含めること』が消えている（#97）"
+fi
+
+# --- skills/run/SKILL.md: Step 3 雛形がcount-skips.shを使う手順になっている ---
+H97_RS_STEP3="$(awk '/^### Step 3:/{f=1} /^### Step 4:/{f=0} f' "${REPO_ROOT}/skills/run/SKILL.md")"
+
+case "$H97_RS_STEP3" in
+  *'tail'*'count-skips.sh'*'tee'*)
+    pass "SKILL.md: Step 3 雛形がテスト出力をteeで保存しcount-skips.shで数える手順になっている（#97）" ;;
+  *)
+    fail "SKILL.md: Step 3 雛形がテスト出力をteeで保存しcount-skips.shで数える手順になっている（#97）" \
+      "$H97_RS_STEP3" ;;
+esac
+
+case "$H97_RS_STEP3" in
+  *'skips=unknown'*'0件」と報告してはならない'*'DEV_WORKFLOW_SKIP_PATTERN'*)
+    pass "SKILL.md: Step 3 雛形がskips=unknownを『0件』と報告してはならない旨を明記している（#97）" ;;
+  *)
+    fail "SKILL.md: Step 3 雛形がskips=unknownを『0件』と報告してはならない旨を明記している（#97）" \
+      "$H97_RS_STEP3" ;;
+esac
+
+# --- skills/run/SKILL.md: SKIP_PATTERN（Epic本文の「## SKIPパターン」節）の抽出手順がある ---
+H97_RS_SKIPPATTERN="$(awk '/^## 起動時の確認/{f=1} /^## 2エージェント体制/{f=0} f' \
+  "${REPO_ROOT}/skills/run/SKILL.md")"
+
+case "$H97_RS_SKIPPATTERN" in
+  *'## SKIPパターン'*'DEV_WORKFLOW_SKIP_PATTERN'*)
+    pass "SKILL.md: Epic本文の『## SKIPパターン』節を読みDEV_WORKFLOW_SKIP_PATTERNとして保持する手順がある（#97）" ;;
+  *)
+    fail "SKILL.md: Epic本文の『## SKIPパターン』節を読みDEV_WORKFLOW_SKIP_PATTERNとして保持する手順がある（#97）" \
+      "$H97_RS_SKIPPATTERN" ;;
+esac
+
+# --- skills/run/SKILL.md: Step 6（統合ゲート）がrun自身でcount-skips.shを実行し、
+#     0件でも必ず表示し、レーンの自己申告と食い違った場合は統合ゲートの値を採用する ---
+H97_RS_STEP6="$(awk '/^### Step 6:/{f=1} /^### Step 7:/{f=0} f' "${REPO_ROOT}/skills/run/SKILL.md")"
+
+case "$H97_RS_STEP6" in
+  *'tee'*'count-skips.sh'*)
+    pass "SKILL.md: Step 6 統合ゲートがテスト出力をteeで保存しcount-skips.shで数えている（#97）" ;;
+  *)
+    fail "SKILL.md: Step 6 統合ゲートがテスト出力をteeで保存しcount-skips.shで数えている（#97）" \
+      "$H97_RS_STEP6" ;;
+esac
+
+case "$H97_RS_STEP6" in
+  *'0件でも必ず表示'*)
+    pass "SKILL.md: Step 6 統合ゲートがSKIP件数を0件でも必ず表示する旨を明記している（#97）" ;;
+  *)
+    fail "SKILL.md: Step 6 統合ゲートがSKIP件数を0件でも必ず表示する旨を明記している（#97）" \
+      "$H97_RS_STEP6" ;;
+esac
+
+case "$H97_RS_STEP6" in
+  *'食い違った場合は統合ゲートの値を採用'*'Epic issue にコメント'*)
+    pass "SKILL.md: Step 6 統合ゲートがレーンの自己申告と食い違った場合に統合ゲートの値を採用しEpic issueにコメントする旨を明記している（#97）" ;;
+  *)
+    fail "SKILL.md: Step 6 統合ゲートがレーンの自己申告と食い違った場合に統合ゲートの値を採用しEpic issueにコメントする旨を明記している（#97）" \
+      "$H97_RS_STEP6" ;;
+esac
+
+# --- skills/run/SKILL.md: 「SKIP を通過扱いにしない」節がskips=unknownの扱いを明記している ---
+H97_RS_SKIPSECTION="$(awk '/^#### SKIP を通過扱いにしない/{f=1} /^### Step 7:/{f=0} f' \
+  "${REPO_ROOT}/skills/run/SKILL.md")"
+
+case "$H97_RS_SKIPSECTION" in
+  *'skips=unknown'*'「0件」として扱ってはならない'*)
+    pass "SKILL.md: 『SKIP を通過扱いにしない』節がskips=unknownを0件扱いしない旨を明記している（#97）" ;;
+  *)
+    fail "SKILL.md: 『SKIP を通過扱いにしない』節がskips=unknownを0件扱いしない旨を明記している（#97）" \
+      "$H97_RS_SKIPSECTION" ;;
+esac
+
+# --- skills/run/SKILL.md: Step 3 雛形に駆動先プロジェクト固有のSKIPパターン値をハードコード
+#     していない（例: このリポジトリ自身のパターン「^  skip - 」が literal で入っていない） ---
+if printf '%s\n' "$H97_RS_STEP3" | grep -Fq -- '^  skip - '; then
+  fail "SKILL.md: Step 3 雛形に駆動先プロジェクト固有のSKIPパターンをハードコードしていない（#97）" \
+    "$H97_RS_STEP3"
+else
+  pass "SKILL.md: Step 3 雛形に駆動先プロジェクト固有のSKIPパターンをハードコードしていない（#97）"
+fi
+
+# --- skills-codex/dev-workflow-run/SKILL.md: 同様にcount-skips.shを使う手順になっている ---
+if grep -Fq -- 'SKIP されたテストがあれば件数と内容を報告に含めること' \
+  "${REPO_ROOT}/skills-codex/dev-workflow-run/SKILL.md"; then
+  fail "SKILL.md(codex): 数え方の指定が無い旧表現が消えている（#97）" \
+    "$(grep -n -- 'SKIP されたテストがあれば件数と内容を報告に含めること' \
+      "${REPO_ROOT}/skills-codex/dev-workflow-run/SKILL.md")"
+else
+  pass "SKILL.md(codex): 数え方の指定が無い旧表現が消えている（#97）"
+fi
+
+H97_CRS_STEP3="$(awk '/^### Step 3:/{f=1} /^#### トークン消費の記録/{f=0} f' \
+  "${REPO_ROOT}/skills-codex/dev-workflow-run/SKILL.md")"
+
+case "$H97_CRS_STEP3" in
+  *'tail'*'count-skips.sh'*'tee'*'skips=unknown'*)
+    pass "SKILL.md(codex): Step 3 プロンプトがcount-skips.shを使いskips=unknownの扱いも明記している（#97）" ;;
+  *)
+    fail "SKILL.md(codex): Step 3 プロンプトがcount-skips.shを使いskips=unknownの扱いも明記している（#97）" \
+      "$H97_CRS_STEP3" ;;
+esac
+
+H97_CRS_STEP5="$(awk '/^### Step 5:/{f=1} /^### Step 6:/{f=0} f' \
+  "${REPO_ROOT}/skills-codex/dev-workflow-run/SKILL.md")"
+
+case "$H97_CRS_STEP5" in
+  *'tee'*'count-skips.sh'*'0件でも必ず表示'*)
+    pass "SKILL.md(codex): Step 5 統合ゲートがteeで保存しcount-skips.shで数え0件でも表示する（#97）" ;;
+  *)
+    fail "SKILL.md(codex): Step 5 統合ゲートがteeで保存しcount-skips.shで数え0件でも表示する（#97）" \
+      "$H97_CRS_STEP5" ;;
+esac
+
+case "$H97_CRS_STEP5" in
+  *'skips=unknown'*'「0件」として扱ってはならない'*)
+    pass "SKILL.md(codex): 『SKIP を通過扱いにしない』節がskips=unknownを0件扱いしない旨を明記している（#97）" ;;
+  *)
+    fail "SKILL.md(codex): 『SKIP を通過扱いにしない』節がskips=unknownを0件扱いしない旨を明記している（#97）" \
+      "$H97_CRS_STEP5" ;;
+esac
+
+# --- README.md: count-skips.sh の使い方・出力・判定順序・DEV_WORKFLOW_SKIP_PATTERN が書かれている ---
+H97_README_CS="$(awk '/^### `scripts\/count-skips.sh`/{f=1} /^### Epic の `## SKIPパターン` 節/{f=0} f' \
+  "${REPO_ROOT}/README.md")"
+
+if [ -z "$H97_README_CS" ]; then
+  fail "README.md: 『scripts/count-skips.sh』節が見つかる（#97）" "節が空でした"
+else
+  pass "README.md: 『scripts/count-skips.sh』節が見つかる（#97）"
+fi
+
+case "$H97_README_CS" in
+  *'skips=<件数 または unknown>'*'runner=<go|pytest|jest|custom|unknown>'*'判定順序'*'DEV_WORKFLOW_SKIP_PATTERN'*)
+    pass "README.md: count-skips.sh節に出力・判定順序・DEV_WORKFLOW_SKIP_PATTERNが書かれている（#97）" ;;
+  *)
+    fail "README.md: count-skips.sh節に出力・判定順序・DEV_WORKFLOW_SKIP_PATTERNが書かれている（#97）" \
+      "$H97_README_CS" ;;
+esac
+
+# --- README.md: Epic の「## SKIPパターン」節の書き方が案内されている ---
+H97_README_EPICSECTION="$(awk '/^### Epic の `## SKIPパターン` 節/{f=1} /^## YOLOモード/{f=0} f' \
+  "${REPO_ROOT}/README.md")"
+
+case "$H97_README_EPICSECTION" in
+  *'## SKIPパターン'*'DEV_WORKFLOW_SKIP_PATTERN'*'skips=unknown'*)
+    pass "README.md: Epicの『## SKIPパターン』節の書き方とDEV_WORKFLOW_SKIP_PATTERNの関係が案内されている（#97）" ;;
+  *)
+    fail "README.md: Epicの『## SKIPパターン』節の書き方とDEV_WORKFLOW_SKIP_PATTERNの関係が案内されている（#97）" \
+      "$H97_README_EPICSECTION" ;;
+esac
+
+# ---------------------------------------------------------------------------
 # 結果集計
 # ---------------------------------------------------------------------------
 

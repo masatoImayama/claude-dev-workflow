@@ -154,6 +154,26 @@ fi
 - `$PREP_CMD` は変数として保持しておき、Step 3 で各レーンの generator プロンプトに
   そのまま埋め込む（レーンの作業ディレクトリで初回1回だけ実行させるため）
 
+#### SKIP件数の判定パターン（Epic 本文の `## SKIPパターン` 節。任意）
+
+`scripts/count-skips.sh`（SKIP件数を機械的に数えるスクリプト。詳細はREADME参照）は
+built-inランナー（go/jest/pytest）の出力形式しか自動認識できず、それ以外の形式では
+`skips=unknown`（exit 1）になる。駆動先プロジェクトの形式が独自の場合に備え、Epic本文に
+任意の節を置けるようにする。
+
+```bash
+# Epic本文に「## SKIPパターン」節があれば、その中身（フェンスコードブロックの内容）を取り出す
+SKIP_PATTERN="$(gh issue view $ARGUMENTS --json body -q '.body' \
+  | awk '/^## SKIPパターン/{f=1; next} /^## /{f=0} f' \
+  | sed -n '/^```/,/^```/p' | sed '1d;$d')"
+```
+
+- **節が無ければ何もしない**（`$SKIP_PATTERN` は空文字のまま）。built-inランナーの形式で
+  数えられるプロジェクトはこの節を書かなくてよい
+- `$SKIP_PATTERN` は変数として保持しておき、Step 3 の各レーンの generator プロンプトと
+  Step 6 の統合ゲートの両方に、`DEV_WORKFLOW_SKIP_PATTERN` として渡す
+- 節の書き方は README「Epic の `## SKIPパターン` 節」を参照
+
 ### サンドボックスへのコマンド投入は sandbox-exec.sh 経由に統一する
 
 **`docker run` を直接組み立ててはならない。** 以下をすべて `scripts/sandbox-exec.sh` が引き受ける:
@@ -420,7 +440,23 @@ Task #[番号A] を実装してください（レーン A）。
   （1レーンで複数タスクを扱う場合を含む）。1回実行しても効いていないと判断した場合も自前で
   追加実行せず、その事実を報告すること
 - 回帰確認はプロジェクトの全テストで行うこと。`-run` で絞った結果を「回帰なし」と報告しないこと
-- SKIP されたテストがあれば件数と内容を報告に含めること
+- **SKIP件数は `tail` の目視ではなく `scripts/count-skips.sh` で機械的に数えること。**
+  テスト出力を `tee` でログに保存してから数え、**数えたコマンドと実出力をそのまま報告に貼ること**
+  （`tail` で目視して「0件」と報告することは明示的に禁止する）:
+  ```bash
+  bash "${CLAUDE_PLUGIN_ROOT}/scripts/sandbox-exec.sh" --epic "$EPIC_NUM" '[全テストコマンド]' \
+    2>&1 | tee /tmp/test-output.log
+  bash "${CLAUDE_PLUGIN_ROOT}/scripts/count-skips.sh" --file /tmp/test-output.log
+  ```
+  （`$SKIP_PATTERN` が空でない場合のみ、次の行を追加する。空の場合はこの行を出さない）
+  このプロジェクトのテスト出力は built-in ランナー（go/jest/pytest）と形式が異なるため、
+  `count-skips.sh` を呼ぶ前に次を実行してから数えること:
+  `export DEV_WORKFLOW_SKIP_PATTERN='[SKIP_PATTERNの内容]'`
+  - `skips=<件数>`（exit 0）→ その件数を報告する。想定外のSKIPは不合格として扱う
+  - `skips=unknown`（exit 1）→ **「0件」と報告してはならない。** built-inランナー以外の
+    形式のため数えられなかった事実と、`DEV_WORKFLOW_SKIP_PATTERN`（Epic本文の
+    `## SKIPパターン` 節）の設定が必要である旨を報告すること。この場合に限り、
+    `tail` ではなく生のテスト出力全体を読み、SKIPを示す行が無いか自分の目でも確認すること
 - issueの要件を確認
 - Task issueの記載だけで着手できない場合に限り、親Epic issueの本文を参照すること
 - テストファーストで実装
@@ -543,7 +579,13 @@ git checkout "wave/${EPIC_NUM}/${WAVE_NO}"
 GATE_START_SEC=$(date +%s)   # 「統合ゲート」フェーズの計測開始
 
 # 1) テスト（Docker sandbox内）— 1回にまとめる。落ちたら不合格
-bash "${CLAUDE_PLUGIN_ROOT}/scripts/sandbox-exec.sh" --epic "$EPIC_NUM" '[全テストを走らせるコマンド]'
+bash "${CLAUDE_PLUGIN_ROOT}/scripts/sandbox-exec.sh" --epic "$EPIC_NUM" '[全テストを走らせるコマンド]' \
+  2>&1 | tee /tmp/gate-test-output.log
+
+# 1b) SKIP件数はレーンの自己申告に依存せず、run自身がcount-skips.shで機械的に数える。
+#     0件でも必ず表示する（黙って省略しない）
+[ -n "$SKIP_PATTERN" ] && export DEV_WORKFLOW_SKIP_PATTERN="$SKIP_PATTERN"
+bash "${CLAUDE_PLUGIN_ROOT}/scripts/count-skips.sh" --file /tmp/gate-test-output.log
 
 # 2) 可読性ガード — waveブランチの差分に対して実行（PostToolUseフックと同じ判定）
 bash "${CLAUDE_PLUGIN_ROOT}/scripts/check-readability.sh" --git
@@ -554,6 +596,13 @@ GATE_SEC=$((GATE_END_SEC - GATE_START_SEC))
 
 内容の要件は従来と同じ（プロジェクトの全テストを1コマンドで／対象の選択をgeneratorに委ねない／
 SKIPを通過扱いにしない。詳細は下記）。
+
+統合ゲートの `count-skips.sh` の結果は、レーンが完了報告に書いた値と**食い違うことがある**
+（レーン内ゲートは各レーンの isolation worktree に対する結果、統合ゲートは全レーン取り込み後の
+wave ブランチに対する結果であり、対象ツリーが異なるため）。
+**食い違った場合は統合ゲートの値を採用し**、その旨を Epic issue にコメントする。
+統合ゲート側も `skips=unknown` になりうるが、その場合も「0件」として扱わない
+（下記「SKIPを通過扱いにしない」参照）。
 
 **Epic worktreeに対する単独のゲートは廃止する。** レーンの変更がEpicに入るのは統合ゲート
 通過後のマージであり、Epic worktreeを先に検証しても検証対象として意味を持たない。加えて、
@@ -578,8 +627,16 @@ generatorが並列に実施するレーン内ゲートと合わせて毎タス�
 #### SKIP を通過扱いにしない
 
 依存物が未配置だとテストが無言で `SKIP` され、`ok` と表示されて成功に見える。
-**`ok` の有無だけで判定してはならない。** 出力中のSKIP件数を確認し、
-検証したかったテストが実際に走ったことを確かめる。想定外のSKIPは不合格として扱う。
+**`ok` の有無だけで判定してはならない。** SKIP件数の数え方は自然言語の依頼にせず、
+`scripts/count-skips.sh` に固定する（`tail` の目視で「0件」と判定することを禁止する。
+上記1b参照）。
+
+- `skips=<件数>`（exit 0）→ その件数を確認し、検証したかったテストが実際に走ったことを
+  確かめる。**想定外のSKIPは不合格として扱う**
+- `skips=unknown`（exit 1）→ **「0件」として扱ってはならない。** built-inランナー
+  （go/jest/pytest）以外の形式であるため数えられなかったことを Epic issue に明記し、
+  `DEV_WORKFLOW_SKIP_PATTERN`（Epic本文の `## SKIPパターン` 節）の設定を促す。
+  この1件のために run 全体を必ず停止させるわけではないが、「0件」への読み替えは常に禁止する
 
 - **通過** → Step 7 へ
 - **失敗** → Step 8「統合ゲート失敗」のリカバリへ（Epicブランチは無傷のまま）

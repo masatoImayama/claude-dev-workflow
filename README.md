@@ -373,6 +373,49 @@ make setup && make wasm
 
 Epic issue 本文にこの節があれば、run がその内容を Epic 開始時の `sandbox-exec.sh --warm` に1回だけ渡す。この1回が効くのは Epic 専用 worktree だけである（キャッシュを温める・統合ゲートが使う Epic worktree に生成物を配置しておく、の2点が目的）。generator のレーン（isolation worktree）はこの後に別ツリーとして作られるため、この1回は及ばない。そのため run は Step 3 で同じ準備コマンドの内容を各 generator のプロンプトにも埋め込み、レーンの作業ディレクトリで初回1回だけ実行させる（同一worktree内で2回目以降は実行しない）。節が無ければ従来どおりビルドコマンドで `--warm` するだけになる（後方互換）。
 
+### `scripts/count-skips.sh`（SKIP件数の機械的カウント）
+
+「SKIP されたテストがあれば件数と内容を報告に含めること」という自然言語の依頼は、`tail` で目視して `--- SKIP` が見えなかったことをもって「SKIP 0件」と誤報告する事故を招いた（依存物が未配置だとテストは無言で `SKIP` され `ok` と表示されるため）。レーン内ゲート（generator）・統合ゲート（run）のどちらも、この自己申告ではなく `count-skips.sh` で機械的に数える。
+
+```bash
+bash "${CLAUDE_PLUGIN_ROOT}/scripts/count-skips.sh" [--file <テスト出力のログ>] [--pattern <ERE>]
+<テスト出力> | bash "${CLAUDE_PLUGIN_ROOT}/scripts/count-skips.sh"
+```
+
+出力（1行1項目・機械可読、この順で必ず3行）:
+
+```
+skips=<件数 または unknown>
+runner=<go|pytest|jest|custom|unknown>
+pattern=<実際に使ったERE または none>
+```
+
+終了コードは `0`=数えられた `1`=数えられなかった（`skips=unknown`。fail loud） `2`=引数エラー。
+
+判定順序（上から最初に一致したものを使う）:
+
+1. `--pattern` または環境変数 `DEV_WORKFLOW_SKIP_PATTERN` があれば `runner=custom` としてそのEREに一致する行数を数える（最優先）
+2. Go と判定できる（`^--- (PASS|FAIL|SKIP)` または `^(ok|FAIL|PASS)` を含む）→ `^--- SKIP` の一致行数
+3. jest と判定できる（`^Tests:` を含む）→ `Tests:` 行の `<N> skipped` の N
+4. pytest と判定できる（`test session starts` を含む）→ サマリ行の最後の `<N> skipped` の N
+5. どれにも当てはまらない → `skips=unknown` / `runner=unknown` / exit 1
+
+built-in ランナー（go/jest/pytest）と異なる出力形式のプロジェクトでは既定で `skips=unknown` になる。この場合に必ず「0件」として扱ってはならない（下記「Epic の `## SKIPパターン` 節」で `DEV_WORKFLOW_SKIP_PATTERN` を設定する）。
+
+### Epic の `## SKIPパターン` 節
+
+駆動先プロジェクトのテスト出力が built-in ランナー（go/jest/pytest）のいずれとも異なる形式で、`count-skips.sh` が既定で `skips=unknown` になる場合に、SKIP行を数える正規表現を Epic issue 本文に明記する。
+
+````markdown
+## SKIPパターン
+
+```
+^  skip - 
+```
+````
+
+節があれば run がその内容を `DEV_WORKFLOW_SKIP_PATTERN` として読み取り、Step 3 の各 generator プロンプトと統合ゲートの両方に渡す（`## 準備コマンド` 節と同じ抽出方法）。節が無ければ何も設定されず、built-in ランナーの判定だけが行われる。`skips=unknown` は「0件」を意味しない。built-in ランナー以外の形式で run を止めずに進めるための既定の逃げ道であり、正しい件数を知るには本節でパターンを明記する必要がある。
+
 ## YOLOモード（完全自律動作）
 
 実装フェーズ（run）ではユーザー確認を一切行わず完全自律で動作する。

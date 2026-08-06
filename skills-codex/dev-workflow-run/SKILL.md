@@ -104,6 +104,11 @@ if [ -n "$PREP_CMD" ]; then
   echo "$PREP_CMD"
   bash "${CLAUDE_PLUGIN_ROOT}/scripts/sandbox-exec.sh" --epic "$EPIC_NUM" --warm "$PREP_CMD"
 fi
+
+# Epic本文に「## SKIPパターン」節があれば取り出す（built-inランナー以外の形式向け。任意）
+SKIP_PATTERN="$(gh issue view <epic番号> --json body -q '.body' \
+  | awk '/^## SKIPパターン/{f=1; next} /^## /{f=0} f' \
+  | sed -n '/^```/,/^```/p' | sed '1d;$d')"
 ```
 
 **節が無ければ何もしない。** 既存の Epic（`## 準備コマンド` 節が無いもの）は上記の
@@ -118,6 +123,11 @@ generator は**サブエージェント専用 worktree を持たず、Epic workt
 作業する**（Step 3 参照）。したがって、ここで実行した1回がそのまま generator の作業ディレクトリに
 効いており、二重に実行させる必要が無い。これは「機能差」ではなく、同じ保証（レーンの作業
 ディレクトリで準備が効いていること）を worktree 構造の違いに応じて満たしているだけである。
+
+`$SKIP_PATTERN` も**節が無ければ何もしない**（`skips=unknown` になった場合の扱いは
+Step 5「SKIP を通過扱いにしない」参照）。空でなければ変数として保持し、Step 3の
+generatorプロンプトとStep 5の統合ゲートの両方に `DEV_WORKFLOW_SKIP_PATTERN` として渡す
+（節の書き方はREADME「Epic の `## SKIPパターン` 節」参照）。
 
 **サンドボックスへのコマンド投入は `sandbox-exec.sh` 経由に統一する。** `docker run` を直接
 組み立ててはならない。イメージの解決とビルド（`Dockerfile.dev` の内容 hash でタグ付けし自動
@@ -279,7 +289,23 @@ Task #<番号> を実装してください。
   作業している**（Claude版のように別ツリーで作業するわけではないため）。準備コマンドは渡されて
   いない。効いていないと判断した場合も自前で追加実行せず、その事実を報告すること
 - 回帰確認はプロジェクトの全テストで行うこと。`-run` で絞った結果を「回帰なし」と報告しないこと
-- SKIP されたテストがあれば件数と内容を報告に含めること
+- **SKIP件数は `tail` の目視ではなく `scripts/count-skips.sh` で機械的に数えること。**
+  テスト出力を `tee` でログに保存してから数え、**数えたコマンドと実出力をそのまま報告に貼ること**
+  （`tail` で目視して「0件」と報告することは禁止する）:
+  ```bash
+  bash "${CLAUDE_PLUGIN_ROOT}/scripts/sandbox-exec.sh" --epic "$EPIC_NUM" '[全テストコマンド]' \
+    2>&1 | tee /tmp/test-output.log
+  bash "${CLAUDE_PLUGIN_ROOT}/scripts/count-skips.sh" --file /tmp/test-output.log
+  ```
+  （`$SKIP_PATTERN` が空でない場合のみ、次の行を追加する。空の場合はこの行を出さない）
+  このプロジェクトのテスト出力は built-in ランナー（go/jest/pytest）と形式が異なるため、
+  `count-skips.sh` を呼ぶ前に次を実行してから数えること:
+  `export DEV_WORKFLOW_SKIP_PATTERN='[SKIP_PATTERNの内容]'`
+  - `skips=<件数>`（exit 0）→ その件数を報告する。想定外のSKIPは不合格として扱う
+  - `skips=unknown`（exit 1）→ **「0件」と報告してはならない。** built-inランナー以外の
+    形式のため数えられなかった事実と、`DEV_WORKFLOW_SKIP_PATTERN`（Epic本文の
+    `## SKIPパターン` 節）の設定が必要である旨を報告すること。この場合に限り、
+    `tail` ではなく生のテスト出力全体を読み、SKIPを示す行が無いか自分の目でも確認すること
 - issueの要件を確認すること。Task issueの記載だけで着手できない場合に限り、
   親Epic issue本文の仕様書・計画書を確認すること
 - テストファーストで実装すること
@@ -329,7 +355,13 @@ bash "${CLAUDE_PLUGIN_ROOT}/scripts/merge-lane.sh" \
 git checkout "$WAVE_BRANCH"
 
 # 1) テスト（Docker sandbox内）— 1回にまとめる。落ちたら不合格
-bash "${CLAUDE_PLUGIN_ROOT}/scripts/sandbox-exec.sh" --epic "$EPIC_NUM" '[全テストを走らせるコマンド]'
+bash "${CLAUDE_PLUGIN_ROOT}/scripts/sandbox-exec.sh" --epic "$EPIC_NUM" '[全テストを走らせるコマンド]' \
+  2>&1 | tee /tmp/gate-test-output.log
+
+# 1b) SKIP件数はgeneratorの自己申告に依存せず、run自身がcount-skips.shで機械的に数える。
+#     0件でも必ず表示する（黙って省略しない）
+[ -n "$SKIP_PATTERN" ] && export DEV_WORKFLOW_SKIP_PATTERN="$SKIP_PATTERN"
+bash "${CLAUDE_PLUGIN_ROOT}/scripts/count-skips.sh" --file /tmp/gate-test-output.log
 
 # 2) 可読性ガード — waveブランチの差分に対して実行（PostToolUseフックと同じ判定）
 bash "${CLAUDE_PLUGIN_ROOT}/scripts/check-readability.sh" --git
@@ -349,8 +381,16 @@ bash "${CLAUDE_PLUGIN_ROOT}/scripts/check-readability.sh" --git
 #### SKIP を通過扱いにしない
 
 依存物が未配置だとテストが無言で `SKIP` され、`ok` と表示されて成功に見える。
-**`ok` の有無だけで判定してはならない。** 出力中のSKIP件数を確認し、
-検証したかったテストが実際に走ったことを確かめる。想定外のSKIPは不合格として扱う。
+**`ok` の有無だけで判定してはならない。** SKIP件数の数え方は自然言語の依頼にせず、
+`scripts/count-skips.sh` に固定する（`tail` の目視で「0件」と判定することを禁止する。
+上記1b参照）。
+
+- `skips=<件数>`（exit 0）→ その件数を確認し、検証したかったテストが実際に走ったことを
+  確かめる。**想定外のSKIPは不合格として扱う**
+- `skips=unknown`（exit 1）→ **「0件」として扱ってはならない。** built-inランナー
+  （go/jest/pytest）以外の形式であるため数えられなかったことを Epic issue に明記し、
+  `DEV_WORKFLOW_SKIP_PATTERN`（Epic本文の `## SKIPパターン` 節）の設定を促す。
+  この1件のために run 全体を必ず停止させるわけではないが、「0件」への読み替えは常に禁止する
 
 - **通過** →
 

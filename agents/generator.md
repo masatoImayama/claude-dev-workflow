@@ -246,8 +246,25 @@ PASS
 ok  	example.com/pkg	0.032s
 ```
 
-`ok` の有無だけで判定せず、**SKIP件数を確認し、検証したかった処理が実際に走ったことを確かめる。**
-意図しない SKIP があれば、その事実を報告に含める。
+`ok` の有無だけで判定しない。**SKIP件数は `tail` で目視して報告してはならない。**
+テスト出力を `tee` でログに保存し、`scripts/count-skips.sh` で機械的に数える。
+
+```bash
+bash "${CLAUDE_PLUGIN_ROOT}/scripts/sandbox-exec.sh" --epic epicXX 'make test' 2>&1 \
+  | tee /tmp/test-output.log
+bash "${CLAUDE_PLUGIN_ROOT}/scripts/count-skips.sh" --file /tmp/test-output.log
+```
+
+出力は3行（`skips=<件数|unknown>` / `runner=<go|pytest|jest|custom|unknown>` /
+`pattern=<使用したERE|none>`）、終了コードは `0`=数えられた `1`=数えられなかった
+（`skips=unknown`）。**数えたコマンドと実出力を報告に貼ること。**
+
+- `skips=<件数>`（exit 0）→ その件数を報告する。**想定外の SKIP は不合格として扱う**
+- `skips=unknown`（exit 1）→ **「0件」と報告してはならない。** built-in ランナー
+  （go/jest/pytest）と異なる形式のため数えられなかったことを明示し、
+  `DEV_WORKFLOW_SKIP_PATTERN`（run から渡された場合は Epic 本文の `## SKIPパターン` 節に
+  由来する）の設定が必要である旨を報告する。渡されていない場合は、`tail` ではなく
+  生のテスト出力全体を読み、SKIPを示す行が無いか自分の目でも確認したうえでその旨を報告する
 
 ### 5. コミット
 
@@ -329,10 +346,16 @@ $ git log --oneline -1
 
 ### テスト結果（サンドボックス内）
 実行したコマンドの全文:
-$ bash .../sandbox-exec.sh '[実際に叩いたコマンドをそのまま]'
+$ bash .../sandbox-exec.sh '[実際に叩いたコマンドをそのまま]' | tee /tmp/test-output.log
 [実出力]
 
-- SKIP件数: [件数]（意図しないSKIPがあればその内容）
+### SKIP件数（count-skips.shの実出力を貼る。tailでの目視や自己申告にしない）
+$ bash "${CLAUDE_PLUGIN_ROOT}/scripts/count-skips.sh" --file /tmp/test-output.log
+skips=[件数 または unknown]
+runner=[go|pytest|jest|custom|unknown]
+pattern=[使用したERE または none]
+（skips=unknownの場合は「0件」と書かない。unknownである事実と、
+DEV_WORKFLOW_SKIP_PATTERNの設定が必要である旨を書く）
 
 ### コミット
 - [コミットハッシュ]: [メッセージ]
